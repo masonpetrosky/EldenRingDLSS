@@ -464,3 +464,10 @@ Cost (4K DLAA, `-Round trees` and `-Round treecost`): wind off 9.26 ms, grass on
 11.23-11.38 ms, so trees add about 1.2 ms. The resolve draw is 0.23 ms of it (it runs over the whole 4 M vertex
 capacity); the rest is the stream-output passes (the previous-pose replay and the game's draw, both without vertex
 reuse) and the per-draw wind patches.
+
+### The golden `WorldTree_Leaves` trees barely move (2026-10-09)
+
+Their vertex shader (captures/inspect_veg/eid_75818) does use `FC_GlobalTime`, but only to rock each leaf cluster
+about a pivot: angle = 0.1 * float_0 (0.3) * smoothstep of a triangle wave with phase (float_1 (32) * a per-vertex
+value + time) * float_11 (0.12), i.e. at most 0.03 rad (1.7 degrees) over an 8.3 s cycle. That is a few hundredths
+of a pixel per frame at 4K, invisible (the user never noticed them move) and not worth motion vectors.
