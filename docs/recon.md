@@ -108,6 +108,24 @@ field) with RMS detail per feature size:
 - Untested so far: presets L/M (NVIDIA: sharper and less ghosting than K, but they cost more and always use
   auto-exposure). Another open question is whether wind-animated vegetation writes motion vectors. NVIDIA's guide
   names animated foliage as the most common place where motion vectors go missing.
+- In game the user found preset M about 30 FPS slower (~70 FPS in the field) with more flicker in trees, and chose
+  preset K without sharpening.
+
+## Chromatic aberration (2026-10-09)
+
+The tonemapping constants (`cbToneMap`, 512 bytes) include `g_vChromaticAberrationRG` (byte 224),
+`g_vChromaticAberrationB` (byte 240) and `g_vChromaticAberrationShapeParam` (byte 320). The dungeon capture had
+RG (0, 0, -0.00075, -0.00015), B (-0.0015, -0.0003) and shape (1.778, 1, 2, -1.5). Its
+`ToneMap_TabledToneMapLUTPS` variant samples the scene once, so the offsets are used elsewhere, probably in
+`ToneMap_PostOETFPS` (the pass after it, which also binds `cbToneMap`).
+
+`tools/ca_measure.py` on the Limgrave shots shows the effect in game: red and blue shift horizontally in opposite
+directions against green, about 0.8-0.95 px at the left and right edges, 0.2-0.5 px a quarter of the way in, and 0
+at the center. There is no vertical shift. TAA and DLAA measure the same, because it runs after anti-aliasing. In
+brightness terms it is a slight sideways smear at the screen sides.
+
+The add-on's `ChromaticAberration=0` (overlay checkbox) zeroes both offset vectors in every `ToneMap_*` pass. It finds
+the buffer by `g_vScreenSize` (byte 336: width, height, 1/width, 1/height).
 
 ## Stage 3 findings so far (2026-10-08)
 

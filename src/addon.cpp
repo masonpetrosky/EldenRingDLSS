@@ -1,7 +1,8 @@
 // Elden Ring DLSS
 // ReShade add-on that replaces ELDEN RING's temporal anti-aliasing (TAA) pass with NVIDIA DLSS.
 // At the TAA draw it feeds the game's own color, depth, motion vectors and camera jitter to DLSS, writes the
-// result into the TAA's render target and skips the original draw.
+// result into the TAA's render target and skips the original draw. Optionally it also turns off the game's
+// chromatic aberration.
 // SPDX-License-Identifier: MIT
 
 #define WIN32_LEAN_AND_MEAN
@@ -42,7 +43,7 @@ namespace {
 namespace fs = std::filesystem;
 
 // Passes recognized by the shader debug names the game ships in its bytecode.
-enum class Pass : uint8_t { kOther, kScene, kMotionPrep, kTaa, kSharpen };
+enum class Pass : uint8_t { kOther, kScene, kMotionPrep, kTaa, kSharpen, kToneMap };
 
 // cbSceneParam, bound at vertex shader register b8 by the scene shaders. Offsets are in floats.
 constexpr uint32_t kSceneParamRegister = 8;
@@ -81,6 +82,8 @@ struct Config {
   // Texture LOD bias for material samplers. NVIDIA's guidance is native bias + log2(render / display) - 1, i.e.
   // -1 for DLAA; the game's own samplers use 0. Samplers are created at startup, so changes need a restart.
   float mip_bias = -1.0f;
+  // The game's lens effect that pulls red and blue apart toward the left and right screen edges.
+  bool chromatic_aberration = true;
   bool flip_jitter_x = false;
   bool flip_jitter_y = false;
   bool flip_motion = false;
@@ -174,6 +177,7 @@ void LoadConfig() {
   g_config.sharpen_strength = ReadFloat(L"SharpenStrength", 0.25f);
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.mip_bias = ReadFloat(L"MipBias", -1.0f);
+  g_config.chromatic_aberration = ReadInt(L"ChromaticAberration", 1) != 0;
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
   g_config.flip_motion = ReadInt(L"FlipMotion", 0) != 0;
@@ -188,6 +192,7 @@ void SaveConfig() {
   WriteFloat(L"SharpenStrength", g_config.sharpen_strength);
   WriteInt(L"GameExposure", g_config.game_exposure);
   WriteFloat(L"MipBias", g_config.mip_bias);
+  WriteInt(L"ChromaticAberration", g_config.chromatic_aberration);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
   WriteInt(L"FlipJitterY", g_config.flip_jitter_y);
   WriteInt(L"FlipMotion", g_config.flip_motion);
@@ -214,6 +219,7 @@ Pass Classify(uint32_t count, const pipeline_subobject* subobjects) {
   if (Contains(ps, "\\PostProcess\\TempAA")) return Pass::kTaa;
   if (Contains(ps, "\\PostProcess\\StencilAndMotionVectorPreprocess")) return Pass::kMotionPrep;
   if (Contains(ps, "\\PostProcess\\SharpenFilter")) return Pass::kSharpen;
+  if (Contains(ps, "\\PostProcess\\ToneMap_")) return Pass::kToneMap;
   if (Contains(vs, "_Velo")) return Pass::kScene;
   return Pass::kOther;
 }
@@ -569,6 +575,47 @@ bool SkipSharpen(command_list* cmd_list) {
   return true;
 }
 
+// The chromatic aberration offsets live in cbToneMap (g_vChromaticAberrationRG at byte 224, g_vChromaticAberrationB
+// at byte 240). The tonemapping passes bind that buffer at different registers, so it is recognized by
+// g_vScreenSize (byte 336: width, height, 1/width, 1/height). Zero offsets sample all three channels at the same
+// spot. Like the sharpen strength, this frame's constants can still be edited before the GPU reads them.
+void RemoveChromaticAberration(command_list* cmd_list) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr) return;
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it == state->descriptor_tables.end()) return;
+  constexpr uint64_t kAberration = 224, kToneMapScreenSize = 336, kBytes = kToneMapScreenSize + 16 - kAberration;
+  for (uint32_t reg = 0; reg < 8; ++reg) {
+    descriptor_heap heap = {0};
+    uint32_t offset = 0;
+    if (!descriptors->Find(dev, it->second.first, it->second.second, shader_stage::pixel,
+                           RegisterKind::kConstantBuffer, reg, 0, &heap, &offset))
+      continue;
+    const buffer_range range = descriptors->Buffer(heap, offset);
+    if (range.buffer == 0 || range.size < kToneMapScreenSize + 16) continue;
+    void* mapped = nullptr;
+    if (!dev->map_buffer_region(range.buffer, range.offset + kAberration, kBytes, map_access::read_write, &mapped))
+      continue;
+    float* const f = static_cast<float*>(mapped);
+    const float* const size = f + (kToneMapScreenSize - kAberration) / 4;
+    const bool tonemap = size[0] >= 16 && size[1] >= 16 && std::fabs(size[0] * size[2] - 1) < 1e-3f &&
+                         std::fabs(size[1] * size[3] - 1) < 1e-3f;
+    static std::atomic<bool> logged{false};
+    if (tonemap && !logged.exchange(true)) {
+      char text[200];
+      std::snprintf(text, sizeof(text),
+                    "Removing chromatic aberration (cbToneMap at b%u; game offsets RG %+.5f %+.5f %+.5f %+.5f, "
+                    "B %+.5f %+.5f).", reg, f[0], f[1], f[2], f[3], f[4], f[5]);
+      Log(reshade::log::level::info, text);
+    }
+    if (tonemap) std::memset(f, 0, 32);
+    dev->unmap_buffer_region(range.buffer);
+    if (tonemap) return;
+  }
+}
+
 // --- Events ------------------------------------------------------------------------------------------------
 
 void OnInitDevice(device* dev) {
@@ -664,7 +711,12 @@ void LogSceneResolution(command_list* cmd_list, const SceneParams& scene) {
 
 bool OnDrawIndexed(command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
   auto* const data = cmd_list->get_private_data<CmdData>();
-  if (data == nullptr || data->pass != Pass::kScene || data->scene_valid || data->scene_attempts >= 8) return false;
+  if (data == nullptr) return false;
+  if (data->pass == Pass::kToneMap) {
+    if (!g_config.chromatic_aberration) RemoveChromaticAberration(cmd_list);
+    return false;
+  }
+  if (data->pass != Pass::kScene || data->scene_valid || data->scene_attempts >= 8) return false;
   ++data->scene_attempts;
   SceneParams scene;
   if (!ReadSceneParams(cmd_list, &scene)) return false;
@@ -694,6 +746,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     if (!g_config.game_sharpening) return SkipSharpen(cmd_list);
     SetSharpenStrength(cmd_list, g_config.sharpen_strength);
   }
+  if (data->pass == Pass::kToneMap && !g_config.chromatic_aberration) RemoveChromaticAberration(cmd_list);
   return false;
 }
 
@@ -790,7 +843,7 @@ std::string CaptureScreenshot(effect_runtime* runtime, const std::string& name) 
 }
 
 // Development remote control: commands written to remote.txt next to the add-on, e.g. "capture taa",
-// "dlss off", "sharpen on", "strength 0.1", "preset 10". The result goes to remote.done.
+// "dlss off", "sharpen on", "strength 0.1", "preset 10", "ca off". The result goes to remote.done.
 void OnReshadePresent(effect_runtime* runtime) {
   static uint64_t counter = 0;
   if (++counter % 10 != 0) return;
@@ -816,6 +869,8 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "preset") {
     g_config.preset = std::atoi(arg.c_str());
     g_recreate = true;
+  } else if (command == "ca") {
+    g_config.chromatic_aberration = arg == "on";
   } else {
     result = "unknown command";
   }
@@ -853,6 +908,9 @@ void OnOverlay(effect_runtime*) {
     SaveConfig();
   }
   ImGui::SetItemTooltip("Gives DLSS the tonemapper's exposure. Off lets DLSS estimate exposure itself.");
+  if (ImGui::Checkbox("Chromatic aberration (game default)", &g_config.chromatic_aberration)) SaveConfig();
+  ImGui::SetItemTooltip("The game's lens effect: red and blue shift up to a pixel apart toward the left and right "
+                        "edges, which softens the image there. Works with DLSS on or off.");
   ImGui::Text("Texture mip bias: %+.2f on %llu samplers (MipBias in EldenRingDLSS.ini, needs a restart)",
               g_applied_mip_bias, static_cast<unsigned long long>(g_biased_samplers.load()));
 
