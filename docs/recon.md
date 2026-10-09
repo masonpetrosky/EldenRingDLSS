@@ -304,3 +304,29 @@ Limgrave grass field at 4K (`ab_capture.ps1 -Round windcov`, coverage markers vi
 
 Not covered: SpeedTree trees (their sway does not follow `FC_GlobalTime`; SpeedTree keeps its own wind state), and
 grass materials outside the three ported ones (`M[AMSN_V]_Grass_Gbuf`, `M[A]_Grass`, emissive variants).
+
+### Cost breakdown and the final selection rule (2026-10-09)
+
+Dev remote `windcost <mode>` (`ab_capture.ps1 -Round windcost` and `-Round windpixel`), GPU time above wind off:
+
+| mode | cost |
+| --- | --- |
+| normal (fused shader) | +0.99 / +1.00 ms |
+| unfused shader | +0.99 ms |
+| static vertex shader (no wind math) | +0.97 ms |
+| pixel shader that only discards | +0.87 ms |
+| no pixel shader | +0.87 ms |
+| no alpha test | +0.97 ms |
+| pipeline and target switches only | +0.13 ms |
+| only intercepting the game's draw | +0.05 ms |
+
+Nearly all of the cost is resubmitting and rasterizing the grass geometry; the shaders are almost free, so fusing
+the two poses (kept for simplicity) changed nothing measurable. Replacing the game's depth prepass with the ported
+shader would remove the extra geometry pass, but `tools/rdc_depthstate.py` shows the shading passes after a prepass
+use `Equal` without depth writes. The port's positions match only to float rounding, so that would punch holes in
+the grass. Not done.
+
+Depth states (capture f12837): the Grass2 prepass `GBufDpt` writes with `GreaterEqual` and its shading uses `Equal`;
+the same goes for Vesitation's few prepasses. Vesitation's usual draw (`_Gbuf_[A]`, 123 of 131 draws) and LOD1 are
+standalone and write depth with `GreaterEqual`. The port therefore follows every grass-family draw whose pipeline
+writes depth. Limgrave grass field: 408 draws per frame, +1.14 ms, near grass 95%, mid grass 71%.
