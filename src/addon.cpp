@@ -1,0 +1,649 @@
+// Elden Ring DLSS
+// ReShade add-on that replaces ELDEN RING's temporal anti-aliasing (TAA) pass with NVIDIA DLSS.
+// At the TAA draw it feeds the game's own color, depth, motion vectors and camera jitter to DLSS, writes the
+// result into the TAA's render target and skips the original draw.
+// SPDX-License-Identifier: MIT
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <d3d12.h>
+
+#define ImTextureID ImU64
+#include <imgui.h>
+#include <reshade.hpp>
+
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+#include "descriptors.hpp"
+#include "dlss.hpp"
+#include "state_tracking.hpp"
+
+extern "C" __declspec(dllexport) const char* NAME = "Elden Ring DLSS";
+extern "C" __declspec(dllexport) const char* DESCRIPTION =
+    "Replaces ELDEN RING's temporal anti-aliasing with NVIDIA DLSS (DLAA).";
+
+using namespace reshade::api;
+using erdlss::RegisterKind;
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// Passes recognized by the shader debug names the game ships in its bytecode.
+enum class Pass : uint8_t { kOther, kScene, kMotionPrep, kTaa };
+
+// cbSceneParam, bound at vertex shader register b8 by the scene shaders. Offsets are in floats.
+constexpr uint32_t kSceneParamRegister = 8;
+constexpr uint32_t kSceneParamBytes = 1424;
+constexpr size_t kScreenSize = 16 / 4;           // float4 FC_ScreenSize
+constexpr size_t kMatrixProj = 256 / 4;          // float4x4 FC_MatrixProj, column-major
+constexpr size_t kSceneExposure = 1152 / 4;      // float SC_SceneExposure
+constexpr size_t kPreExposure = 1160 / 4;        // float SC_PreExposure
+constexpr size_t kScreenPercentage = 1376 / 4;   // float4 SC_DynamicResolution_ScreenPercentage
+
+struct SceneParams {
+  float width = 0, height = 0;
+  float jitter_ndc_x = 0, jitter_ndc_y = 0;
+  float exposure = 1, pre_exposure = 1;
+  float screen_percentage = 1;
+};
+
+struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
+  pipeline current = {0};
+  Pass pass = Pass::kOther;
+  int scene_attempts = 0;
+  bool scene_valid = false;
+  SceneParams scene;
+  resource depth = {0};       // main depth, bound to the motion-vector prep pass as its stencil source
+  resource depth_copy = {0};  // the depth copy the same pass samples
+};
+
+struct Config {
+  bool enabled = false;
+  int preset = 0;  // 0 = NGX default, which is preset K for DLAA
+  int toggle_key = VK_F9;
+  bool flip_jitter_x = false;
+  bool flip_jitter_y = false;
+  bool flip_motion = false;
+  bool use_depth_copy = false;
+};
+
+Config g_config;
+fs::path g_addon_dir;
+fs::path g_ini_path;
+
+device* g_device = nullptr;
+erdlss::Dlss g_dlss;
+std::mutex g_dlss_mutex;
+
+std::shared_mutex g_pipeline_mutex;
+std::unordered_map<uint64_t, Pass> g_pipelines;
+
+std::mutex g_scene_mutex;
+SceneParams g_scene;  // most recent valid scene constants, for command lists without their own
+std::atomic<uint64_t> g_depth{0};
+std::atomic<uint64_t> g_depth_copy{0};
+std::atomic<uint32_t> g_render_width{0};
+std::atomic<uint32_t> g_render_height{0};
+
+std::atomic<uint64_t> g_frame{0};
+std::atomic<float> g_frame_time_ms{16.7f};
+std::atomic<bool> g_reset{true};
+std::atomic<bool> g_recreate{false};
+
+// DLSS writes here (it needs a UAV); the result is then copied into the game's TAA render target.
+resource g_output = {0};
+uint32_t g_output_width = 0, g_output_height = 0;
+format g_output_format = format::unknown;
+struct Retired {
+  resource res;
+  uint64_t frame;
+};
+std::vector<Retired> g_retired;
+
+std::atomic<uint64_t> g_taa_draws{0};
+std::atomic<uint64_t> g_dlss_frames{0};
+std::atomic<uint64_t> g_failures{0};
+std::mutex g_info_mutex;
+std::string g_taa_info = "TAA pass not seen yet.";
+std::string g_logged_info;
+
+void Log(reshade::log::level level, const std::string& message) {
+  reshade::log::message(level, ("[ERDLSS] " + message).c_str());
+}
+
+// --- Configuration -----------------------------------------------------------------------------------------
+
+int ReadInt(const wchar_t* key, int fallback) {
+  return static_cast<int>(GetPrivateProfileIntW(L"EldenRingDLSS", key, fallback, g_ini_path.c_str()));
+}
+
+void WriteInt(const wchar_t* key, int value) {
+  WritePrivateProfileStringW(L"EldenRingDLSS", key, std::to_wstring(value).c_str(), g_ini_path.c_str());
+}
+
+void LoadConfig() {
+  g_config.enabled = ReadInt(L"Enabled", 0) != 0;
+  g_config.preset = ReadInt(L"Preset", 0);
+  g_config.toggle_key = ReadInt(L"ToggleKey", VK_F9);
+  g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
+  g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
+  g_config.flip_motion = ReadInt(L"FlipMotion", 0) != 0;
+  g_config.use_depth_copy = ReadInt(L"UseDepthCopy", 0) != 0;
+}
+
+void SaveConfig() {
+  WriteInt(L"Enabled", g_config.enabled);
+  WriteInt(L"Preset", g_config.preset);
+  WriteInt(L"ToggleKey", g_config.toggle_key);
+  WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
+  WriteInt(L"FlipJitterY", g_config.flip_jitter_y);
+  WriteInt(L"FlipMotion", g_config.flip_motion);
+  WriteInt(L"UseDepthCopy", g_config.use_depth_copy);
+}
+
+// --- Pass detection ----------------------------------------------------------------------------------------
+
+bool Contains(const shader_desc* shader, std::string_view needle) {
+  if (shader == nullptr || shader->code == nullptr || shader->code_size < needle.size()) return false;
+  const std::string_view code(static_cast<const char*>(shader->code), shader->code_size);
+  return code.find(needle) != std::string_view::npos;
+}
+
+Pass Classify(uint32_t count, const pipeline_subobject* subobjects) {
+  const shader_desc* vs = nullptr;
+  const shader_desc* ps = nullptr;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (subobjects[i].type == pipeline_subobject_type::vertex_shader)
+      vs = static_cast<const shader_desc*>(subobjects[i].data);
+    else if (subobjects[i].type == pipeline_subobject_type::pixel_shader)
+      ps = static_cast<const shader_desc*>(subobjects[i].data);
+  }
+  if (Contains(ps, "\\PostProcess\\TempAA")) return Pass::kTaa;
+  if (Contains(ps, "\\PostProcess\\StencilAndMotionVectorPreprocess")) return Pass::kMotionPrep;
+  if (Contains(vs, "_Velo")) return Pass::kScene;
+  return Pass::kOther;
+}
+
+// --- Binding lookups ---------------------------------------------------------------------------------------
+
+resource BoundResource(command_list* cmd_list, shader_stage stage, uint32_t reg) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr) return {0};
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it == state->descriptor_tables.end()) return {0};
+  descriptor_heap heap = {0};
+  uint32_t offset = 0;
+  if (!descriptors->Find(dev, it->second.first, it->second.second, stage, RegisterKind::kShaderResource, reg, 0,
+                         &heap, &offset))
+    return {0};
+  const resource_view view = descriptors->View(heap, offset);
+  return view == 0 ? resource{0} : dev->get_resource_from_view(view);
+}
+
+bool ReadSceneParams(command_list* cmd_list, SceneParams* out) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr) return false;
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it == state->descriptor_tables.end()) return false;
+  descriptor_heap heap = {0};
+  uint32_t offset = 0;
+  if (!descriptors->Find(dev, it->second.first, it->second.second, shader_stage::vertex,
+                         RegisterKind::kConstantBuffer, kSceneParamRegister, 0, &heap, &offset))
+    return false;
+  const buffer_range range = descriptors->Buffer(heap, offset);
+  if (range.buffer == 0 || range.size < kSceneParamBytes) return false;
+
+  void* mapped = nullptr;
+  if (!dev->map_buffer_region(range.buffer, range.offset, kSceneParamBytes, map_access::read_only, &mapped))
+    return false;
+  float f[kSceneParamBytes / 4];
+  std::memcpy(f, mapped, sizeof(f));
+  dev->unmap_buffer_region(range.buffer);
+
+  // A perspective projection stored column-major ends in the column (0, 0, 1, 0); the jitter lives in the
+  // z row of the first two columns and is a fraction of a pixel.
+  const float* proj = f + kMatrixProj;
+  if (!(proj[0] > 0 && proj[5] > 0 && proj[12] == 0 && proj[13] == 0 && proj[14] == 1 && proj[15] == 0 &&
+        std::fabs(proj[2]) < 0.01f && std::fabs(proj[6]) < 0.01f && f[kScreenSize] >= 64 &&
+        f[kScreenSize + 1] >= 64))
+    return false;
+  out->width = f[kScreenSize];
+  out->height = f[kScreenSize + 1];
+  out->jitter_ndc_x = proj[2];
+  out->jitter_ndc_y = proj[6];
+  out->exposure = f[kSceneExposure];
+  out->pre_exposure = f[kPreExposure];
+  out->screen_percentage = f[kScreenPercentage];
+  return true;
+}
+
+const char* FormatName(format f) {
+  switch (f) {
+    case format::r11g11b10_float: return "R11G11B10_FLOAT";
+    case format::r16g16_float: return "R16G16_FLOAT";
+    case format::r16g16b16a16_float: return "R16G16B16A16_FLOAT";
+    case format::r32_g8_typeless: return "R32G8X24_TYPELESS";
+    case format::d32_float_s8_uint: return "D32_FLOAT_S8X24_UINT";
+    case format::r32_typeless: return "R32_TYPELESS";
+    case format::r8g8b8a8_unorm: return "R8G8B8A8_UNORM";
+    case format::r10g10b10a2_unorm: return "R10G10B10A2_UNORM";
+    default: return "other";
+  }
+}
+
+std::string Describe(device* dev, resource res) {
+  if (res == 0) return "none";
+  const resource_desc d = dev->get_resource_desc(res);
+  char text[96];
+  std::snprintf(text, sizeof(text), "%ux%u %s (%d)", d.texture.width, d.texture.height,
+                FormatName(d.texture.format), static_cast<int>(d.texture.format));
+  return text;
+}
+
+// --- DLSS --------------------------------------------------------------------------------------------------
+
+void RetireOutput() {
+  if (g_output != 0) g_retired.push_back({g_output, g_frame.load()});
+  g_output = {0};
+  g_output_width = g_output_height = 0;
+}
+
+bool EnsureOutput(device* dev, uint32_t width, uint32_t height, format fmt) {
+  if (g_output != 0 && g_output_width == width && g_output_height == height && g_output_format == fmt) return true;
+  RetireOutput();
+  const resource_desc desc(width, height, 1, 1, fmt, 1, memory_heap::default_,
+                           resource_usage::unordered_access | resource_usage::copy_source |
+                               resource_usage::shader_resource);
+  if (!dev->create_resource(desc, nullptr, resource_usage::unordered_access, &g_output)) {
+    g_output = {0};
+    Log(reshade::log::level::error, "Could not create the DLSS output texture.");
+    return false;
+  }
+  dev->set_resource_name(g_output, "EldenRingDLSS output");
+  g_output_width = width;
+  g_output_height = height;
+  g_output_format = fmt;
+  return true;
+}
+
+// NGX records its own descriptor heaps, compute root signature and pipeline state into the game's command
+// list. Put the game's back: descriptor heaps and compute root signature directly (ReShade still believes the
+// game's are bound), then every descriptor table the game has set and its current pipeline.
+void RestoreState(command_list* cmd_list, const CmdData& data) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  device* const dev = cmd_list->get_device();
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  if (state == nullptr) return;
+
+  ID3D12DescriptorHeap* heaps[2] = {};  // CBV/SRV/UAV, sampler
+  for (const auto& [stages, tables] : state->descriptor_tables) {
+    for (const descriptor_table table : tables.second) {
+      if (table == 0) continue;
+      descriptor_heap heap = {0};
+      dev->get_descriptor_heap_offset(table, 0, 0, &heap, nullptr);
+      auto* const h = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
+      if (h == nullptr) continue;
+      const int slot = h->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? 1 : 0;
+      if (heaps[slot] == nullptr) heaps[slot] = h;
+    }
+  }
+  ID3D12DescriptorHeap* bound[2];
+  UINT count = 0;
+  for (ID3D12DescriptorHeap* h : heaps)
+    if (h != nullptr) bound[count++] = h;
+  if (count != 0) native->SetDescriptorHeaps(count, bound);
+
+  for (const auto& [stages, tables] : state->descriptor_tables) {
+    if (tables.first == 0) continue;
+    if ((stages & shader_stage::all_compute) != 0)
+      native->SetComputeRootSignature(reinterpret_cast<ID3D12RootSignature*>(tables.first.handle));
+    for (uint32_t i = 0; i < tables.second.size(); ++i)
+      if (tables.second[i] != 0) cmd_list->bind_descriptor_tables(stages, tables.first, i, 1, &tables.second[i]);
+  }
+  if (data.current != 0) cmd_list->bind_pipeline(pipeline_stage::all, data.current);
+}
+
+void SetInfo(const std::string& info) {
+  std::lock_guard lock(g_info_mutex);
+  g_taa_info = info;
+  if (info != g_logged_info) {
+    g_logged_info = info;
+    Log(reshade::log::level::info, info);
+  }
+}
+
+// Returns true when DLSS replaced the draw.
+bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
+  const uint64_t draw = ++g_taa_draws;
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  if (state == nullptr || state->render_targets.empty()) return false;
+
+  const resource color = BoundResource(cmd_list, shader_stage::pixel, 0);   // SourceTex
+  const resource motion = BoundResource(cmd_list, shader_stage::pixel, 3);  // g_MoveTex
+  const resource target = dev->get_resource_from_view(state->render_targets[0]);
+  resource depth = g_config.use_depth_copy ? data.depth_copy : data.depth;
+  if (depth == 0) depth = {g_config.use_depth_copy ? g_depth_copy.load() : g_depth.load()};
+
+  SceneParams scene;
+  bool have_scene = data.scene_valid;
+  if (have_scene) {
+    scene = data.scene;
+  } else {
+    std::lock_guard lock(g_scene_mutex);
+    scene = g_scene;
+    have_scene = scene.width > 0;
+  }
+
+  const resource_desc td = target != 0 ? dev->get_resource_desc(target) : resource_desc();
+  const uint32_t width = td.texture.width, height = td.texture.height;
+  g_render_width = width;
+  g_render_height = height;
+  bool valid = color != 0 && motion != 0 && target != 0 && depth != 0;
+  if (valid) {
+    const resource_desc cd = dev->get_resource_desc(color);
+    const resource_desc md = dev->get_resource_desc(motion);
+    const resource_desc dd = dev->get_resource_desc(depth);
+    valid = cd.texture.width == width && cd.texture.height == height && cd.texture.format == td.texture.format &&
+            md.texture.width == width && md.texture.height == height && md.texture.format == format::r16g16_float &&
+            dd.texture.width == width && dd.texture.height == height;
+  }
+  const bool scene_ok = have_scene && scene.width == static_cast<float>(width) &&
+                        scene.height == static_cast<float>(height);
+
+  if (draw == 1 || !valid || !scene_ok) {
+    char text[512];
+    std::snprintf(text, sizeof(text),
+                  "TAA pass: color %s, motion %s, depth %s, target %s; scene constants %s (%.0fx%.0f, exposure "
+                  "%.3g, pre-exposure %.3g, screen %% %.3g)%s",
+                  Describe(dev, color).c_str(), Describe(dev, motion).c_str(), Describe(dev, depth).c_str(),
+                  Describe(dev, target).c_str(), have_scene ? (scene_ok ? "ok" : "size mismatch") : "missing",
+                  scene.width, scene.height, scene.exposure, scene.pre_exposure, scene.screen_percentage,
+                  valid ? "" : " - inputs incomplete, keeping the game's TAA");
+    SetInfo(text);
+  }
+  if (!g_config.enabled || !valid || !scene_ok) return false;
+
+  std::lock_guard lock(g_dlss_mutex);
+  if (!g_dlss.available()) return false;
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  if (!EnsureOutput(dev, width, height, td.texture.format)) return false;
+  if (!g_dlss.has_feature() || g_dlss.feature_width() != width || g_dlss.feature_height() != height) {
+    const bool created = g_dlss.Create(native, width, height, g_config.preset);
+    RestoreState(cmd_list, data);
+    if (!created) {
+      g_config.enabled = false;
+      Log(reshade::log::level::error, g_dlss.status() + "; DLSS disabled.");
+    } else {
+      Log(reshade::log::level::info, "Created DLSS feature at " + std::to_string(width) + "x" +
+                                         std::to_string(height) + ", preset " + std::to_string(g_config.preset));
+    }
+    g_reset = true;
+    return false;  // DLSS takes over from the next frame
+  }
+
+  erdlss::DlssInputs in;
+  in.color = reinterpret_cast<ID3D12Resource*>(color.handle);
+  in.depth = reinterpret_cast<ID3D12Resource*>(depth.handle);
+  in.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
+  in.output = reinterpret_cast<ID3D12Resource*>(g_output.handle);
+  in.width = width;
+  in.height = height;
+  // Projection offset in pixels with x right and y down.
+  in.jitter_x = (g_config.flip_jitter_x ? -1.0f : 1.0f) * scene.jitter_ndc_x * 0.5f * width;
+  in.jitter_y = (g_config.flip_jitter_y ? -1.0f : 1.0f) * -scene.jitter_ndc_y * 0.5f * height;
+  // The game stores (current - previous) UV with x scaled by the aspect ratio, i.e. both axes in screen
+  // heights; DLSS wants previous - current in pixels.
+  const float mv_scale = (g_config.flip_motion ? 1.0f : -1.0f) * static_cast<float>(height);
+  in.mv_scale_x = mv_scale;
+  in.mv_scale_y = mv_scale;
+  in.reset = g_reset.exchange(false);
+  in.frame_time_ms = g_frame_time_ms.load();
+  const bool ok = g_dlss.Evaluate(native, in);
+  RestoreState(cmd_list, data);
+  if (!ok) {
+    if (++g_failures == 1) Log(reshade::log::level::error, g_dlss.status());
+    return false;
+  }
+
+  cmd_list->barrier(g_output, resource_usage::unordered_access, resource_usage::copy_source);
+  cmd_list->barrier(target, resource_usage::render_target, resource_usage::copy_dest);
+  cmd_list->copy_resource(g_output, target);
+  cmd_list->barrier(target, resource_usage::copy_dest, resource_usage::render_target);
+  cmd_list->barrier(g_output, resource_usage::copy_source, resource_usage::unordered_access);
+  ++g_dlss_frames;
+  return true;
+}
+
+// --- Events ------------------------------------------------------------------------------------------------
+
+void OnInitDevice(device* dev) {
+  if (dev->get_api() != device_api::d3d12 || g_device != nullptr) return;
+  g_device = dev;
+  const fs::path log_dir = g_addon_dir / L"ngx";
+  std::error_code ec;
+  fs::create_directories(log_dir, ec);
+  std::lock_guard lock(g_dlss_mutex);
+  if (g_dlss.Init(reinterpret_cast<ID3D12Device*>(dev->get_native()), g_addon_dir.wstring(), log_dir.wstring()))
+    Log(reshade::log::level::info, "DLSS is available.");
+  else
+    Log(reshade::log::level::warning, "DLSS unavailable: " + g_dlss.status());
+}
+
+void OnDestroyDevice(device* dev) {
+  if (dev != g_device) return;
+  std::lock_guard lock(g_dlss_mutex);
+  RetireOutput();
+  for (const Retired& r : g_retired) dev->destroy_resource(r.res);
+  g_retired.clear();
+  g_dlss.Shutdown();
+  g_device = nullptr;
+}
+
+void OnInitCommandList(command_list* cmd_list) { cmd_list->create_private_data<CmdData>(); }
+
+void OnDestroyCommandList(command_list* cmd_list) { cmd_list->destroy_private_data<CmdData>(); }
+
+void OnResetCommandList(command_list* cmd_list) {
+  if (auto* data = cmd_list->get_private_data<CmdData>()) *data = CmdData();
+}
+
+void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_subobject* subobjects, pipeline p) {
+  const Pass pass = Classify(count, subobjects);
+  if (pass == Pass::kOther) return;
+  std::unique_lock lock(g_pipeline_mutex);
+  g_pipelines[p.handle] = pass;
+}
+
+void OnDestroyPipeline(device*, pipeline p) {
+  std::unique_lock lock(g_pipeline_mutex);
+  g_pipelines.erase(p.handle);
+}
+
+void OnBindPipeline(command_list* cmd_list, pipeline_stage, pipeline p) {
+  auto* const data = cmd_list->get_private_data<CmdData>();
+  if (data == nullptr) return;
+  data->current = p;
+  std::shared_lock lock(g_pipeline_mutex);
+  const auto it = g_pipelines.find(p.handle);
+  data->pass = it == g_pipelines.end() ? Pass::kOther : it->second;
+}
+
+bool OnDrawIndexed(command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
+  auto* const data = cmd_list->get_private_data<CmdData>();
+  if (data == nullptr || data->pass != Pass::kScene || data->scene_valid || data->scene_attempts >= 8) return false;
+  ++data->scene_attempts;
+  SceneParams scene;
+  if (!ReadSceneParams(cmd_list, &scene)) return false;
+  // Other cameras (shadows, probes) use other sizes; once the TAA size is known, only accept matching ones.
+  const uint32_t w = g_render_width.load(), h = g_render_height.load();
+  if (w != 0 && (scene.width != static_cast<float>(w) || scene.height != static_cast<float>(h))) return false;
+  data->scene = scene;
+  data->scene_valid = true;
+  std::lock_guard lock(g_scene_mutex);
+  g_scene = scene;
+  return false;
+}
+
+bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t, uint32_t) {
+  auto* const data = cmd_list->get_private_data<CmdData>();
+  if (data == nullptr) return false;
+  if (data->pass == Pass::kMotionPrep) {
+    data->depth = BoundResource(cmd_list, shader_stage::pixel, 0);       // g_StencilTexForCopy
+    data->depth_copy = BoundResource(cmd_list, shader_stage::pixel, 2);  // g_DepthTex
+    if (data->depth != 0) g_depth = data->depth.handle;
+    if (data->depth_copy != 0) g_depth_copy = data->depth_copy.handle;
+    return false;
+  }
+  if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) return ReplaceTaa(cmd_list, *data);
+  return false;
+}
+
+bool KeyPressed(int vk) {
+  static bool was_down[256] = {};
+  if (vk <= 0 || vk >= 256) return false;
+  const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+  const bool pressed = down && !was_down[vk];
+  was_down[vk] = down;
+  return pressed;
+}
+
+void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
+  const uint64_t frame = ++g_frame;
+  static LARGE_INTEGER frequency = {}, last = {};
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  if (frequency.QuadPart == 0) QueryPerformanceFrequency(&frequency);
+  if (last.QuadPart != 0)
+    g_frame_time_ms = static_cast<float>(1000.0 * (now.QuadPart - last.QuadPart) / frequency.QuadPart);
+  last = now;
+
+  if (KeyPressed(g_config.toggle_key)) {
+    g_config.enabled = !g_config.enabled;
+    g_reset = true;
+    SaveConfig();
+    Log(reshade::log::level::info, g_config.enabled ? "DLSS on." : "DLSS off (game TAA).");
+  }
+
+  if (g_recreate.exchange(false)) {
+    queue->wait_idle();
+    std::lock_guard lock(g_dlss_mutex);
+    g_dlss.ReleaseFeature();
+  }
+  if (!g_retired.empty() && g_device != nullptr) {
+    std::lock_guard lock(g_dlss_mutex);
+    for (auto it = g_retired.begin(); it != g_retired.end();) {
+      if (frame > it->frame + 8) {
+        g_device->destroy_resource(it->res);
+        it = g_retired.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+}
+
+void OnOverlay(effect_runtime*) {
+  bool enabled = g_config.enabled;
+  if (ImGui::Checkbox("Use DLSS instead of the game's TAA", &enabled)) {
+    g_config.enabled = enabled;
+    g_reset = true;
+    SaveConfig();
+  }
+  ImGui::SetItemTooltip("Toggle in game with F9 (ToggleKey in EldenRingDLSS.ini).");
+
+  static const char* kPresetNames[] = {"Default (K)", "J", "K", "L", "M"};
+  static const int kPresetValues[] = {0, 10, 11, 12, 13};
+  int index = 0;
+  for (int i = 0; i < 5; ++i)
+    if (kPresetValues[i] == g_config.preset) index = i;
+  if (ImGui::Combo("Preset", &index, kPresetNames, 5)) {
+    g_config.preset = kPresetValues[index];
+    g_recreate = true;
+    SaveConfig();
+  }
+
+  {
+    std::unique_lock lock(g_dlss_mutex, std::try_to_lock);
+    if (lock.owns_lock()) ImGui::Text("DLSS: %s", g_dlss.status().c_str());
+  }
+  ImGui::Text("TAA draws: %llu   DLSS frames: %llu   failures: %llu",
+              static_cast<unsigned long long>(g_taa_draws.load()),
+              static_cast<unsigned long long>(g_dlss_frames.load()),
+              static_cast<unsigned long long>(g_failures.load()));
+  {
+    std::lock_guard lock(g_info_mutex);
+    ImGui::TextWrapped("%s", g_taa_info.c_str());
+  }
+  {
+    std::lock_guard lock(g_scene_mutex);
+    ImGui::Text("Jitter (NDC): %+.6f %+.6f   exposure %.3g", g_scene.jitter_ndc_x, g_scene.jitter_ndc_y,
+                g_scene.exposure);
+  }
+
+  if (ImGui::CollapsingHeader("Developer")) {
+    bool changed = ImGui::Checkbox("Flip jitter X", &g_config.flip_jitter_x);
+    changed |= ImGui::Checkbox("Flip jitter Y", &g_config.flip_jitter_y);
+    changed |= ImGui::Checkbox("Flip motion vectors", &g_config.flip_motion);
+    changed |= ImGui::Checkbox("Use the depth copy", &g_config.use_depth_copy);
+    if (changed) {
+      g_reset = true;
+      SaveConfig();
+    }
+  }
+}
+
+void Initialize(HMODULE module) {
+  wchar_t path[MAX_PATH] = {};
+  GetModuleFileNameW(module, path, MAX_PATH);
+  g_addon_dir = fs::path(path).parent_path();
+  g_ini_path = g_addon_dir / L"EldenRingDLSS.ini";
+  LoadConfig();
+  Log(reshade::log::level::info, std::string("Loaded. DLSS ") + (g_config.enabled ? "on" : "off") +
+                                     "; toggle key " + std::to_string(g_config.toggle_key) + ".");
+}
+
+}  // namespace
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+  switch (reason) {
+    case DLL_PROCESS_ATTACH:
+      if (!reshade::register_addon(module)) return FALSE;
+      Initialize(module);
+      erdlss::Descriptors::RegisterEvents();
+      state_tracking::register_events();
+      reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+      reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
+      reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
+      reshade::register_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
+      reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
+      reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
+      reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+      reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+      reshade::register_event<reshade::addon_event::draw>(OnDraw);
+      reshade::register_event<reshade::addon_event::present>(OnPresent);
+      reshade::register_overlay(nullptr, OnOverlay);
+      break;
+    case DLL_PROCESS_DETACH:
+      reshade::unregister_addon(module);
+      break;
+  }
+  return TRUE;
+}
