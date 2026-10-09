@@ -1,0 +1,8 @@
+# local tools, captures and build output
+.tools/
+build/
+dist/
+captures/
+*.rdc
+*.log
+__pycache__/
