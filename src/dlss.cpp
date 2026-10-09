@@ -137,6 +137,7 @@ bool Dlss::Evaluate(ID3D12GraphicsCommandList* cmd, const DlssInputs& in) {
   eval.InMVScaleX = in.mv_scale_x;
   eval.InMVScaleY = in.mv_scale_y;
   eval.pInExposureTexture = in.exposure;
+  eval.pInBiasCurrentColorMask = in.bias_mask;
   eval.InPreExposure = 1.0f;
   eval.InExposureScale = 1.0f;
   eval.InFrameTimeDeltaInMsec = in.frame_time_ms;

@@ -19,8 +19,19 @@ add_library(reshade_utils STATIC third_party/reshade/state_tracking.cpp)
 target_include_directories(reshade_utils PUBLIC third_party/reshade)
 target_compile_options(reshade_utils PRIVATE /W0)
 
-add_library(EldenRingDLSS SHARED src/addon.cpp src/descriptors.cpp src/dlss.cpp)
-target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui)
+# Compute shaders are compiled to DXBC headers with the Windows SDK's fxc.
+find_program(FXC fxc REQUIRED)
+set(SHADER_DIR ${CMAKE_BINARY_DIR}/shaders)
+add_custom_command(
+  OUTPUT ${SHADER_DIR}/vegetation_mask_cs.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
+  COMMAND ${FXC} /nologo /T cs_5_0 /E main /O3 /Vn kVegetationMaskCs /Fh ${SHADER_DIR}/vegetation_mask_cs.h
+          ${CMAKE_SOURCE_DIR}/src/vegetation_mask.hlsl
+  DEPENDS src/vegetation_mask.hlsl
+  VERBATIM)
+
+add_library(EldenRingDLSS SHARED src/addon.cpp src/descriptors.cpp src/dlss.cpp ${SHADER_DIR}/vegetation_mask_cs.h)
+target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui ${SHADER_DIR})
 target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
 target_link_libraries(EldenRingDLSS PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib d3d12)
 set_target_properties(EldenRingDLSS PROPERTIES SUFFIX ".addon64")

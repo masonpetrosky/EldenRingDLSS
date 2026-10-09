@@ -209,3 +209,16 @@ The low two bits are an object class; the next two look like distance bands (mor
 wind motion. In the ruin view, class 3 (58% of the screen) had 33% of its pixels change by more than 6% over one
 second, with motion vectors on 0.1% of them. Class 0 (38%) changed on 1.6%. The game's TAA handles this by
 giving class 3 the least history (0.80 against 0.90 for terrain).
+
+### DLSS bias-current-color mask: no effect (2026-10-09)
+
+The add-on can pass class 3 to DLSS as `pInBiasCurrentColorMask` (`src/vegetation_mask.hlsl` turns the stencil copy
+into an R8_UNORM mask; ini `VegetationMask`, remote `vmask <strength>`, `vmaskall on` masks the whole screen).
+The dumped mask was correct: 255 on every pixel in whole-screen mode, and 255 on exactly the class-3 pixels
+otherwise (99% agreement with the same frame's stencil; the rest is one frame of wind). Captures at the ruin wall
+(`ab_capture.ps1 -Round vmask` and `-Round vmaskpresets`) showed no effect with DLSS 310.x at DLAA. With the
+whole screen masked at strength 1, the static wall changed by RMS 7.3-10.2 (x1000) for presets F, K, L and M.
+Two unmasked captures differ by 6.8, so that is just capture noise. Fine noise on the wall stayed within ±5%. A
+mask DLSS honored would have handed the wall the raw, aliased current frame. So this DLSS version ignores the input
+for DLAA, even on the CNN preset F. Option 1 for the wind problem is out; the mask pipeline can be reused for a
+vegetation-only post effect.

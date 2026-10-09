@@ -31,6 +31,7 @@
 #include "descriptors.hpp"
 #include "dlss.hpp"
 #include "state_tracking.hpp"
+#include "vegetation_mask_cs.h"
 
 extern "C" __declspec(dllexport) const char* NAME = "Elden Ring DLSS";
 extern "C" __declspec(dllexport) const char* DESCRIPTION =
@@ -85,6 +86,12 @@ struct Config {
   float mip_bias = -1.0f;
   // The game's lens effect that pulls red and blue apart toward the left and right screen edges.
   bool chromatic_aberration = true;
+  // Wind sways the game's vegetation without motion vectors. This is the strength of DLSS's bias-current-color mask
+  // on the TAA's object class 3 (vegetation and natural rocks): 0 = off, 1 = rely on the current frame there.
+  // DLSS 310.x ignores the mask for DLAA with every preset (F, K, L, M tested), so it stays an ini/remote setting
+  // for testing newer DLSS versions.
+  float vegetation_mask = 0.0f;
+  bool mask_everything = false;  // development test: mask the whole screen (not saved)
   bool flip_jitter_x = false;
   bool flip_jitter_y = false;
   bool flip_motion = false;
@@ -131,6 +138,15 @@ constexpr uint32_t kExposureSlotBytes = 512;  // D3D12 texture copies need 512-b
 resource g_exposure = {0};
 resource g_exposure_upload = {0};
 uint8_t* g_exposure_mapped = nullptr;
+
+// Bias-current-color mask for DLSS, computed from the TAA's stencil copy by vegetation_mask.hlsl.
+constexpr uint32_t kVegetationClass = 3;
+pipeline_layout g_mask_layout = {0};
+pipeline g_mask_pipeline = {0};
+bool g_mask_failed = false;
+resource g_mask = {0};
+resource_view g_mask_uav = {0};
+std::unordered_map<uint64_t, resource_view> g_stencil_views;  // stencil copy -> its R8_UINT view
 
 float g_applied_mip_bias = 0.0f;  // bias in effect for this session (fixed at startup)
 std::atomic<uint64_t> g_biased_samplers{0};
@@ -195,6 +211,7 @@ void LoadConfig() {
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.mip_bias = ReadFloat(L"MipBias", -1.0f);
   g_config.chromatic_aberration = ReadInt(L"ChromaticAberration", 1) != 0;
+  g_config.vegetation_mask = ReadFloat(L"VegetationMask", 0.0f);
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
   g_config.flip_motion = ReadInt(L"FlipMotion", 0) != 0;
@@ -210,6 +227,7 @@ void SaveConfig() {
   WriteInt(L"GameExposure", g_config.game_exposure);
   WriteFloat(L"MipBias", g_config.mip_bias);
   WriteInt(L"ChromaticAberration", g_config.chromatic_aberration);
+  WriteFloat(L"VegetationMask", g_config.vegetation_mask);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
   WriteInt(L"FlipJitterY", g_config.flip_jitter_y);
   WriteInt(L"FlipMotion", g_config.flip_motion);
@@ -423,7 +441,8 @@ void SetInfo(const std::string& info) {
   }
 }
 
-bool CopyToReadback(command_list* cmd_list, resource res, uint64_t frame, const std::string& name) {
+bool CopyToReadback(command_list* cmd_list, resource res, uint64_t frame, const std::string& name,
+                    resource_usage state = resource_usage::shader_resource) {
   device* const dev = cmd_list->get_device();
   const resource_desc d = dev->get_resource_desc(res);
   const uint32_t bpp = format_row_pitch(d.texture.format, 1);
@@ -433,9 +452,9 @@ bool CopyToReadback(command_list* cmd_list, resource res, uint64_t frame, const 
                                           resource_usage::copy_dest),
                             nullptr, resource_usage::copy_dest, &buffer))
     return false;
-  cmd_list->barrier(res, resource_usage::shader_resource, resource_usage::copy_source);
+  cmd_list->barrier(res, state, resource_usage::copy_source);
   cmd_list->copy_texture_to_buffer(res, 0, nullptr, buffer, 0, row_pitch / bpp, d.texture.height);
-  cmd_list->barrier(res, resource_usage::copy_source, resource_usage::shader_resource);
+  cmd_list->barrier(res, resource_usage::copy_source, state);
   g_dumps.push_back({buffer, d.texture.width, d.texture.height, row_pitch, bpp, d.texture.format, frame, name});
   return true;
 }
@@ -467,6 +486,12 @@ void DumpTaaInputs(command_list* cmd_list) {
     g_dump_remaining = 0;
     return;
   }
+  {
+    // The vegetation mask as DLSS saw it in the previous frame (it stays in the unordered-access state between frames).
+    std::lock_guard dlss_lock(g_dlss_mutex);
+    if (g_mask != 0 && g_config.vegetation_mask > 0.0f)
+      CopyToReadback(cmd_list, g_mask, frame, g_dump_name + "_mask" + suffix, resource_usage::unordered_access);
+  }
   g_dump_last = frame;
   --g_dump_remaining;
 }
@@ -484,7 +509,7 @@ std::string WriteDumps(command_queue* queue) {
     std::lock_guard scene_lock(g_scene_mutex);
     exposure = g_scene.exposure;
   }
-  size_t frames = 0, stencils = 0;
+  size_t frames = 0, stencils = 0, masks = 0;
   for (const Readback& r : g_dumps) {
     void* mapped = nullptr;
     if (g_device->map_buffer_region(r.buffer, 0, UINT64_MAX, map_access::read_only, &mapped)) {
@@ -496,13 +521,96 @@ std::string WriteDumps(command_queue* queue) {
       std::ofstream(dir / (r.name + ".txt")) << r.width << " " << r.height << " " << static_cast<int>(r.fmt) << " "
                                              << (r.frame - g_dump_start) << " " << exposure << "\n";
       frames += r.fmt == format::r16g16_float;
-      stencils += r.bytes_per_pixel == 1;
+      stencils += r.bytes_per_pixel == 1 && r.fmt != format::r8_unorm;
+      masks += r.fmt == format::r8_unorm;
     }
     g_device->destroy_resource(r.buffer);
   }
   g_dumps.clear();
-  return "saved " + std::to_string(frames) + " frames (" + std::to_string(stencils) + " with stencil) as shots/" +
+  return "saved " + std::to_string(frames) + " frames (" + std::to_string(stencils) + " with stencil, " +
+         std::to_string(masks) + " with mask) as shots/" +
          g_dump_name + "_mv_NN.bin";
+}
+
+void DestroyMask(device* dev) {
+  for (const auto& [res, view] : g_stencil_views) dev->destroy_resource_view(view);
+  g_stencil_views.clear();
+  if (g_mask_uav != 0) dev->destroy_resource_view(g_mask_uav);
+  if (g_mask != 0) dev->destroy_resource(g_mask);
+  g_mask_uav = {0};
+  g_mask = {0};
+}
+
+bool EnsureMask(device* dev, uint32_t width, uint32_t height) {
+  if (g_mask_failed) return false;
+  if (g_mask_pipeline == 0) {
+    const pipeline_layout_param params[] = {
+        constant_range{0, 0, 0, 4, shader_stage::compute},
+        descriptor_range{0, 0, 0, 1, shader_stage::compute, 1, descriptor_type::texture_shader_resource_view},
+        descriptor_range{0, 0, 0, 1, shader_stage::compute, 1, descriptor_type::texture_unordered_access_view},
+    };
+    shader_desc cs = {};
+    cs.code = kVegetationMaskCs;
+    cs.code_size = sizeof(kVegetationMaskCs);
+    const pipeline_subobject subobject = {pipeline_subobject_type::compute_shader, 1, &cs};
+    if (!dev->create_pipeline_layout(3, params, &g_mask_layout) ||
+        !dev->create_pipeline(g_mask_layout, 1, &subobject, &g_mask_pipeline)) {
+      Log(reshade::log::level::error, "Could not create the vegetation mask shader; mask disabled.");
+      g_mask_failed = true;
+      return false;
+    }
+  }
+  if (g_mask != 0) {
+    const resource_desc d = dev->get_resource_desc(g_mask);
+    if (d.texture.width == width && d.texture.height == height) return true;
+    DestroyMask(dev);  // new size: the game recreated its render targets, so cached stencil views are stale too
+  }
+  const resource_desc desc(width, height, 1, 1, format::r8_unorm, 1, memory_heap::default_,
+                           resource_usage::unordered_access | resource_usage::shader_resource);
+  if (!dev->create_resource(desc, nullptr, resource_usage::unordered_access, &g_mask) ||
+      !dev->create_resource_view(g_mask, resource_usage::unordered_access, resource_view_desc(format::r8_unorm),
+                                 &g_mask_uav)) {
+    Log(reshade::log::level::error, "Could not create the vegetation mask texture; mask disabled.");
+    DestroyMask(dev);
+    g_mask_failed = true;
+    return false;
+  }
+  dev->set_resource_name(g_mask, "EldenRingDLSS vegetation mask");
+  return true;
+}
+
+// Records the mask computation and leaves the mask readable for DLSS. Returns false without a usable stencil.
+bool BuildMask(command_list* cmd_list, resource stencil, uint32_t width, uint32_t height) {
+  device* const dev = cmd_list->get_device();
+  if (stencil == 0) return false;
+  const resource_desc sd = dev->get_resource_desc(stencil);
+  if (format_to_typeless(sd.texture.format) != format::r8_typeless || sd.texture.width != width ||
+      sd.texture.height != height || !EnsureMask(dev, width, height))
+    return false;
+  resource_view& view = g_stencil_views[stencil.handle];
+  if (view == 0 && !dev->create_resource_view(stencil, resource_usage::shader_resource,
+                                              resource_view_desc(format::r8_uint), &view)) {
+    g_stencil_views.erase(stencil.handle);
+    return false;
+  }
+  const struct {
+    float strength;
+    uint32_t object_class, everything, unused;
+  } constants = {g_config.vegetation_mask, kVegetationClass, g_config.mask_everything ? 1u : 0u, 0u};
+  cmd_list->bind_pipeline(pipeline_stage::all_compute, g_mask_pipeline);
+  cmd_list->push_constants(shader_stage::compute, g_mask_layout, 0, 0, 4, &constants);
+  cmd_list->push_descriptors(shader_stage::compute, g_mask_layout, 1,
+                             descriptor_table_update{{}, 0, 0, 1, descriptor_type::texture_shader_resource_view, &view});
+  cmd_list->push_descriptors(shader_stage::compute, g_mask_layout, 2,
+                             descriptor_table_update{{}, 0, 0, 1, descriptor_type::texture_unordered_access_view,
+                                                     &g_mask_uav});
+  cmd_list->dispatch((width + 7) / 8, (height + 7) / 8, 1);
+  cmd_list->barrier(g_mask, resource_usage::unordered_access, resource_usage::shader_resource);
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true))
+    Log(reshade::log::level::info, "Vegetation mask active (strength " + std::to_string(g_config.vegetation_mask) +
+                                       (g_config.mask_everything ? ", whole screen)." : ")."));
+  return true;
 }
 
 // Returns true when DLSS replaced the draw.
@@ -582,6 +690,8 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
     return false;  // DLSS takes over from the next frame
   }
   if (game_exposure) UploadExposure(cmd_list, scene.exposure);
+  const bool masked = g_config.vegetation_mask > 0.0f &&
+                      BuildMask(cmd_list, BoundResource(cmd_list, shader_stage::pixel, 5), width, height);  // g_StencilTex
 
   erdlss::DlssInputs in;
   in.color = reinterpret_cast<ID3D12Resource*>(color.handle);
@@ -589,6 +699,7 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   in.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
   in.output = reinterpret_cast<ID3D12Resource*>(g_output.handle);
   in.exposure = game_exposure ? reinterpret_cast<ID3D12Resource*>(g_exposure.handle) : nullptr;
+  in.bias_mask = masked ? reinterpret_cast<ID3D12Resource*>(g_mask.handle) : nullptr;
   in.width = width;
   in.height = height;
   // Projection offset in pixels with x right and y down.
@@ -602,6 +713,7 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   in.reset = g_reset.exchange(false);
   in.frame_time_ms = g_frame_time_ms.load();
   const bool ok = g_dlss.Evaluate(native, in);
+  if (masked) cmd_list->barrier(g_mask, resource_usage::shader_resource, resource_usage::unordered_access);
   RestoreState(cmd_list, data);
   if (!ok) {
     if (++g_failures == 1) Log(reshade::log::level::error, g_dlss.status());
@@ -749,6 +861,11 @@ void OnDestroyDevice(device* dev) {
   if (g_exposure != 0) dev->destroy_resource(g_exposure);
   g_exposure = g_exposure_upload = {0};
   g_exposure_mapped = nullptr;
+  DestroyMask(dev);
+  if (g_mask_pipeline != 0) dev->destroy_pipeline(g_mask_pipeline);
+  if (g_mask_layout != 0) dev->destroy_pipeline_layout(g_mask_layout);
+  g_mask_pipeline = {0};
+  g_mask_layout = {0};
   g_dlss.Shutdown();
   g_device = nullptr;
 }
@@ -956,7 +1073,8 @@ void FinishRemote(const std::string& request, const std::string& result) {
 }
 
 // Development remote control: commands written to remote.txt next to the add-on, e.g. "capture taa",
-// "dlss off", "sharpen on", "strength 0.1", "preset 10", "ca off", "mv 8 grass". The result goes to remote.done.
+// "dlss off", "sharpen on", "strength 0.1", "preset 10", "ca off", "mv 8 grass", "vmask 1", "vmaskall on". The
+// result goes to remote.done.
 void OnReshadePresent(effect_runtime* runtime) {
   static std::string dump_request;  // the pending "mv" command, answered once its frames are saved
   if (!dump_request.empty()) {
@@ -1006,6 +1124,10 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "preset") {
     g_config.preset = std::atoi(arg.c_str());
     g_recreate = true;
+  } else if (command == "vmask") {
+    g_config.vegetation_mask = std::strtof(arg.c_str(), nullptr);
+  } else if (command == "vmaskall") {
+    g_config.mask_everything = arg == "on";
   } else if (command == "ca") {
     g_config.chromatic_aberration = arg == "on";
   } else {

@@ -7,8 +7,13 @@
 # ini setting.
 # -Round mv: two dumps of the TAA's motion vectors and color (8 frames each, 1 s apart) for tools\mv_check.py.
 # Keep the camera at rest so only objects that write their own velocity show motion.
+# -Round vmask: DLAA with the vegetation bias mask off, on the whole screen (does the preset read the mask at all?),
+# and on vegetation at strength 1 and 0.5; then back to the ini setting.
+# -Round vmaskpresets: the whole-screen mask off and on with presets F (CNN, documented to read the mask), L and M,
+# then back to the ini preset with the mask off.
+# -Round maskcheck: dumps the vegetation mask (whole screen, then vegetation only) next to the stencil.
 param(
-  [ValidateSet('sharpen', 'presets', 'ca', 'mv')][string]$Round = 'sharpen',
+  [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -39,6 +44,30 @@ if ($Round -eq 'sharpen') {
   Send 'sharpen off'; Send 'preset 10' 2.5; Send 'capture dlaa_presetJ'
   Send 'preset 0'; Send 'dlss off' 2.0; Send 'capture taa'
   Send 'dlss on' 1.0
+} elseif ($Round -eq 'vmask') {
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = ($ini | Where-Object { $_ -match '^VegetationMask=' }) -replace '^VegetationMask=', ''
+  if (-not $restore) { $restore = '0' }
+  Send 'dlss on'; Send 'vmaskall off'; Send 'vmask 0' 1.5; Send 'capture vm_off'
+  Send 'vmaskall on'; Send 'vmask 1' 1.5; Send 'capture vm_all'
+  Send 'vmaskall off' 1.5; Send 'capture vm_veg100'
+  Send 'vmask 0.5' 1.5; Send 'capture vm_veg50'
+  Send 'vmask 0' 1.5; Send 'capture vm_off2'
+  Send "vmask $restore"
+} elseif ($Round -eq 'vmaskpresets') {
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $preset = ($ini | Where-Object { $_ -match '^Preset=' }) -replace '^Preset=', ''
+  if (-not $preset) { $preset = '0' }
+  Send 'dlss on'; Send 'vmaskall on'
+  foreach ($p in @(@('6', 'F'), @('12', 'L'), @('13', 'M'))) {
+    Send 'vmask 0'; Send "preset $($p[0])" 3.0; Send "capture vmp_$($p[1])_off"
+    Send 'vmask 1' 1.5; Send "capture vmp_$($p[1])_all"
+  }
+  Send 'vmask 0'; Send 'vmaskall off'; Send "preset $preset" 1.0
+} elseif ($Round -eq 'maskcheck') {
+  Send 'dlss on'; Send 'vmaskall on'; Send 'vmask 1' 0.5; Send 'mv 2 maskall'
+  Send 'vmaskall off' 0.5; Send 'mv 2 maskveg'
+  Send 'vmask 0'
 } elseif ($Round -eq 'mv') {
   Send 'mv 8 still_a' 1.0; Send 'mv 8 still_b'
 } elseif ($Round -eq 'ca') {

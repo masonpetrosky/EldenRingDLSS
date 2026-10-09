@@ -19,6 +19,7 @@ struct DlssInputs {
   ID3D12Resource* motion = nullptr;
   ID3D12Resource* output = nullptr;  // output resolution, in UNORDERED_ACCESS state
   ID3D12Resource* exposure = nullptr;  // 1x1 R32_FLOAT, or null when the feature uses auto-exposure
+  ID3D12Resource* bias_mask = nullptr;  // R8_UNORM bias-current-color mask (1 = trust the current frame), optional
   uint32_t width = 0;                // render resolution
   uint32_t height = 0;
   float jitter_x = 0.0f;             // render pixels
