@@ -270,3 +270,37 @@ Result at a Limgrave grass field (`ab_capture.ps1 -Round winddiag`, `tools/wind_
 
 Left in the code, off by default, for future use. Ideas if it's ever revisited: replace the game's draw with an
 SO-enabled copy (saves one replay), early-Z in the resolve, skip far-LOD grass, fix the trees.
+
+## Wind motion vectors, take 2: a port of the grass vertex shader (2026-10-09)
+
+The stream-output version costs ~6 ms because stream output gives up the GPU's vertex reuse (one heavy wind-shader run
+per index). `src/wind_port.*` (WindMode=1, the default) instead reimplements the grass family's position math in
+`wind_port.hlsl`, decompiled from `M[AMSN_V]_Grass2_Gbuf` and `_Grass2_LOD1_Gbuf`:
+
+- World position: an instance-indirected object matrix (`g_InstanceIndexBuffer`, `cbInstanceData` row 4,
+  `cbObjMatrix`). Up to 8 forces (`cbInstanceData` row 7, `g_forceParam`) add up to a displacement: a sine sway with
+  distance falloff and an optional cone, plus travelling gust pulses. The blade is rotated about its pivot (TEXCOORD3,
+  or TEXCOORD2 for LOD1) by `log2(|D| + 1) * k` around `cross(up, D)`, weighted by `1 - TEXCOORD2.z` (LOD1: by the
+  height above the pivot, after shrinking distant blades toward the pivot).
+- Grass2 and Vesitation are the same shader apart from which `cbMtdParam` components scale the phase and the bend
+  (.y/.z vs .x/.w). LOD1 adds the distance shrink.
+- The shader reads the game's `cbSceneParam`/`cbPerFrame` itself (both poses in one pass) and runs on the game's own
+  root signature. It is drawn right after the game's draw into a velocity and a depth side target, with a
+  greater-equal test against the game's depth. `wind_merge.hlsl` copies the velocity into the TAA's `g_MoveTex` where
+  the recorded depth is still the final one.
+- Grass2 and Vesitation draw every batch twice: a `GBufDpt` depth prepass, then shading with the same vertex shader.
+  Only the prepass gets the velocity pass, with its pixel shader's alpha test ported (texture alpha, camera fades
+  with the 8x8 dither, per-instance LOD dither, `FC_AlphaRef`). LOD1 has a single pass; its G-buffer shader's test
+  (`FC_CameraFadeParam`) is ported too.
+
+Limgrave grass field at 4K (`ab_capture.ps1 -Round windcov`, coverage markers via `windmerge drawn|merged`):
+
+| | stream output | port |
+| --- | --- | --- |
+| frame time, wind off -> on | 8.9 -> 14.95 ms (+6.05) | 9.28 -> 10.25 ms (+0.97) |
+| near grass motion (median) | 0.64 px | 0.60-0.63 px |
+| near grass pixels with motion | 92% | 95% |
+| mid grass pixels with motion | 56% | 69% (the rest is mostly bushes and rocks drawn over it) |
+
+Not covered: SpeedTree trees (their sway does not follow `FC_GlobalTime`; SpeedTree keeps its own wind state), and
+grass materials outside the three ported ones (`M[AMSN_V]_Grass_Gbuf`, `M[A]_Grass`, emissive variants).
