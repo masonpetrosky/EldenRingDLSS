@@ -68,3 +68,10 @@ to UnlockTheFps) detected the TAA inputs in game and ran DLSS 310.9.1 DLAA at 38
 failures. Toggling with F9 showed less noise than the game's TAA. Jitter from `FC_MatrixProj` with the
 "projection offset in pixels, y down" convention and motion scale (-H, -H) gave a stable image (no smearing
 reported).
+
+## Polish result (2026-10-08)
+
+With the game in HDR, DLAA with the game's sharpening pass skipped looked clearly best (grass blades much
+cleaner; the sharpening filter's artifacts stand out in HDR). In SDR the unsharpened DLAA reads as softer.
+Feeding DLSS the tonemapper exposure instead of auto-exposure made a small difference (some highlights
+popped more). Defaults: game sharpening off, game exposure on.
