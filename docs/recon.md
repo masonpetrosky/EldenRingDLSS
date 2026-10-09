@@ -96,3 +96,10 @@ popped more). Defaults: game sharpening off, game exposure on.
   `0x141B68C81` then copies the struct field by field into the mapped constant buffer.
 - Next: find who writes view+0xF4 (and whether scene viewports follow it), then force it from the add-on.
 - Note: under RenderDoc the game reports HDR as unsupported and saves HDR off; turn it back on after captures.
+- One level further: the per-frame view setup around `0x140A3AD20` fills view+0xD4..0xF0 from a render context
+  (`r13`, fields +0x964/+0x980/+0x994..0x9A8) and copies view+0xF4 = context+0x9AC (16 bytes, primary
+  percentages) and view+0x104 = context+0x9BC (secondary). It also fills view+0x114.. from calls to
+  `0x14025FA70`/`0x14025FA40` (render target sizes per index). No direct SIMD or float store to context+0x9AC
+  exists in the code, so it is filled indirectly (bulk copy or through a pointer). Next: capture `r13` at
+  runtime (hook or hardware breakpoint at `0x140A3ADBE`), write 0.67 there, and check whether the scene
+  viewports follow (the add-on logs "Scene: screen percentage ..., geometry viewport ...").
