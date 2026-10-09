@@ -14,6 +14,7 @@
 #include <imgui.h>
 #include <reshade.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -133,6 +134,21 @@ uint8_t* g_exposure_mapped = nullptr;
 
 float g_applied_mip_bias = 0.0f;  // bias in effect for this session (fixed at startup)
 std::atomic<uint64_t> g_biased_samplers{0};
+
+// Development dump of the TAA's inputs (remote command "mv <frames> [name]"): g_MoveTex and SourceTex of
+// consecutive frames, copied into readback buffers at the TAA draw and saved to shots/ a few frames later.
+struct Readback {
+  resource buffer;
+  uint32_t width, height, row_pitch;
+  format fmt;
+  uint64_t frame;
+  std::string name;
+};
+std::mutex g_dump_mutex;
+std::atomic<int> g_dump_remaining{0};
+std::string g_dump_name;
+uint64_t g_dump_start = 0, g_dump_last = 0;
+std::vector<Readback> g_dumps;
 
 std::atomic<uint64_t> g_taa_draws{0};
 std::atomic<uint64_t> g_dlss_frames{0};
@@ -406,6 +422,81 @@ void SetInfo(const std::string& info) {
   }
 }
 
+bool CopyToReadback(command_list* cmd_list, resource res, uint64_t frame, const std::string& name) {
+  device* const dev = cmd_list->get_device();
+  const resource_desc d = dev->get_resource_desc(res);
+  const uint32_t row_pitch = (d.texture.width * 4 + 255) & ~255u;  // both inputs are 32 bits per pixel
+  resource buffer = {0};
+  if (!dev->create_resource(resource_desc(static_cast<uint64_t>(row_pitch) * d.texture.height, memory_heap::readback,
+                                          resource_usage::copy_dest),
+                            nullptr, resource_usage::copy_dest, &buffer))
+    return false;
+  cmd_list->barrier(res, resource_usage::shader_resource, resource_usage::copy_source);
+  cmd_list->copy_texture_to_buffer(res, 0, nullptr, buffer, 0, row_pitch / 4, d.texture.height);
+  cmd_list->barrier(res, resource_usage::copy_source, resource_usage::shader_resource);
+  g_dumps.push_back({buffer, d.texture.width, d.texture.height, row_pitch, d.texture.format, frame, name});
+  return true;
+}
+
+// Called at the TAA draw while a dump is pending; copies once per frame.
+void DumpTaaInputs(command_list* cmd_list) {
+  std::lock_guard lock(g_dump_mutex);
+  const uint64_t frame = g_frame.load();
+  if (g_dump_remaining.load() <= 0 || frame == g_dump_last) return;
+  device* const dev = cmd_list->get_device();
+  const resource color = BoundResource(cmd_list, shader_stage::pixel, 0);   // SourceTex
+  const resource motion = BoundResource(cmd_list, shader_stage::pixel, 3);  // g_MoveTex
+  if (color == 0 || motion == 0) return;
+  const resource_desc md = dev->get_resource_desc(motion);
+  const resource_desc cd = dev->get_resource_desc(color);
+  if (md.texture.format != format::r16g16_float || cd.texture.format != format::r11g11b10_float ||
+      md.texture.width != cd.texture.width || md.texture.height != cd.texture.height)
+    return;
+  if (g_dump_last == 0) g_dump_start = frame;  // the request may arrive while this frame's draw is already recorded
+  const int index = static_cast<int>(frame - g_dump_start);
+  char suffix[16];
+  std::snprintf(suffix, sizeof(suffix), "_%02d", index);
+  if (!CopyToReadback(cmd_list, motion, frame, g_dump_name + "_mv" + suffix) ||
+      !CopyToReadback(cmd_list, color, frame, g_dump_name + "_color" + suffix)) {
+    Log(reshade::log::level::error, "Could not create a readback buffer for the TAA dump.");
+    g_dump_remaining = 0;
+    return;
+  }
+  g_dump_last = frame;
+  --g_dump_remaining;
+}
+
+// Saves the dumped frames once the GPU has finished them: raw rows without padding plus a .txt with
+// width, height, format, frame index and the scene exposure. Returns the result line for remote.done.
+std::string WriteDumps(command_queue* queue) {
+  queue->wait_idle();
+  std::lock_guard lock(g_dump_mutex);
+  const fs::path dir = g_addon_dir / L"shots";
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  float exposure;
+  {
+    std::lock_guard scene_lock(g_scene_mutex);
+    exposure = g_scene.exposure;
+  }
+  size_t written = 0;
+  for (const Readback& r : g_dumps) {
+    void* mapped = nullptr;
+    if (g_device->map_buffer_region(r.buffer, 0, UINT64_MAX, map_access::read_only, &mapped)) {
+      std::ofstream out(dir / (r.name + ".bin"), std::ios::binary);
+      for (uint32_t y = 0; y < r.height; ++y)
+        out.write(static_cast<const char*>(mapped) + static_cast<size_t>(y) * r.row_pitch, r.width * 4);
+      g_device->unmap_buffer_region(r.buffer);
+      std::ofstream(dir / (r.name + ".txt")) << r.width << " " << r.height << " " << static_cast<int>(r.fmt) << " "
+                                             << (r.frame - g_dump_start) << " " << exposure << "\n";
+      ++written;
+    }
+    g_device->destroy_resource(r.buffer);
+  }
+  g_dumps.clear();
+  return "saved " + std::to_string(written / 2) + " frames as shots/" + g_dump_name + "_mv_NN.bin";
+}
+
 // Returns true when DLSS replaced the draw.
 bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   const uint64_t draw = ++g_taa_draws;
@@ -637,6 +728,12 @@ void OnDestroyDevice(device* dev) {
   RetireOutput();
   for (const Retired& r : g_retired) dev->destroy_resource(r.res);
   g_retired.clear();
+  {
+    std::lock_guard dump_lock(g_dump_mutex);
+    for (const Readback& r : g_dumps) dev->destroy_resource(r.buffer);
+    g_dumps.clear();
+    g_dump_remaining = 0;
+  }
   if (g_exposure_upload != 0) {
     dev->unmap_buffer_region(g_exposure_upload);
     dev->destroy_resource(g_exposure_upload);
@@ -741,7 +838,10 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     if (data->depth_copy != 0) g_depth_copy = data->depth_copy.handle;
     return false;
   }
-  if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) return ReplaceTaa(cmd_list, *data);
+  if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) {
+    if (g_dump_remaining.load() > 0) DumpTaaInputs(cmd_list);
+    return ReplaceTaa(cmd_list, *data);
+  }
   if (data->pass == Pass::kSharpen && data->dlss_applied && vertex_count == 3 && instance_count == 1) {
     if (!g_config.game_sharpening) return SkipSharpen(cmd_list);
     SetSharpenStrength(cmd_list, g_config.sharpen_strength);
@@ -842,21 +942,50 @@ std::string CaptureScreenshot(effect_runtime* runtime, const std::string& name) 
   return "saved shots/" + name + ".bin";
 }
 
+void FinishRemote(const std::string& request, const std::string& result) {
+  std::ofstream(g_addon_dir / L"remote.done") << request << ": " << result << "\n";
+  Log(reshade::log::level::info, "Remote: " + request + " -> " + result);
+}
+
 // Development remote control: commands written to remote.txt next to the add-on, e.g. "capture taa",
-// "dlss off", "sharpen on", "strength 0.1", "preset 10", "ca off". The result goes to remote.done.
+// "dlss off", "sharpen on", "strength 0.1", "preset 10", "ca off", "mv 8 grass". The result goes to remote.done.
 void OnReshadePresent(effect_runtime* runtime) {
+  static std::string dump_request;  // the pending "mv" command, answered once its frames are saved
+  if (!dump_request.empty()) {
+    const uint64_t frame = g_frame.load();
+    bool done;
+    {
+      std::lock_guard lock(g_dump_mutex);
+      if (g_dump_remaining.load() > 0 && frame > g_dump_start + 600) g_dump_remaining = 0;  // no TAA (menu?)
+      done = g_dump_remaining.load() == 0 && frame > g_dump_last + 3;
+    }
+    if (done) {
+      FinishRemote(dump_request, WriteDumps(runtime->get_command_queue()));
+      dump_request.clear();
+    }
+    return;
+  }
   static uint64_t counter = 0;
   if (++counter % 10 != 0) return;
   const fs::path request = g_addon_dir / L"remote.txt";
   std::error_code ec;
   if (!fs::exists(request, ec)) return;
-  std::string command, arg;
+  std::string command, arg, arg2;
   {
     std::ifstream in(request);
-    in >> command >> arg;
+    in >> command >> arg >> arg2;
   }
   fs::remove(request, ec);
   std::string result = "ok";
+  if (command == "mv") {
+    std::lock_guard lock(g_dump_mutex);
+    g_dump_name = arg2.empty() ? "taa" : arg2;
+    g_dump_start = g_frame.load() + 1;
+    g_dump_last = 0;
+    g_dump_remaining = std::max(1, std::min(std::atoi(arg.c_str()), 16));
+    dump_request = command + " " + arg + " " + arg2;
+    return;
+  }
   if (command == "capture") {
     result = CaptureScreenshot(runtime, arg.empty() ? "shot" : arg);
   } else if (command == "dlss") {
@@ -874,8 +1003,7 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else {
     result = "unknown command";
   }
-  std::ofstream(g_addon_dir / L"remote.done") << command << " " << arg << ": " << result << "\n";
-  Log(reshade::log::level::info, "Remote: " + command + " " + arg + " -> " + result);
+  FinishRemote(command + " " + arg, result);
 }
 
 void OnOverlay(effect_runtime*) {

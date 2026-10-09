@@ -159,3 +159,33 @@ edge and 13% on leaves at the left edge. The center was unchanged apart from gra
   exists in the code, so it is filled indirectly (bulk copy or through a pointer). Next: capture `r13` at
   runtime (hook or hardware breakpoint at `0x140A3ADBE`), write 0.67 there, and check whether the scene
   viewports follow (the add-on logs "Scene: screen percentage ..., geometry viewport ...").
+
+## Wind-blown vegetation has no motion vectors (2026-10-09)
+
+Test: dev remote command `mv 8 <name>` (`tools/ab_capture.ps1 -Round mv`) copies the TAA's `g_MoveTex` and
+`SourceTex` of 8 consecutive frames into readback buffers and saves them to `shots/`; `tools/mv_check.py` analyzes
+them. Limgrave grass field, grass and trees swaying in the wind, player idle, camera at rest, DLAA preset K.
+
+- Only the player character carries motion: torso, cape and sword (idle breathing, 0.1-0.3 px). Grass, bushes and
+  trees read exactly 0 in every frame (3.7% of the screen moves at all, all of it the character).
+- The vegetation did move. Between two dumps 1 s apart (each averaged over its frames to cancel the jitter) the
+  display brightness changed by 5.6-6.2% on grass and tree canopies against 0.7-2.1% on the static rock and
+  ruin. Frame-to-frame change, which includes the jitter, is 2.6-4.6% everywhere.
+
+| region | 1-frame change | 1-second change | pixels with motion |
+| --- | --- | --- | --- |
+| grass, lower left | 4.6% | 6.1% | 0.0% |
+| grass, right | 4.3% | 5.6% | 0.0% |
+| tree canopy | 4.3% | 6.2% | 0.0% |
+| rock, center | 2.6% | 0.7% | 0.0% |
+| stone ruin | 4.3% | 2.1% | 0.0% |
+| character torso | 6.2% | 8.5% | 87.6% |
+
+So the wind is a vertex-shader effect without a velocity output. DLSS reprojects swaying blades as if they
+were static and blends their positions over time. That fits the user's "vegetation a little blurry" with DLAA.
+
+How the game's TAA copes: `TempAA[StencilMask]` reads `g_StencilTex` (R8_UINT copy of the stencil). For motion
+under 1.5 px its history factor is `w = a[s & 3] + (1 - a[s & 3]) * b[(s >> 2) & 3]` from
+`CB_AA.g_FeedbackWeightScale[4]` (byte 160; open world: a = .x = 0.9, 0.85, 0.85, 0.8 and b = .y = 0, 0.2, 0.4,
+0.8). For larger motion it rejects history when the low two stencil bits of the current and previous pixel differ.
+Not known yet: which stencil class grass and trees get. If they get a class of their own, that is a vegetation mask.

@@ -5,8 +5,10 @@
 # (shots\<name>.csv).
 # -Round ca: the game's chromatic aberration on and off (measure with tools\ca_measure.py), then back to the
 # ini setting.
+# -Round mv: two dumps of the TAA's motion vectors and color (8 frames each, 1 s apart) for tools\mv_check.py.
+# Keep the camera at rest so only objects that write their own velocity show motion.
 param(
-  [ValidateSet('sharpen', 'presets', 'ca')][string]$Round = 'sharpen',
+  [ValidateSet('sharpen', 'presets', 'ca', 'mv')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -16,7 +18,7 @@ function Send([string]$Command, [double]$Settle = 0) {
   $done = Join-Path $Folder 'remote.done'
   Remove-Item $done -ErrorAction SilentlyContinue
   Set-Content -Path (Join-Path $Folder 'remote.txt') -Value $Command -Encoding ascii
-  for ($i = 0; $i -lt 100 -and -not (Test-Path $done); $i++) { Start-Sleep -Milliseconds 100 }
+  for ($i = 0; $i -lt 300 -and -not (Test-Path $done); $i++) { Start-Sleep -Milliseconds 100 }
   if (-not (Test-Path $done)) { throw "No response to '$Command' (is the game running with the dev build?)" }
   Get-Content $done
   if ($Settle -gt 0) { Start-Sleep -Milliseconds ([int]($Settle * 1000)) }
@@ -37,6 +39,8 @@ if ($Round -eq 'sharpen') {
   Send 'sharpen off'; Send 'preset 10' 2.5; Send 'capture dlaa_presetJ'
   Send 'preset 0'; Send 'dlss off' 2.0; Send 'capture taa'
   Send 'dlss on' 1.0
+} elseif ($Round -eq 'mv') {
+  Send 'mv 8 still_a' 1.0; Send 'mv 8 still_b'
 } elseif ($Round -eq 'ca') {
   $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
   $restore = if ($ini -match '^ChromaticAberration=0') { 'off' } else { 'on' }
