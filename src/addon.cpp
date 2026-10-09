@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -75,6 +76,7 @@ struct Config {
   int preset = 0;  // 0 = NGX default, which is preset K for DLAA
   int toggle_key = VK_F9;
   bool game_sharpening = false;  // run the game's TAA sharpening filter on the DLSS output
+  float sharpen_strength = 0.25f;  // its strength while DLSS is on (the game uses 0.25)
   bool game_exposure = true;     // give DLSS the tonemapper's exposure instead of letting it estimate one
   // Texture LOD bias for material samplers. NVIDIA's guidance is native bias + log2(render / display) - 1, i.e.
   // -1 for DLAA; the game's own samplers use 0. Samplers are created at startup, so changes need a restart.
@@ -169,6 +171,7 @@ void LoadConfig() {
   g_config.preset = ReadInt(L"Preset", 0);
   g_config.toggle_key = ReadInt(L"ToggleKey", VK_F9);
   g_config.game_sharpening = ReadInt(L"GameSharpening", 0) != 0;
+  g_config.sharpen_strength = ReadFloat(L"SharpenStrength", 0.25f);
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.mip_bias = ReadFloat(L"MipBias", -1.0f);
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
@@ -182,6 +185,7 @@ void SaveConfig() {
   WriteInt(L"Preset", g_config.preset);
   WriteInt(L"ToggleKey", g_config.toggle_key);
   WriteInt(L"GameSharpening", g_config.game_sharpening);
+  WriteFloat(L"SharpenStrength", g_config.sharpen_strength);
   WriteInt(L"GameExposure", g_config.game_exposure);
   WriteFloat(L"MipBias", g_config.mip_bias);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
@@ -520,6 +524,30 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   return true;
 }
 
+// The sharpen pass reads g_SharpenIntensity from CB_AA (pixel shader b0, byte 152; the game uses 0.25). The
+// constants for this frame are already in the upload heap but not yet read by the GPU, so they can be edited.
+void SetSharpenStrength(command_list* cmd_list, float strength) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr) return;
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it == state->descriptor_tables.end()) return;
+  descriptor_heap heap = {0};
+  uint32_t offset = 0;
+  if (!descriptors->Find(dev, it->second.first, it->second.second, shader_stage::pixel, RegisterKind::kConstantBuffer,
+                         0, 0, &heap, &offset))
+    return;
+  const buffer_range range = descriptors->Buffer(heap, offset);
+  constexpr uint64_t kSharpenIntensity = 152;
+  if (range.buffer == 0 || range.size < kSharpenIntensity + 4) return;
+  void* mapped = nullptr;
+  if (!dev->map_buffer_region(range.buffer, range.offset + kSharpenIntensity, 4, map_access::write_only, &mapped))
+    return;
+  std::memcpy(mapped, &strength, sizeof(strength));
+  dev->unmap_buffer_region(range.buffer);
+}
+
 // Without the game's sharpening, the sharpen pass becomes a plain copy of the DLSS result into the scene color.
 bool SkipSharpen(command_list* cmd_list) {
   device* const dev = cmd_list->get_device();
@@ -662,9 +690,10 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     return false;
   }
   if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) return ReplaceTaa(cmd_list, *data);
-  if (data->pass == Pass::kSharpen && data->dlss_applied && !g_config.game_sharpening && vertex_count == 3 &&
-      instance_count == 1)
-    return SkipSharpen(cmd_list);
+  if (data->pass == Pass::kSharpen && data->dlss_applied && vertex_count == 3 && instance_count == 1) {
+    if (!g_config.game_sharpening) return SkipSharpen(cmd_list);
+    SetSharpenStrength(cmd_list, g_config.sharpen_strength);
+  }
   return false;
 }
 
@@ -687,6 +716,8 @@ const char* ColorSpaceName(color_space cs) {
   }
 }
 
+std::atomic<color_space> g_output_space{color_space::unknown};
+
 // Logs the game's output whenever it changes, e.g. when HDR is switched in the game's options.
 void LogOutputMode(swapchain* sc) {
   static format last_format = format::unknown;
@@ -695,6 +726,7 @@ void LogOutputMode(swapchain* sc) {
   if (back_buffer == 0) return;
   const format fmt = sc->get_device()->get_resource_desc(back_buffer).texture.format;
   const color_space space = sc->get_color_space();
+  g_output_space = space;
   if (fmt == last_format && space == last_space) return;
   last_format = fmt;
   last_space = space;
@@ -738,6 +770,59 @@ void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, ui
   }
 }
 
+// Saves the back buffer (game image without the ReShade overlay) as raw pixels plus a size/format line.
+std::string CaptureScreenshot(effect_runtime* runtime, const std::string& name) {
+  uint32_t width = 0, height = 0;
+  runtime->get_screenshot_width_and_height(&width, &height);
+  const resource back_buffer = runtime->get_current_back_buffer();
+  const format fmt = runtime->get_device()->get_resource_desc(back_buffer).texture.format;
+  const uint32_t bytes = fmt == format::r16g16b16a16_float ? 8 : 4;
+  std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * bytes);
+  if (width == 0 || !runtime->capture_screenshot(pixels.data())) return "capture failed";
+  const fs::path dir = g_addon_dir / L"shots";
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  std::ofstream(dir / (name + ".bin"), std::ios::binary).write(reinterpret_cast<const char*>(pixels.data()),
+                                                               static_cast<std::streamsize>(pixels.size()));
+  std::ofstream(dir / (name + ".txt")) << width << " " << height << " " << static_cast<int>(fmt) << " "
+                                       << static_cast<int>(g_output_space.load()) << "\n";
+  return "saved shots/" + name + ".bin";
+}
+
+// Development remote control: commands written to remote.txt next to the add-on, e.g. "capture taa",
+// "dlss off", "sharpen on", "strength 0.1", "preset 10". The result goes to remote.done.
+void OnReshadePresent(effect_runtime* runtime) {
+  static uint64_t counter = 0;
+  if (++counter % 10 != 0) return;
+  const fs::path request = g_addon_dir / L"remote.txt";
+  std::error_code ec;
+  if (!fs::exists(request, ec)) return;
+  std::string command, arg;
+  {
+    std::ifstream in(request);
+    in >> command >> arg;
+  }
+  fs::remove(request, ec);
+  std::string result = "ok";
+  if (command == "capture") {
+    result = CaptureScreenshot(runtime, arg.empty() ? "shot" : arg);
+  } else if (command == "dlss") {
+    g_config.enabled = arg == "on";
+    g_reset = true;
+  } else if (command == "sharpen") {
+    g_config.game_sharpening = arg == "on";
+  } else if (command == "strength") {
+    g_config.sharpen_strength = std::strtof(arg.c_str(), nullptr);
+  } else if (command == "preset") {
+    g_config.preset = std::atoi(arg.c_str());
+    g_recreate = true;
+  } else {
+    result = "unknown command";
+  }
+  std::ofstream(g_addon_dir / L"remote.done") << command << " " << arg << ": " << result << "\n";
+  Log(reshade::log::level::info, "Remote: " + command + " " + arg + " -> " + result);
+}
+
 void OnOverlay(effect_runtime*) {
   bool enabled = g_config.enabled;
   if (ImGui::Checkbox("Use DLSS instead of the game's TAA", &enabled)) {
@@ -758,7 +843,11 @@ void OnOverlay(effect_runtime*) {
     SaveConfig();
   }
   if (ImGui::Checkbox("Game sharpening on top of DLSS", &g_config.game_sharpening)) SaveConfig();
-  ImGui::SetItemTooltip("The game's TAA sharpening filter (strength 0.25). Off shows DLSS's output as is.");
+  ImGui::SetItemTooltip("The game's TAA sharpening filter. Off shows DLSS's output as is.");
+  if (g_config.game_sharpening) {
+    if (ImGui::SliderFloat("Sharpening strength", &g_config.sharpen_strength, 0.0f, 0.5f, "%.2f")) SaveConfig();
+    ImGui::SetItemTooltip("The game uses 0.25 with its own TAA.");
+  }
   if (ImGui::Checkbox("Use the game's exposure", &g_config.game_exposure)) {
     g_reset = true;
     SaveConfig();
@@ -832,6 +921,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+      reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
       reshade::register_overlay(nullptr, OnOverlay);
       break;
     case DLL_PROCESS_DETACH:
