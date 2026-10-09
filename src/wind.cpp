@@ -23,7 +23,6 @@ constexpr uint32_t kRingSlots = 1024;
 constexpr uint32_t kResolveSlots = 8;
 constexpr D3D12_RESOURCE_STATES kShaderResource =
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-constexpr float kDepthTolerance = 1e-4f;
 constexpr uint32_t kDebugVertices = 64;
 constexpr uint32_t kDebugFilled = 0, kDebugPrev = 256, kDebugCur = kDebugPrev + kDebugVertices * 16,
                    kDebugSlot = kDebugCur + kDebugVertices * 16, kDebugSize = kDebugSlot + 4096;
@@ -85,35 +84,6 @@ bool WindMotion::Init(ID3D12Device* device, uint32_t capacity) {
   device_ = device;
   capacity_ = capacity / 3 * 3;
 
-  // Stream output: the game's vertex-stage tables (b0-3, b4-13, t0-3, t4-19, t20-65, s0-3, s4-15) with b8 and b9
-  // taken out of the second table (descriptor offsets unchanged) and given root CBVs instead.
-  const D3D12_DESCRIPTOR_RANGE ranges[] = {
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 4, 0, 0),
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 4, 4, 0),  Range(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 4, 10, 6),
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0),
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16, 4, 0),
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 46, 20, 0),
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 4, 0, 0),
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 12, 4, 0),
-  };
-  const uint32_t range_first[] = {0, 1, 3, 4, 5, 6, 7};
-  const uint32_t range_count[] = {1, 2, 1, 1, 1, 1, 1};
-  D3D12_ROOT_PARAMETER stream_params[9] = {};
-  for (uint32_t i = 0; i < 7; ++i) {
-    stream_params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    stream_params[i].DescriptorTable = {range_count[i], &ranges[range_first[i]]};
-    stream_params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-  }
-  for (uint32_t i = 7; i < 9; ++i) {
-    stream_params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    stream_params[i].Descriptor = {i + 1, 0};  // b8, b9
-    stream_params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-  }
-  const D3D12_ROOT_SIGNATURE_DESC stream_desc = {
-      9, stream_params, 0, nullptr,
-      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT};
-  stream_rs_ = CreateRootSignature(device, stream_desc);
-
   // Resolve: streamed vertices and fill counters as root SRVs, the depth through a table, encoding constants.
   const D3D12_DESCRIPTOR_RANGE depth_range = Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3, 0);
   D3D12_ROOT_PARAMETER resolve_params[5] = {};
@@ -124,7 +94,7 @@ bool WindMotion::Init(ID3D12Device* device, uint32_t capacity) {
   resolve_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   resolve_params[3].DescriptorTable = {1, &depth_range};
   resolve_params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  resolve_params[4].Constants = {0, 0, 5};
+  resolve_params[4].Constants = {0, 0, 6};
   const D3D12_ROOT_SIGNATURE_DESC resolve_desc = {5, resolve_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
   resolve_rs_ = CreateRootSignature(device, resolve_desc);
 
@@ -140,26 +110,8 @@ bool WindMotion::Init(ID3D12Device* device, uint32_t capacity) {
   patch_params[3].Constants = {2, 0, 1};
   const D3D12_ROOT_SIGNATURE_DESC patch_desc = {4, patch_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
   patch_rs_ = CreateRootSignature(device, patch_desc);
-  if (stream_rs_ == nullptr || resolve_rs_ == nullptr || patch_rs_ == nullptr) {
+  if (resolve_rs_ == nullptr || patch_rs_ == nullptr) {
     status_ = "root signature creation failed";
-    return false;
-  }
-
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
-  pso.pRootSignature = resolve_rs_;
-  pso.VS = {kWindResolveVs, sizeof(kWindResolveVs)};
-  pso.PS = {kWindResolvePs, sizeof(kWindResolvePs)};
-  pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-  pso.SampleMask = UINT_MAX;
-  pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-  pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-  pso.RasterizerState.DepthClipEnable = TRUE;
-  pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-  pso.NumRenderTargets = 1;
-  pso.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
-  pso.SampleDesc.Count = 1;
-  if (FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&resolve_pso_)))) {
-    status_ = "resolve pipeline creation failed";
     return false;
   }
   D3D12_COMPUTE_PIPELINE_STATE_DESC compute = {};
@@ -197,8 +149,11 @@ bool WindMotion::Init(ID3D12Device* device, uint32_t capacity) {
   if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&srv_heap_)))) return false;
   heap = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kResolveSlots, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
   if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&rtv_heap_)))) return false;
+  heap = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kResolveSlots, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+  if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&dsv_heap_)))) return false;
   srv_increment_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   rtv_increment_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  dsv_increment_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
   status_ = "initialized";
   return true;
 }
@@ -210,10 +165,18 @@ void WindMotion::Shutdown() {
     for (auto& [game, psos] : pipelines_) {
       Release(psos.prev);
       Release(psos.cur);
+      Release(psos.full);
     }
     pipelines_.clear();
     for (ID3D12PipelineState*& pso : retired_) Release(pso);
     retired_.clear();
+    for (auto& [layout, root] : roots_) Release(root.signature);
+    roots_.clear();
+  }
+  {
+    std::lock_guard lock(resolve_mutex_);
+    for (auto& [format, pso] : resolve_psos_) Release(pso);
+    resolve_psos_.clear();
   }
   Release(prev_);
   Release(cur_);
@@ -225,9 +188,8 @@ void WindMotion::Shutdown() {
   Release(patch_rs_);
   Release(srv_heap_);
   Release(rtv_heap_);
-  Release(resolve_pso_);
+  Release(dsv_heap_);
   Release(resolve_rs_);
-  Release(stream_rs_);
   device_ = nullptr;
   status_ = "off";
 }
@@ -246,37 +208,132 @@ void WindMotion::RecordSetup(ID3D12GraphicsCommandList* cmd) {
   cmd->ResourceBarrier(1, &back);
 }
 
-bool WindMotion::AddPipeline(uint64_t pipeline, const std::string& name, const void* vs, size_t vs_size,
-                             const std::vector<D3D12_INPUT_ELEMENT_DESC>& input_layout,
-                             D3D12_PRIMITIVE_TOPOLOGY_TYPE topology) {
-  if (device_ == nullptr || stream_rs_ == nullptr) return false;
+// The game's layout with the vertex stage's b8 and b9 (space 0) taken out of their descriptor tables (the other
+// descriptors keep their offsets) and given root CBVs at the end, plus permission for stream output.
+bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layout, Root* root) {
+  {
+    std::shared_lock lock(pipelines_mutex_);
+    const auto it = roots_.find(layout_key);
+    if (it != roots_.end()) {
+      *root = it->second;
+      return root->signature != nullptr;
+    }
+  }
+  std::vector<std::vector<D3D12_DESCRIPTOR_RANGE>> ranges(layout.size());
+  std::vector<D3D12_ROOT_PARAMETER> params(layout.size());
+  bool moved[2] = {false, false};
+  for (size_t i = 0; i < layout.size(); ++i) {
+    const RootParam& p = layout[i];
+    D3D12_ROOT_PARAMETER& out = params[i];
+    out.ParameterType = p.type;
+    out.ShaderVisibility = p.visibility;
+    if (p.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+      out.Constants = {p.reg, p.space, p.count};
+      continue;
+    }
+    if (p.type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+      out.Descriptor = {p.reg, p.space};
+      continue;
+    }
+    for (const D3D12_DESCRIPTOR_RANGE& r : p.ranges) {
+      const bool vertex_cbv = r.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV && r.RegisterSpace == 0 &&
+                              p.visibility == D3D12_SHADER_VISIBILITY_VERTEX;
+      const bool covers = vertex_cbv && r.BaseShaderRegister <= 9 &&
+                          (r.NumDescriptors == UINT_MAX || r.BaseShaderRegister + r.NumDescriptors > 8);
+      if (!covers) {
+        ranges[i].push_back(r);
+        continue;
+      }
+      if (r.NumDescriptors == UINT_MAX || r.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+        return false;
+      // Split around b8/b9, keeping each register at its descriptor offset.
+      uint32_t start = r.BaseShaderRegister;
+      const uint32_t end = r.BaseShaderRegister + r.NumDescriptors;
+      for (uint32_t reg = r.BaseShaderRegister; reg <= end; ++reg) {
+        const bool cut = reg == end || reg == 8 || reg == 9;
+        if (!cut) continue;
+        if (reg > start)
+          ranges[i].push_back({r.RangeType, reg - start, start, 0,
+                               r.OffsetInDescriptorsFromTableStart + (start - r.BaseShaderRegister)});
+        if (reg == 8 || reg == 9) moved[reg - 8] = true;
+        start = reg + 1;
+      }
+    }
+    out.DescriptorTable = {static_cast<UINT>(ranges[i].size()), ranges[i].data()};
+  }
+  if (!moved[0] || !moved[1]) return false;
+  Root made;
+  made.scene_param = static_cast<UINT>(params.size());
+  made.frame_param = made.scene_param + 1;
+  for (UINT reg = 8; reg <= 9; ++reg) {
+    D3D12_ROOT_PARAMETER cbv = {};
+    cbv.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    cbv.Descriptor = {reg, 0};
+    cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    params.push_back(cbv);
+  }
+  const D3D12_ROOT_SIGNATURE_DESC desc = {
+      static_cast<UINT>(params.size()), params.data(), 0, nullptr,
+      D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT};
+  made.signature = CreateRootSignature(device_, desc);
+  std::unique_lock lock(pipelines_mutex_);
+  Root& stored = roots_[layout_key];
+  if (stored.signature == nullptr) stored = made;
+  else Release(made.signature);  // another thread was faster
+  *root = stored;
+  return root->signature != nullptr;
+}
+
+bool WindMotion::AddPipeline(uint64_t pipeline, const std::string& name, uint64_t layout_key,
+                             const std::vector<RootParam>& layout, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+  if (device_ == nullptr) return false;
+  Root root;
+  if (!RootFor(layout_key, layout, &root)) {
+    status_ = "unsupported root layout for " + name;
+    return false;
+  }
   const UINT strides[2] = {kStride, kStride};
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
-  desc.pRootSignature = stream_rs_;
-  desc.VS = {vs, vs_size};
-  desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-  desc.SampleMask = UINT_MAX;
-  desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-  desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-  desc.RasterizerState.DepthClipEnable = TRUE;
-  desc.InputLayout = {input_layout.data(), static_cast<UINT>(input_layout.size())};
-  desc.PrimitiveTopologyType = topology;
-  desc.SampleDesc.Count = 1;
   StreamPipelines psos;
+  psos.root = root;
+
+  // Vertex-only passes: no rasterization, so only the vertex shader and input layout matter.
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC vs_only = {};
+  vs_only.pRootSignature = root.signature;
+  vs_only.VS = desc.VS;
+  vs_only.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  vs_only.SampleMask = UINT_MAX;
+  vs_only.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  vs_only.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  vs_only.RasterizerState.DepthClipEnable = TRUE;
+  vs_only.InputLayout = desc.InputLayout;
+  vs_only.IBStripCutValue = desc.IBStripCutValue;
+  vs_only.PrimitiveTopologyType = desc.PrimitiveTopologyType;
+  vs_only.SampleDesc.Count = 1;
   for (UINT slot = 0; slot < 2; ++slot) {
     const D3D12_SO_DECLARATION_ENTRY entry = {0, "SV_Position", 0, 0, 4, static_cast<BYTE>(slot)};
-    desc.StreamOutput = {&entry, 1, strides, 2, D3D12_SO_NO_RASTERIZED_STREAM};
+    vs_only.StreamOutput = {&entry, 1, strides, 2, D3D12_SO_NO_RASTERIZED_STREAM};
     ID3D12PipelineState*& pso = slot == 0 ? psos.prev : psos.cur;
-    if (FAILED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)))) {
+    if (FAILED(device_->CreateGraphicsPipelineState(&vs_only, IID_PPV_ARGS(&pso)))) {
       Release(psos.prev);
       status_ = "stream-output pipeline creation failed for " + name;
       return false;
     }
   }
+  // The game's own pipeline, also streaming the current positions to slot 1 while it rasterizes.
+  if (desc.PS.pShaderBytecode != nullptr) {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC full = desc;
+    full.pRootSignature = root.signature;
+    const D3D12_SO_DECLARATION_ENTRY entry = {0, "SV_Position", 0, 0, 4, 1};
+    full.StreamOutput = {&entry, 1, strides, 2, 0};
+    if (FAILED(device_->CreateGraphicsPipelineState(&full, IID_PPV_ARGS(&psos.full)))) {
+      psos.full = nullptr;
+      status_ = "full pipeline copy failed for " + name + " (using a vertex-only pass)";
+    }
+  }
   std::unique_lock lock(pipelines_mutex_);
   StreamPipelines& stored = pipelines_[pipeline];
-  if (stored.prev != nullptr) retired_.push_back(stored.prev);
-  if (stored.cur != nullptr) retired_.push_back(stored.cur);
+  for (ID3D12PipelineState* old : {stored.prev, stored.cur, stored.full})
+    if (old != nullptr) retired_.push_back(old);
   stored = psos;
   return true;
 }
@@ -285,8 +342,9 @@ void WindMotion::RemovePipeline(uint64_t pipeline) {
   std::unique_lock lock(pipelines_mutex_);
   const auto it = pipelines_.find(pipeline);
   if (it == pipelines_.end()) return;
-  retired_.push_back(it->second.prev);  // in-flight command lists may still use them; released at shutdown
-  retired_.push_back(it->second.cur);
+  // In-flight command lists may still use them; released at shutdown.
+  for (ID3D12PipelineState* old : {it->second.prev, it->second.cur, it->second.full})
+    if (old != nullptr) retired_.push_back(old);
   pipelines_.erase(it);
 }
 
@@ -295,9 +353,21 @@ bool WindMotion::IsWindPipeline(uint64_t pipeline) const {
   return pipelines_.count(pipeline) != 0;
 }
 
+ID3D12RootSignature* WindMotion::root_signature(uint64_t pipeline) const {
+  std::shared_lock lock(pipelines_mutex_);
+  const auto it = pipelines_.find(pipeline);
+  return it == pipelines_.end() ? nullptr : it->second.root.signature;
+}
+
 size_t WindMotion::pipeline_count() const {
   std::shared_lock lock(pipelines_mutex_);
   return pipelines_.size();
+}
+
+size_t WindMotion::full_pipeline_count() const {
+  std::shared_lock lock(pipelines_mutex_);
+  return static_cast<size_t>(std::count_if(pipelines_.begin(), pipelines_.end(),
+                                           [](const auto& entry) { return entry.second.full != nullptr; }));
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS WindMotion::RecordPrevious(ID3D12GraphicsCommandList* cmd, D3D12_GPU_VIRTUAL_ADDRESS scene,
@@ -338,7 +408,7 @@ void WindMotion::BindStreams(ID3D12GraphicsCommandList* cmd) {
   cmd->SOSetTargets(0, 2, views);
 }
 
-void WindMotion::RecordStreams(ID3D12GraphicsCommandList* cmd, uint64_t pipeline, D3D12_GPU_VIRTUAL_ADDRESS scene,
+bool WindMotion::RecordStreams(ID3D12GraphicsCommandList* cmd, uint64_t pipeline, D3D12_GPU_VIRTUAL_ADDRESS scene,
                                D3D12_GPU_VIRTUAL_ADDRESS frame, D3D12_GPU_VIRTUAL_ADDRESS prev_scene,
                                D3D12_GPU_VIRTUAL_ADDRESS prev_frame, uint32_t index_count, uint32_t instance_count,
                                uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
@@ -346,35 +416,72 @@ void WindMotion::RecordStreams(ID3D12GraphicsCommandList* cmd, uint64_t pipeline
   {
     std::shared_lock lock(pipelines_mutex_);
     const auto it = pipelines_.find(pipeline);
-    if (it == pipelines_.end()) return;
+    if (it == pipelines_.end()) return false;
     psos = it->second;
   }
   cmd->SetPipelineState(psos.prev);
-  cmd->SetGraphicsRootConstantBufferView(7, prev_scene);
-  cmd->SetGraphicsRootConstantBufferView(8, prev_frame);
+  cmd->SetGraphicsRootConstantBufferView(psos.root.scene_param, prev_scene);
+  cmd->SetGraphicsRootConstantBufferView(psos.root.frame_param, prev_frame);
   cmd->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
-  cmd->SetPipelineState(psos.cur);
-  cmd->SetGraphicsRootConstantBufferView(7, scene);
-  cmd->SetGraphicsRootConstantBufferView(8, frame);
+  const bool full = psos.full != nullptr && full_draw_.load();
+  cmd->SetPipelineState(full ? psos.full : psos.cur);
+  cmd->SetGraphicsRootConstantBufferView(psos.root.scene_param, scene);
+  cmd->SetGraphicsRootConstantBufferView(psos.root.frame_param, frame);
   cmd->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
   ++streamed_draws_;
+  if (full) ++replaced_draws_;
   streamed_vertices_ += static_cast<uint64_t>(index_count) * instance_count;
+  return full;
+}
+
+// The resolve tests against the scene depth through a read-only depth-stencil view, so the rasterizer drops
+// fragments behind the visible surface before the pixel shader runs.
+ID3D12PipelineState* WindMotion::ResolvePipeline(DXGI_FORMAT dsv_format) {
+  std::lock_guard lock(resolve_mutex_);
+  ID3D12PipelineState*& pso = resolve_psos_[static_cast<int>(dsv_format)];
+  if (pso != nullptr) return pso;
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = resolve_rs_;
+  desc.VS = {kWindResolveVs, sizeof(kWindResolveVs)};
+  desc.PS = {kWindResolvePs, sizeof(kWindResolvePs)};
+  desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  desc.SampleMask = UINT_MAX;
+  desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  desc.RasterizerState.DepthClipEnable = TRUE;
+  desc.DepthStencilState.DepthEnable = TRUE;
+  desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+  desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER_EQUAL;  // reverse-Z: nearer is larger
+  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  desc.NumRenderTargets = 1;
+  desc.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+  desc.DSVFormat = dsv_format;
+  desc.SampleDesc.Count = 1;
+  if (FAILED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)))) pso = nullptr;
+  return pso;
 }
 
 bool WindMotion::Resolve(ID3D12GraphicsCommandList* cmd, ID3D12Resource* motion, ID3D12Resource* depth,
                          uint32_t width, uint32_t height, float encode_scale, float encode_bias) {
   const D3D12_RESOURCE_DESC dd = depth->GetDesc();
-  DXGI_FORMAT depth_format;
-  if (dd.Format == DXGI_FORMAT_R32G8X24_TYPELESS || dd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
-    depth_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-  else if (dd.Format == DXGI_FORMAT_R32_TYPELESS || dd.Format == DXGI_FORMAT_D32_FLOAT)
-    depth_format = DXGI_FORMAT_R32_FLOAT;
-  else
+  DXGI_FORMAT srv_format, dsv_format;
+  D3D12_DSV_FLAGS dsv_flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+  if (dd.Format == DXGI_FORMAT_R32G8X24_TYPELESS || dd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+    srv_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    dsv_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    dsv_flags |= D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+  } else if (dd.Format == DXGI_FORMAT_R32_TYPELESS || dd.Format == DXGI_FORMAT_D32_FLOAT) {
+    srv_format = DXGI_FORMAT_R32_FLOAT;
+    dsv_format = DXGI_FORMAT_D32_FLOAT;
+  } else {
     return false;
+  }
+  ID3D12PipelineState* const pso = ResolvePipeline(dsv_format);
+  if (pso == nullptr) return false;
 
   const uint32_t slot = resolve_count_++ % kResolveSlots;
   D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-  srv.Format = depth_format;
+  srv.Format = srv_format;
   srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
   srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   srv.Texture2D.MipLevels = 1;
@@ -389,28 +496,40 @@ bool WindMotion::Resolve(ID3D12GraphicsCommandList* cmd, ID3D12Resource* motion,
   D3D12_CPU_DESCRIPTOR_HANDLE rtv_cpu = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
   rtv_cpu.ptr += static_cast<SIZE_T>(slot) * rtv_increment_;
   device_->CreateRenderTargetView(motion, &rtv, rtv_cpu);
+  D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {};
+  dsv.Format = dsv_format;
+  dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+  dsv.Flags = dsv_flags;
+  D3D12_CPU_DESCRIPTOR_HANDLE dsv_cpu = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+  dsv_cpu.ptr += static_cast<SIZE_T>(slot) * dsv_increment_;
+  device_->CreateDepthStencilView(depth, &dsv, dsv_cpu);
 
+  const D3D12_RESOURCE_STATES depth_read = D3D12_RESOURCE_STATE_DEPTH_READ | kShaderResource;
   const D3D12_RESOURCE_BARRIER to[] = {
       Transition(motion, kShaderResource, D3D12_RESOURCE_STATE_RENDER_TARGET),
+      Transition(depth, kShaderResource, depth_read),
       Transition(prev_, D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
       Transition(cur_, D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
       Transition(filled_, D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
   };
-  cmd->ResourceBarrier(4, to);
+  cmd->ResourceBarrier(5, to);
 
+  const float tolerance = depth_tolerance_.load();
   cmd->SetDescriptorHeaps(1, &srv_heap_);
   cmd->SetGraphicsRootSignature(resolve_rs_);
-  cmd->SetPipelineState(resolve_pso_);
+  cmd->SetPipelineState(pso);
   cmd->SetGraphicsRootShaderResourceView(0, prev_->GetGPUVirtualAddress());
   cmd->SetGraphicsRootShaderResourceView(1, cur_->GetGPUVirtualAddress());
   cmd->SetGraphicsRootShaderResourceView(2, filled_->GetGPUVirtualAddress());
   cmd->SetGraphicsRootDescriptorTable(3, srv_gpu);
   const float constants[4] = {encode_scale * 0.5f * static_cast<float>(width) / static_cast<float>(height),
-                              -0.5f * encode_scale, encode_bias, kDepthTolerance};
+                              -0.5f * encode_scale, encode_bias, tolerance};
   cmd->SetGraphicsRoot32BitConstants(4, 4, constants, 0);
   cmd->SetGraphicsRoot32BitConstant(4, capacity_, 4);
+  const float z_scale = 1.0f + tolerance;  // pulls fragments forward so the depth test keeps near matches
+  cmd->SetGraphicsRoot32BitConstants(4, 1, &z_scale, 5);
   cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  cmd->OMSetRenderTargets(1, &rtv_cpu, FALSE, nullptr);
+  cmd->OMSetRenderTargets(1, &rtv_cpu, FALSE, &dsv_cpu);
   const D3D12_VIEWPORT viewport = {0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
   const D3D12_RECT scissor = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
   cmd->RSSetViewports(1, &viewport);
@@ -441,11 +560,12 @@ bool WindMotion::Resolve(ID3D12GraphicsCommandList* cmd, ID3D12Resource* motion,
 
   const D3D12_RESOURCE_BARRIER back[] = {
       Transition(motion, D3D12_RESOURCE_STATE_RENDER_TARGET, kShaderResource),
+      Transition(depth, depth_read, kShaderResource),
       Transition(prev_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_STREAM_OUT),
       Transition(cur_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_STREAM_OUT),
       Transition(filled_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
   };
-  cmd->ResourceBarrier(4, back);
+  cmd->ResourceBarrier(5, back);
   cmd->CopyBufferRegion(filled_, 0, zeros_, 0, 256);
   const D3D12_RESOURCE_BARRIER reset =
       Transition(filled_, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);

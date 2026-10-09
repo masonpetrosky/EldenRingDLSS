@@ -116,14 +116,22 @@ fs::path g_ini_path;
 device* g_device = nullptr;
 erdlss::Dlss g_dlss;
 
-// Wind motion vectors. The vertex shaders and input layouts of animated materials' G-buffer pipelines are kept from
-// pipeline creation, so the stream-output copies can be built whenever the feature is switched on.
+// Wind motion vectors. Animated materials' G-buffer pipelines are kept from pipeline creation (shaders and states),
+// so the stream-output copies can be built whenever the feature is switched on.
 struct WindSource {
   std::string name;
-  std::vector<uint8_t> vs;
+  pipeline_layout layout = {0};
+  std::vector<uint8_t> vs, ps;
   std::vector<std::string> semantics;  // one per input element
   std::vector<input_element> elements;  // semantic pointers are refreshed from `semantics` before use
-  D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  blend_desc blend;
+  rasterizer_desc rasterizer;
+  depth_stencil_desc depth_stencil;
+  std::vector<format> render_targets;
+  format depth_format = format::unknown;
+  uint32_t sample_mask = UINT32_MAX, sample_count = 1;
+  primitive_topology topology = primitive_topology::triangle_list;
+  bool other_stages = false;  // hull, domain or geometry shader: no full copy
 };
 std::mutex g_wind_mutex;
 std::unordered_map<uint64_t, WindSource> g_wind_sources;
@@ -986,19 +994,151 @@ void SetWindError(const std::string& error) {
   }
 }
 
-// Builds the stream-output copy of a remembered pipeline. Called with g_wind_mutex held.
-void AddWindPipeline(uint64_t pipeline, WindSource& source) {
-  std::vector<D3D12_INPUT_ELEMENT_DESC> layout(source.elements.size());
-  for (size_t i = 0; i < layout.size(); ++i) {
-    const input_element& e = source.elements[i];
-    layout[i] = {source.semantics[i].c_str(), e.semantic_index, static_cast<DXGI_FORMAT>(e.format), e.buffer_binding,
-                 e.offset,
-                 e.instance_step_rate != 0 ? D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
-                                           : D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-                 e.instance_step_rate};
+D3D12_SHADER_VISIBILITY ToVisibility(shader_stage stage) {
+  switch (stage) {
+    case shader_stage::vertex: return D3D12_SHADER_VISIBILITY_VERTEX;
+    case shader_stage::hull: return D3D12_SHADER_VISIBILITY_HULL;
+    case shader_stage::domain: return D3D12_SHADER_VISIBILITY_DOMAIN;
+    case shader_stage::geometry: return D3D12_SHADER_VISIBILITY_GEOMETRY;
+    case shader_stage::pixel: return D3D12_SHADER_VISIBILITY_PIXEL;
+    default: return D3D12_SHADER_VISIBILITY_ALL;
   }
-  if (!g_wind.AddPipeline(pipeline, source.name, source.vs.data(), source.vs.size(), layout, source.topology))
-    SetWindError(g_wind.status());
+}
+
+// The game's root layout in D3D12 terms. Only descriptor tables are supported: the state tracking can restore them
+// after the stream passes switch root signatures, but not root constants or root descriptors.
+bool ToRootParams(const std::vector<erdlss::Descriptors::ParamInfo>& params,
+                  std::vector<erdlss::WindMotion::RootParam>* out) {
+  for (const erdlss::Descriptors::ParamInfo& param : params) {
+    if ((param.type != pipeline_layout_param_type::descriptor_table &&
+         param.type != pipeline_layout_param_type::descriptor_table_with_flags) ||
+        param.ranges.empty())
+      return false;
+    erdlss::WindMotion::RootParam root;
+    root.visibility = ToVisibility(param.ranges[0].visibility);
+    for (const descriptor_range& r : param.ranges) {
+      D3D12_DESCRIPTOR_RANGE_TYPE type;
+      switch (r.type) {
+        case descriptor_type::sampler: type = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER; break;
+        case descriptor_type::constant_buffer: type = D3D12_DESCRIPTOR_RANGE_TYPE_CBV; break;
+        case descriptor_type::shader_resource_view:
+        case descriptor_type::buffer_shader_resource_view:
+        case descriptor_type::acceleration_structure: type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; break;
+        case descriptor_type::unordered_access_view:
+        case descriptor_type::buffer_unordered_access_view: type = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; break;
+        default: return false;
+      }
+      root.ranges.push_back({type, r.count, r.dx_register_index, r.dx_register_space, r.binding});
+    }
+    out->push_back(std::move(root));
+  }
+  return true;
+}
+
+// The game's pipeline in D3D12 terms (ReShade's enums are Vulkan-ordered). `input_layout` receives the elements the
+// description points to.
+D3D12_GRAPHICS_PIPELINE_STATE_DESC ToPipelineDesc(const WindSource& source,
+                                                  std::vector<D3D12_INPUT_ELEMENT_DESC>* input_layout) {
+  static const D3D12_BLEND kBlend[] = {
+      D3D12_BLEND_ZERO,           D3D12_BLEND_ONE,           D3D12_BLEND_SRC_COLOR,      D3D12_BLEND_INV_SRC_COLOR,
+      D3D12_BLEND_DEST_COLOR,     D3D12_BLEND_INV_DEST_COLOR, D3D12_BLEND_SRC_ALPHA,     D3D12_BLEND_INV_SRC_ALPHA,
+      D3D12_BLEND_DEST_ALPHA,     D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_BLEND_FACTOR,  D3D12_BLEND_INV_BLEND_FACTOR,
+      D3D12_BLEND_BLEND_FACTOR,   D3D12_BLEND_INV_BLEND_FACTOR, D3D12_BLEND_SRC_ALPHA_SAT, D3D12_BLEND_SRC1_COLOR,
+      D3D12_BLEND_INV_SRC1_COLOR, D3D12_BLEND_SRC1_ALPHA,    D3D12_BLEND_INV_SRC1_ALPHA,
+  };
+  static const D3D12_LOGIC_OP kLogic[] = {
+      D3D12_LOGIC_OP_CLEAR,  D3D12_LOGIC_OP_AND,   D3D12_LOGIC_OP_AND_REVERSE,   D3D12_LOGIC_OP_COPY,
+      D3D12_LOGIC_OP_AND_INVERTED, D3D12_LOGIC_OP_NOOP, D3D12_LOGIC_OP_XOR,     D3D12_LOGIC_OP_OR,
+      D3D12_LOGIC_OP_NOR,    D3D12_LOGIC_OP_EQUIV, D3D12_LOGIC_OP_INVERT,        D3D12_LOGIC_OP_OR_REVERSE,
+      D3D12_LOGIC_OP_COPY_INVERTED, D3D12_LOGIC_OP_OR_INVERTED, D3D12_LOGIC_OP_NAND, D3D12_LOGIC_OP_SET,
+  };
+  auto blend = [](blend_factor f) { return kBlend[std::min<uint32_t>(static_cast<uint32_t>(f), 18)]; };
+  auto op = [](auto value) { return static_cast<uint32_t>(value) + 1; };  // blend, compare and stencil ops
+
+  input_layout->resize(source.elements.size());
+  for (size_t i = 0; i < source.elements.size(); ++i) {
+    const input_element& e = source.elements[i];
+    (*input_layout)[i] = {source.semantics[i].c_str(), e.semantic_index, static_cast<DXGI_FORMAT>(e.format),
+                          e.buffer_binding, e.offset,
+                          e.instance_step_rate != 0 ? D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+                                                    : D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                          e.instance_step_rate};
+  }
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
+  d.VS = {source.vs.data(), source.vs.size()};
+  if (!source.ps.empty() && !source.other_stages && source.topology == primitive_topology::triangle_list)
+    d.PS = {source.ps.data(), source.ps.size()};
+  const blend_desc& b = source.blend;
+  d.BlendState.AlphaToCoverageEnable = b.alpha_to_coverage_enable;
+  d.BlendState.IndependentBlendEnable = TRUE;
+  for (int i = 0; i < 8; ++i) {
+    D3D12_RENDER_TARGET_BLEND_DESC& rt = d.BlendState.RenderTarget[i];
+    rt.BlendEnable = b.blend_enable[i];
+    rt.LogicOpEnable = b.logic_op_enable[i];
+    rt.SrcBlend = blend(b.source_color_blend_factor[i]);
+    rt.DestBlend = blend(b.dest_color_blend_factor[i]);
+    rt.BlendOp = static_cast<D3D12_BLEND_OP>(op(b.color_blend_op[i]));
+    rt.SrcBlendAlpha = blend(b.source_alpha_blend_factor[i]);
+    rt.DestBlendAlpha = blend(b.dest_alpha_blend_factor[i]);
+    rt.BlendOpAlpha = static_cast<D3D12_BLEND_OP>(op(b.alpha_blend_op[i]));
+    rt.LogicOp = kLogic[std::min<uint32_t>(static_cast<uint32_t>(b.logic_op[i]), 15)];
+    rt.RenderTargetWriteMask = b.render_target_write_mask[i];
+  }
+  d.SampleMask = source.sample_mask;
+  const rasterizer_desc& r = source.rasterizer;
+  d.RasterizerState.FillMode = r.fill_mode == fill_mode::wireframe ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
+  d.RasterizerState.CullMode = r.cull_mode == cull_mode::front  ? D3D12_CULL_MODE_FRONT
+                               : r.cull_mode == cull_mode::back ? D3D12_CULL_MODE_BACK
+                                                                : D3D12_CULL_MODE_NONE;
+  d.RasterizerState.FrontCounterClockwise = r.front_counter_clockwise;
+  d.RasterizerState.DepthBias = static_cast<INT>(r.depth_bias);
+  d.RasterizerState.DepthBiasClamp = r.depth_bias_clamp;
+  d.RasterizerState.SlopeScaledDepthBias = r.slope_scaled_depth_bias;
+  d.RasterizerState.DepthClipEnable = r.depth_clip_enable;
+  d.RasterizerState.MultisampleEnable = r.multisample_enable;
+  d.RasterizerState.AntialiasedLineEnable = r.antialiased_line_enable;
+  d.RasterizerState.ConservativeRaster = r.conservative_rasterization != 0 ? D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
+                                                                           : D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+  const depth_stencil_desc& ds = source.depth_stencil;
+  d.DepthStencilState.DepthEnable = ds.depth_enable;
+  d.DepthStencilState.DepthWriteMask = ds.depth_write_mask ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+  d.DepthStencilState.DepthFunc = static_cast<D3D12_COMPARISON_FUNC>(op(ds.depth_func));
+  d.DepthStencilState.StencilEnable = ds.stencil_enable;
+  d.DepthStencilState.StencilReadMask = ds.front_stencil_read_mask;
+  d.DepthStencilState.StencilWriteMask = ds.front_stencil_write_mask;
+  d.DepthStencilState.FrontFace = {static_cast<D3D12_STENCIL_OP>(op(ds.front_stencil_fail_op)),
+                                   static_cast<D3D12_STENCIL_OP>(op(ds.front_stencil_depth_fail_op)),
+                                   static_cast<D3D12_STENCIL_OP>(op(ds.front_stencil_pass_op)),
+                                   static_cast<D3D12_COMPARISON_FUNC>(op(ds.front_stencil_func))};
+  d.DepthStencilState.BackFace = {static_cast<D3D12_STENCIL_OP>(op(ds.back_stencil_fail_op)),
+                                  static_cast<D3D12_STENCIL_OP>(op(ds.back_stencil_depth_fail_op)),
+                                  static_cast<D3D12_STENCIL_OP>(op(ds.back_stencil_pass_op)),
+                                  static_cast<D3D12_COMPARISON_FUNC>(op(ds.back_stencil_func))};
+  d.InputLayout = {input_layout->data(), static_cast<UINT>(input_layout->size())};
+  d.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+  d.PrimitiveTopologyType = source.topology == primitive_topology::point_list ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+                            : source.topology == primitive_topology::line_list ||
+                                    source.topology == primitive_topology::line_strip
+                                ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                                : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  d.NumRenderTargets = static_cast<UINT>(std::min<size_t>(source.render_targets.size(), 8));
+  for (UINT i = 0; i < d.NumRenderTargets; ++i) d.RTVFormats[i] = static_cast<DXGI_FORMAT>(source.render_targets[i]);
+  d.DSVFormat = static_cast<DXGI_FORMAT>(source.depth_format);
+  d.SampleDesc.Count = std::max<uint32_t>(1, source.sample_count);
+  return d;
+}
+
+// Builds the stream-output copies of a remembered pipeline. Called with g_wind_mutex held.
+void AddWindPipeline(uint64_t pipeline, WindSource& source) {
+  auto* const descriptors = g_device != nullptr ? g_device->get_private_data<erdlss::Descriptors>() : nullptr;
+  std::vector<erdlss::WindMotion::RootParam> layout;
+  if (descriptors == nullptr || !ToRootParams(descriptors->Params(source.layout), &layout)) {
+    SetWindError("unsupported root layout for " + source.name);
+    return;
+  }
+  std::vector<D3D12_INPUT_ELEMENT_DESC> input_layout;
+  const D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = ToPipelineDesc(source, &input_layout);
+  if (!g_wind.AddPipeline(pipeline, source.name, source.layout.handle, layout, desc)) SetWindError(g_wind.status());
 }
 
 void RememberWindPipeline(device* dev, pipeline_layout layout, uint32_t count, const pipeline_subobject* subobjects,
@@ -1011,23 +1151,68 @@ void RememberWindPipeline(device* dev, pipeline_layout layout, uint32_t count, c
   }
   WindSource source;
   source.name = name;
+  source.layout = layout;
   source.vs.assign(static_cast<const uint8_t*>(vs->code), static_cast<const uint8_t*>(vs->code) + vs->code_size);
   for (uint32_t i = 0; i < count; ++i) {
-    if (subobjects[i].type == pipeline_subobject_type::input_layout) {
-      const auto* elements = static_cast<const input_element*>(subobjects[i].data);
-      for (uint32_t k = 0; k < subobjects[i].count; ++k) {
-        source.semantics.emplace_back(elements[k].semantic != nullptr ? elements[k].semantic : "");
-        source.elements.push_back(elements[k]);
+    const pipeline_subobject& sub = subobjects[i];
+    if (sub.count == 0 || sub.data == nullptr) continue;
+    switch (sub.type) {
+      case pipeline_subobject_type::pixel_shader: {
+        const auto* ps = static_cast<const shader_desc*>(sub.data);
+        const auto* code = static_cast<const uint8_t*>(ps->code);
+        if (code != nullptr) source.ps.assign(code, code + ps->code_size);
+        break;
       }
-    } else if (subobjects[i].type == pipeline_subobject_type::primitive_topology && subobjects[i].count != 0) {
-      const auto topology = *static_cast<const primitive_topology*>(subobjects[i].data);
-      source.topology = topology == primitive_topology::point_list ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
-                        : topology == primitive_topology::line_list || topology == primitive_topology::line_strip
-                            ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
-                            : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      case pipeline_subobject_type::hull_shader:
+      case pipeline_subobject_type::domain_shader:
+      case pipeline_subobject_type::geometry_shader:
+        if (static_cast<const shader_desc*>(sub.data)->code != nullptr) source.other_stages = true;
+        break;
+      case pipeline_subobject_type::input_layout: {
+        const auto* elements = static_cast<const input_element*>(sub.data);
+        for (uint32_t k = 0; k < sub.count; ++k) {
+          source.semantics.emplace_back(elements[k].semantic != nullptr ? elements[k].semantic : "");
+          source.elements.push_back(elements[k]);
+        }
+        break;
+      }
+      case pipeline_subobject_type::blend_state: source.blend = *static_cast<const blend_desc*>(sub.data); break;
+      case pipeline_subobject_type::rasterizer_state:
+        source.rasterizer = *static_cast<const rasterizer_desc*>(sub.data);
+        break;
+      case pipeline_subobject_type::depth_stencil_state:
+        source.depth_stencil = *static_cast<const depth_stencil_desc*>(sub.data);
+        break;
+      case pipeline_subobject_type::primitive_topology:
+        source.topology = *static_cast<const primitive_topology*>(sub.data);
+        break;
+      case pipeline_subobject_type::render_target_formats: {
+        const auto* formats = static_cast<const format*>(sub.data);
+        source.render_targets.assign(formats, formats + sub.count);
+        break;
+      }
+      case pipeline_subobject_type::depth_stencil_format:
+        source.depth_format = *static_cast<const format*>(sub.data);
+        break;
+      case pipeline_subobject_type::sample_mask: source.sample_mask = *static_cast<const uint32_t*>(sub.data); break;
+      case pipeline_subobject_type::sample_count: source.sample_count = *static_cast<const uint32_t*>(sub.data); break;
+      default: break;
     }
   }
   std::lock_guard lock(g_wind_mutex);
+  // One log line per material: how its G-buffer pass tests depth (a depth prepass shows as no depth writes).
+  static std::vector<std::string> logged;
+  const std::string material = name.substr(0, name.find('@'));
+  if (std::find(logged.begin(), logged.end(), material) == logged.end()) {
+    logged.push_back(material);
+    char text[256];
+    std::snprintf(text, sizeof(text),
+                  "Wind material %s: depth test %d, write %d, func %u, stencil %d, cull %u, PS %zu B",
+                  material.c_str(), source.depth_stencil.depth_enable, source.depth_stencil.depth_write_mask,
+                  static_cast<uint32_t>(source.depth_stencil.depth_func), source.depth_stencil.stencil_enable,
+                  static_cast<uint32_t>(source.rasterizer.cull_mode), source.ps.size());
+    Log(reshade::log::level::info, text);
+  }
   WindSource& stored = g_wind_sources[p.handle];
   stored = std::move(source);
   if (g_wind_ready.load()) AddWindPipeline(p.handle, stored);
@@ -1186,17 +1371,21 @@ std::string WriteMaterialStats(int frames) {
 }
 
 // Streams the previous and current positions of an animated vegetation draw in the main camera's G-buffer pass.
-void StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count, uint32_t instance_count,
+// Returns true when the game's draw was recorded here (with the stream-output copy of its pipeline), so the caller
+// skips the original.
+bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count, uint32_t instance_count,
                     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
   device* const dev = cmd_list->get_device();
   auto* const state = cmd_list->get_private_data<state_tracking>();
   auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
-  if (state == nullptr || descriptors == nullptr || state->render_targets.size() != 5) return;
+  if (state == nullptr || descriptors == nullptr || state->render_targets.size() != 5) return false;
   const resource rt0 = dev->get_resource_from_view(state->render_targets[0]);
   const uint32_t width = g_render_width.load();
-  if (rt0 == 0 || (width != 0 && dev->get_resource_desc(rt0).texture.width != width)) return;
+  if (rt0 == 0 || (width != 0 && dev->get_resource_desc(rt0).texture.width != width)) return false;
   const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
-  if (it == state->descriptor_tables.end() || it->second.second.size() < 7) return;
+  if (it == state->descriptor_tables.end() || it->second.second.size() < 7) return false;
+  ID3D12RootSignature* const stream_rs = g_wind.root_signature(data.current.handle);
+  if (stream_rs == nullptr) return false;
   const pipeline_layout layout = it->second.first;
   const std::vector<descriptor_table> tables = it->second.second;
 
@@ -1211,7 +1400,7 @@ void StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
         (range = descriptors->Buffer(heap, offset)).buffer == 0 || range.size < (i == 0 ? 2016u : 448u)) {
       std::lock_guard lock(g_wind_mutex);
       SetWindError(std::string("no usable ") + (i == 0 ? "cbSceneParam" : "cbPerFrame") + " at a vegetation draw");
-      return;
+      return false;
     }
     va[i] = reinterpret_cast<ID3D12Resource*>(range.buffer.handle)->GetGPUVirtualAddress() + range.offset;
   }
@@ -1230,18 +1419,21 @@ void StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
   }
   const D3D12_GPU_VIRTUAL_ADDRESS prev[2] = {data.wind_prev, data.wind_prev + erdlss::WindMotion::kPrevFrameOffset};
 
-  const pipeline_layout stream_layout = {reinterpret_cast<uint64_t>(g_wind.stream_root_signature())};
-  cmd_list->bind_descriptor_tables(shader_stage::all_graphics, stream_layout, 0, 7, tables.data());
+  // The copies' root signature has the game's parameters at the same indices (b8/b9 come as root CBVs on top).
+  const pipeline_layout stream_layout = {reinterpret_cast<uint64_t>(stream_rs)};
+  for (uint32_t i = 0; i < tables.size(); ++i)
+    if (tables[i] != 0) cmd_list->bind_descriptor_tables(shader_stage::all_graphics, stream_layout, i, 1, &tables[i]);
   if (!data.wind_streams_bound) {
     g_wind.BindStreams(native);
     data.wind_streams_bound = true;
   }
-  g_wind.RecordStreams(native, data.current.handle, va[0], va[1], prev[0], prev[1], index_count, instance_count,
-                       first_index, vertex_offset, first_instance);
+  const bool replaced = g_wind.RecordStreams(native, data.current.handle, va[0], va[1], prev[0], prev[1], index_count,
+                                             instance_count, first_index, vertex_offset, first_instance);
   // Changing the root signature dropped every root argument; put the game's back, then its pipeline.
   for (uint32_t i = 0; i < tables.size(); ++i)
     if (tables[i] != 0) cmd_list->bind_descriptor_tables(shader_stage::all_graphics, layout, i, 1, &tables[i]);
   cmd_list->bind_pipeline(pipeline_stage::all, data.current);
+  return replaced;
 }
 
 // Writes the streamed vegetation's motion into the TAA's motion texture, then puts the TAA draw's state back.
@@ -1311,18 +1503,21 @@ void StartWind(effect_runtime* runtime) {
 }
 
 std::string WindStats() {
-  static uint64_t last_frame = 0, last_draws = 0, last_vertices = 0, last_resolves = 0, last_patches = 0;
+  static uint64_t last_frame = 0, last_draws = 0, last_vertices = 0, last_resolves = 0, last_patches = 0,
+                  last_replaced = 0;
   const uint64_t frame = g_frame.load(), draws = g_wind.streamed_draws(), vertices = g_wind.streamed_vertices();
   const uint64_t resolves = g_wind_resolves.load();
   const double frames = static_cast<double>(std::max<uint64_t>(1, frame - last_frame));
   char text[256];
   std::snprintf(text, sizeof(text),
-                "wind: %zu pipelines, %.0f draws and %.2f M vertices streamed per frame, %.1f constant patches and "
-                "%.2f resolves per frame, %llu errors",
-                g_wind.pipeline_count(), (draws - last_draws) / frames, (vertices - last_vertices) / frames / 1e6,
+                "wind: %zu pipelines (%zu full copies), %.0f draws (%.0f replaced) and %.2f M vertices streamed per "
+                "frame, %.1f constant patches and %.2f resolves per frame, %llu errors",
+                g_wind.pipeline_count(), g_wind.full_pipeline_count(), (draws - last_draws) / frames,
+                (g_wind.replaced_draws() - last_replaced) / frames, (vertices - last_vertices) / frames / 1e6,
                 (g_wind.patches() - last_patches) / frames, (resolves - last_resolves) / frames,
                 static_cast<unsigned long long>(g_wind_errors.load()));
   last_patches = g_wind.patches();
+  last_replaced = g_wind.replaced_draws();
   last_frame = frame;
   last_draws = draws;
   last_vertices = vertices;
@@ -1334,8 +1529,9 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
                    int32_t vertex_offset, uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
-  if (g_config.wind_motion && g_wind_ready.load() && g_wind.IsWindPipeline(data->current.handle))
-    StreamWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance);
+  if (g_config.wind_motion && g_wind_ready.load() && g_wind.IsWindPipeline(data->current.handle) &&
+      StreamWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance))
+    return true;  // drawn by the stream-output copy of the game's pipeline
   if (g_stats_remaining.load() > 0) CountMaterialDraw(cmd_list, *data, index_count, instance_count);
   if (data->pass == Pass::kToneMap) {
     if (!g_config.chromatic_aberration) RemoveChromaticAberration(cmd_list);
@@ -1573,6 +1769,10 @@ void OnReshadePresent(effect_runtime* runtime) {
     g_wind.set_time_step(std::strtof(arg.c_str(), nullptr));
   } else if (command == "windresolve") {
     g_wind.set_resolve_draw(arg != "off");
+  } else if (command == "winddepth") {
+    g_wind.set_depth_tolerance(std::strtof(arg.c_str(), nullptr));
+  } else if (command == "windfull") {
+    g_wind.set_full_draw(arg != "off");
   } else if (command == "winddebug") {
     g_wind.RequestDebug();
     wind_debug_request = command;

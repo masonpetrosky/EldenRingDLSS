@@ -17,9 +17,12 @@
 # to the ini setting. Analyze with tools\wind_check.py.
 # -Round winddiag: wind on; a debug capture (shots/winddebug.txt) and motion dump with the game's time step, then with
 # a 0.5 s step; frame times with the resolve draw skipped, with everything on, and with wind off.
+# -Round windopt: wind on; screenshots with wind on and off (the stream-output copy must draw the grass exactly like
+# the game); motion dumps with the game's time step, a 0.5 s step and a 1% depth tolerance; frame times with
+# everything on, with vertex-only current passes, without the resolve draw, and with wind off.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
-               'winddiag')][string]$Round = 'sharpen',
+               'winddiag', 'windopt')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -75,6 +78,20 @@ if ($Round -eq 'sharpen') {
   $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
   Send 'dlss on'; Send 'wind off' 1.0; Send 'mv 4 windoff'; LogFrames 'wind_off'
   Send 'wind on' 3.0; Send 'windstats' 1.0; Send 'mv 4 windon'; LogFrames 'wind_on'; Send 'windstats'
+  Send "wind $restore"
+} elseif ($Round -eq 'windopt') {
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
+  Remove-Item (Join-Path $Folder 'shots\winddebug.txt') -ErrorAction SilentlyContinue
+  Send 'dlss on'; Send 'wind off' 1.0; Send 'capture wind_shot_off'
+  Send 'wind on' 5.0; Send 'capture wind_shot_on'; Send 'windstats' 1.0; Send 'winddebug'
+  Send 'mv 2 wind_dt'; Send 'windstats'
+  Send 'windtime 0.5' 1.0; Send 'mv 2 wind_half'; Send 'windtime 0'
+  Send 'winddepth 0.01' 1.0; Send 'mv 2 wind_tol'; Send 'winddepth 0.0001'
+  LogFrames 'wind_on3'
+  Send 'windfull off' 1.0; LogFrames 'wind_vsonly'; Send 'windfull on'
+  Send 'windresolve off' 1.0; LogFrames 'wind_noresolve'; Send 'windresolve on'
+  Send 'wind off' 1.0; LogFrames 'wind_off3'
   Send "wind $restore"
 } elseif ($Round -eq 'winddiag') {
   $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue

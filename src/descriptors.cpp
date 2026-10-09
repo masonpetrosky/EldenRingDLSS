@@ -85,6 +85,14 @@ buffer_range Descriptors::Buffer(descriptor_heap heap, uint32_t offset) const {
              : buffer_range{};
 }
 
+std::vector<Descriptors::ParamInfo> Descriptors::Params(pipeline_layout layout) const {
+  std::vector<ParamInfo> out;
+  const auto it = layouts_.find(layout.handle);
+  if (it == layouts_.end()) return out;
+  for (const Param& param : it->second) out.push_back({param.type, param.ranges});
+  return out;
+}
+
 bool Descriptors::HasMaterialVertexTables(pipeline_layout layout) const {
   const auto it = layouts_.find(layout.handle);
   if (it == layouts_.end() || it->second.size() < 7) return false;

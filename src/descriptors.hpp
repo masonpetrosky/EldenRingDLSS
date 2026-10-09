@@ -34,6 +34,14 @@ class __declspec(uuid("7d3f0a52-8b1e-4d6a-9c3e-2f5b8e4a1c07")) Descriptors {
             uint32_t* offset) const;
 
   reshade::api::resource_view View(reshade::api::descriptor_heap heap, uint32_t offset) const;
+  // A root parameter as tracked: tables keep their ranges; root constants keep one range whose count is the number of
+  // 32-bit values; root descriptors keep their single range.
+  struct ParamInfo {
+    reshade::api::pipeline_layout_param_type type;
+    std::vector<reshade::api::descriptor_range> ranges;
+  };
+  std::vector<ParamInfo> Params(reshade::api::pipeline_layout layout) const;
+
   // True when root parameters 0-6 are the vertex-stage tables of the game's material layout: b0-3, b4-13, t0-3,
   // t4-19, t20-65, s0-3, s4-15 (what the wind stream-output root signature mirrors).
   bool HasMaterialVertexTables(reshade::api::pipeline_layout layout) const;
