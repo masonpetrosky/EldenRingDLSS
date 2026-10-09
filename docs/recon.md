@@ -360,3 +360,29 @@ holes or specks, and coverage matches the extra-draw path (vegetation drawn 55.7
 The extra draw evaluates the wind once per vertex and, testing against the finished depth without writing it, shades
 roughly one fragment per pixel. The replacement evaluates it for every fragment the prepass rasterizes, overdraw
 included, and that costs more than the geometry pass it saves. Off by default.
+
+## Trees and the other swaying materials (2026-10-09, capture `er117_drs67_f12837`)
+
+`tools/rdc_drawnames.py` lists every draw with its shader names (`captures/drawnames_f12837.txt`);
+`captures/inspect_tree` has four SpeedTree G-buffer draws.
+
+| material | G-buffer vertices | wind driven by |
+| --- | --- | --- |
+| SpeedTree (5 shader variants, `SpeedTree_*_w*_Gbuf`) | 1.06 M | per-tree wind state from the CPU |
+| `M[WorldTree_Leaves]` (+ `_Emissive_Glow`) | 0.97 M | `FC_GlobalTime` |
+| `M[AMSN][Sway]` | 0.32 M | `FC_GlobalTime` |
+
+- `[Sway]` and `WorldTree_Leaves` work like grass: short vertex shaders (435 and 552 decompiled lines) driven by
+  `FC_GlobalTime` and a few `cbMtdParam` floats, so the previous pose is the same math at `FC_GlobalTime -
+  FC_GlobalDt`. The Erdtree leaves are far away almost everywhere, so their motion is mostly sub-pixel.
+- SpeedTree draws are standalone (they write depth, no G-buffer prepass), so an extra velocity draw would fit. Each
+  tree's transform comes from a per-instance vertex stream (position and scale, up and right vectors). The wind is in
+  `cbSpeedTreeWind` (b13): one 272-byte `sSpeedTreeWind` (17 float4s: direction, anchor, global, two branch levels,
+  two leaf levels, frond ripple, strength, interaction) per tree, indexed by `g_InstanceIndexBuffer[offset +
+  instance] * 17`. The trees of a draw share every parameter except the clocks (global time, branch times, leaf
+  ripple, tumble and twitch times), which carry one per-tree offset (34.78 to 35.26 for the five trees of event
+  66998). Only the current clocks are there: the game keeps no previous wind state.
+- A previous tree pose therefore needs last frame's clocks of the same tree. The trees must be matched between frames
+  (by instance position, on the GPU), or the per-frame clock advance has to be learned per tree model. Then either
+  SpeedTree's wind math gets ported (five shader variants of 26-49 KB of decompiled code each), or the game's own
+  shader is replayed with the previous clocks (the stream-output approach).
