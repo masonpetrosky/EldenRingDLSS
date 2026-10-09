@@ -40,6 +40,16 @@ Vertex VSMain(uint id : SV_VertexID) {
   return v;
 }
 
+// Draw arguments for the resolve: the vertices both streams hold (whole triangles), at most the capacity, so the
+// draw does not run the vertex shader over the whole buffer.
+RWByteAddressBuffer g_Args : register(u0);
+
+[numthreads(1, 1, 1)]
+void ArgsMain() {
+  const uint count = min(min(g_Filled.Load(0), g_Filled.Load(16)) / 16, g_Capacity) / 3 * 3;
+  g_Args.Store4(0, uint4(count, 1, 0, 0));
+}
+
 float2 PSMain(Vertex v) : SV_Target {
   const float scene = g_Depth.Load(int3(v.position.xy, 0));
   if (abs(scene - v.position.z / g_ZScale) > g_DepthTolerance * max(scene, 1e-7)) discard;

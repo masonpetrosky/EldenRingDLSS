@@ -154,6 +154,7 @@ erdlss::WindPort g_wind_port;
 std::atomic<bool> g_wind_ready{false};
 std::atomic<bool> g_port_ready{false};
 std::atomic<bool> g_wind_failed{false};
+std::atomic<bool> g_trees_failed{false};
 std::atomic<uint64_t> g_wind_errors{0};
 std::atomic<uint64_t> g_wind_resolves{0};
 std::string g_wind_error;  // first error, under g_wind_mutex
@@ -1803,24 +1804,6 @@ void StartWind(effect_runtime* runtime) {
     Log(reshade::log::level::info, "Wind motion vectors on (ported shader): " +
                                        std::to_string(g_wind_port.pipeline_count()) + " grass-family pipelines, " +
                                        std::to_string(g_wind_port.replacement_count()) + " prepass replacements.");
-    // Trees: the stream-output path, for SpeedTree only.
-    const uint32_t tree_capacity = static_cast<uint32_t>(g_config.wind_tree_capacity) * 1000000u;
-    if (!g_wind.Init(reinterpret_cast<ID3D12Device*>(g_device->get_native()), tree_capacity)) {
-      Log(reshade::log::level::error, "Tree motion vectors unavailable: " + g_wind.status());
-      g_wind.Shutdown();
-      return;
-    }
-    g_wind.RecordSetup(
-        reinterpret_cast<ID3D12GraphicsCommandList*>(queue->get_immediate_command_list()->get_native()));
-    queue->flush_immediate_command_list();
-    queue->wait_idle();
-    for (auto& [pipeline, source] : g_wind_sources)
-      if (IsTreeMaterial(source.name)) AddWindPipeline(pipeline, source);
-    g_wind.MarkReady();
-    g_wind_ready = true;
-    Log(reshade::log::level::info, "Tree motion vectors on: " + std::to_string(g_wind.pipeline_count()) +
-                                       " SpeedTree pipelines, room for " + std::to_string(tree_capacity) +
-                                       " vertices per frame.");
     return;
   }
   const uint32_t capacity = static_cast<uint32_t>(g_config.wind_capacity) * 1000000u;
@@ -1840,6 +1823,31 @@ void StartWind(effect_runtime* runtime) {
   Log(reshade::log::level::info, "Wind motion vectors on: " + std::to_string(g_wind.pipeline_count()) + " of " +
                                      std::to_string(g_wind_sources.size()) + " vegetation pipelines, room for " +
                                      std::to_string(capacity) + " vertices per frame.");
+}
+
+// Trees next to the ported grass path: the stream-output path for SpeedTree only, started the first time trees are
+// on (so it takes no video memory while they are off).
+void StartTrees(effect_runtime* runtime) {
+  std::lock_guard lock(g_wind_mutex);
+  if (g_device == nullptr) return;
+  const uint32_t capacity = static_cast<uint32_t>(g_config.wind_tree_capacity) * 1000000u;
+  if (!g_wind.Init(reinterpret_cast<ID3D12Device*>(g_device->get_native()), capacity)) {
+    Log(reshade::log::level::error, "Tree motion vectors unavailable: " + g_wind.status());
+    g_wind.Shutdown();
+    g_trees_failed = true;
+    return;
+  }
+  command_queue* const queue = runtime->get_command_queue();
+  g_wind.RecordSetup(reinterpret_cast<ID3D12GraphicsCommandList*>(queue->get_immediate_command_list()->get_native()));
+  queue->flush_immediate_command_list();
+  queue->wait_idle();
+  for (auto& [pipeline, source] : g_wind_sources)
+    if (IsTreeMaterial(source.name)) AddWindPipeline(pipeline, source);
+  g_wind.MarkReady();
+  g_wind_ready = true;
+  Log(reshade::log::level::info, "Tree motion vectors on: " + std::to_string(g_wind.pipeline_count()) +
+                                     " SpeedTree pipelines, room for " + std::to_string(capacity) +
+                                     " vertices per frame.");
 }
 
 std::string PortStats() {
@@ -2094,6 +2102,9 @@ void FinishRemote(const std::string& request, const std::string& result) {
 void OnReshadePresent(effect_runtime* runtime) {
   if (g_config.wind_motion && !g_wind_ready.load() && !g_port_ready.load() && !g_wind_failed.load())
     StartWind(runtime);
+  if (g_config.wind_motion && g_config.wind_mode == 1 && g_config.wind_trees && g_port_ready.load() &&
+      !g_wind_ready.load() && !g_trees_failed.load())
+    StartTrees(runtime);
   static std::string dump_request;  // the pending "mv" command, answered once its frames are saved
   static std::string stats_request;  // the pending "vegstats" command
   static int stats_frames = 0;
@@ -2280,19 +2291,33 @@ void OnOverlay(effect_runtime*) {
   ImGui::SetItemTooltip("The game's lens effect: red and blue shift up to a pixel apart toward the left and right "
                         "edges, which softens the image there. Works with DLSS on or off.");
   if (ImGui::Checkbox("Wind motion vectors (experimental)", &g_config.wind_motion)) SaveConfig();
-  ImGui::SetItemTooltip("Gives grass, bushes and trees swaying in the wind motion vectors, so DLSS (or the game's TAA) "
-                        "can follow them instead of smearing. Costs GPU time and about %d MB of video memory.",
-                        g_config.wind_capacity * 32);
+  ImGui::SetItemTooltip("Gives grass and bushes swaying in the wind motion vectors, so DLSS (or the game's TAA) can "
+                        "follow them instead of smearing. Costs GPU time (about 1 ms at 4K in a grass field).");
+  if (g_config.wind_motion && g_config.wind_mode == 1) {
+    ImGui::Indent();
+    if (ImGui::Checkbox("Tree motion vectors", &g_config.wind_trees)) SaveConfig();
+    ImGui::SetItemTooltip("Also gives SpeedTree trees and shrubs motion vectors. Costs about 1 ms more at 4K at a "
+                          "forest edge, and about %d MB of video memory.",
+                          g_config.wind_tree_capacity * 32 + 13);
+    ImGui::Unindent();
+  }
   if (g_config.wind_motion) {
     std::unique_lock lock(g_wind_mutex, std::try_to_lock);
-    if (lock.owns_lock())
-      ImGui::Text("  %s, %zu pipelines, %llu errors%s%s",
-                  g_port_ready.load()   ? "running (ported shader)"
-                  : g_wind_ready.load() ? "running (stream output)"
-                                        : g_wind.status().c_str(),
-                  g_port_ready.load() ? g_wind_port.pipeline_count() : g_wind.pipeline_count(),
-                  static_cast<unsigned long long>(g_wind_errors.load()), g_wind_error.empty() ? "" : ": ",
-                  g_wind_error.c_str());
+    if (lock.owns_lock()) {
+      if (g_config.wind_mode == 1)
+        ImGui::Text("  grass: %s, %zu pipelines; trees: %s, %zu pipelines; %llu errors%s%s",
+                    g_port_ready.load() ? "running" : g_wind_port.status().c_str(), g_wind_port.pipeline_count(),
+                    g_wind_ready.load() ? (g_config.wind_trees ? "running" : "paused")
+                    : g_config.wind_trees ? g_wind.status().c_str()
+                                          : "off",
+                    g_wind.pipeline_count(), static_cast<unsigned long long>(g_wind_errors.load()),
+                    g_wind_error.empty() ? "" : ": ", g_wind_error.c_str());
+      else
+        ImGui::Text("  %s, %zu pipelines, %llu errors%s%s",
+                    g_wind_ready.load() ? "running (stream output)" : g_wind.status().c_str(),
+                    g_wind.pipeline_count(), static_cast<unsigned long long>(g_wind_errors.load()),
+                    g_wind_error.empty() ? "" : ": ", g_wind_error.c_str());
+    }
   }
   ImGui::Text("Texture mip bias: %+.2f on %llu samplers (MipBias in EldenRingDLSS.ini, needs a restart)",
               g_applied_mip_bias, static_cast<unsigned long long>(g_biased_samplers.load()));

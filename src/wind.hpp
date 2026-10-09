@@ -136,6 +136,11 @@ class WindMotion {
   uint32_t capacity_ = 0;
 
   ID3D12RootSignature* resolve_rs_ = nullptr;
+  // The resolve's indirect draw: its arguments come from the fill counters (wind_resolve.hlsl ArgsMain).
+  ID3D12RootSignature* args_rs_ = nullptr;
+  ID3D12PipelineState* args_pso_ = nullptr;
+  ID3D12CommandSignature* draw_signature_ = nullptr;
+  ID3D12Resource* args_ = nullptr;
   ID3D12RootSignature* patch_rs_ = nullptr;
   ID3D12PipelineState* patch_pso_ = nullptr;
   std::mutex resolve_mutex_;

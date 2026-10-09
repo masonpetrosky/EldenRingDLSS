@@ -11,6 +11,7 @@
 
 #include "d3d12_util.hpp"
 #include "kWindPatchCs.h"
+#include "kWindResolveArgsCs.h"
 #include "kWindResolvePs.h"
 #include "kWindResolveVs.h"
 #include "kTreeWindAdvanceCs.h"
@@ -121,6 +122,28 @@ bool WindMotion::Init(ID3D12Device* device, uint32_t capacity) {
   }
   tree_table_->SetName(L"EldenRingDLSS tree wind table");
 
+  // Resolve arguments: the fill counters as a root SRV (t2), the arguments as a root UAV, the resolve's constants.
+  D3D12_ROOT_PARAMETER args_params[3] = {};
+  args_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+  args_params[0].Descriptor = {2, 0};
+  args_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  args_params[1].Descriptor = {0, 0};
+  args_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  args_params[2].Constants = {0, 0, 6};
+  const D3D12_ROOT_SIGNATURE_DESC args_desc = {3, args_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  args_rs_ = CreateRootSignature(device, args_desc);
+  compute.pRootSignature = args_rs_;
+  compute.CS = {kWindResolveArgsCs, sizeof(kWindResolveArgsCs)};
+  const D3D12_INDIRECT_ARGUMENT_DESC draw_arg = {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
+  const D3D12_COMMAND_SIGNATURE_DESC signature = {sizeof(D3D12_DRAW_ARGUMENTS), 1, &draw_arg, 0};
+  if (args_rs_ == nullptr || FAILED(device->CreateComputePipelineState(&compute, IID_PPV_ARGS(&args_pso_))) ||
+      FAILED(device->CreateCommandSignature(&signature, nullptr, IID_PPV_ARGS(&draw_signature_)))) {
+    status_ = "resolve argument pipeline creation failed";
+    return false;
+  }
+  args_ = CreateBuffer(device, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
   prev_ = CreateBuffer(device, static_cast<uint64_t>(capacity_) * kStride, D3D12_HEAP_TYPE_DEFAULT,
                        D3D12_RESOURCE_STATE_COMMON);
   cur_ = CreateBuffer(device, static_cast<uint64_t>(capacity_) * kStride, D3D12_HEAP_TYPE_DEFAULT,
@@ -131,7 +154,7 @@ bool WindMotion::Init(ID3D12Device* device, uint32_t capacity) {
                        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   debug_ = CreateBuffer(device, kDebugSize, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
   if (prev_ == nullptr || cur_ == nullptr || filled_ == nullptr || zeros_ == nullptr || ring_ == nullptr ||
-      debug_ == nullptr) {
+      debug_ == nullptr || args_ == nullptr) {
     status_ = "buffer creation failed (" + std::to_string(2ull * capacity_ * kStride >> 20) + " MB)";
     return false;
   }
@@ -189,6 +212,10 @@ void WindMotion::Shutdown() {
   Release(tree_advance_pso_);
   Release(tree_clear_pso_);
   Release(tree_rs_);
+  Release(args_);
+  Release(draw_signature_);
+  Release(args_pso_);
+  Release(args_rs_);
   Release(tree_table_);
   Release(tree_ring_);
   Release(srv_heap_);
@@ -585,6 +612,18 @@ bool WindMotion::Resolve(ID3D12GraphicsCommandList* cmd, ID3D12Resource* motion,
   };
   cmd->ResourceBarrier(5, to);
 
+  // The draw's vertex count from the fill counters (the arguments buffer starts the list in the common state and is
+  // promoted to unordered access by the dispatch).
+  cmd->SetComputeRootSignature(args_rs_);
+  cmd->SetPipelineState(args_pso_);
+  cmd->SetComputeRootShaderResourceView(0, filled_->GetGPUVirtualAddress());
+  cmd->SetComputeRootUnorderedAccessView(1, args_->GetGPUVirtualAddress());
+  cmd->SetComputeRoot32BitConstant(2, capacity_, 4);
+  cmd->Dispatch(1, 1, 1);
+  const D3D12_RESOURCE_BARRIER args_ready =
+      Transition(args_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+  cmd->ResourceBarrier(1, &args_ready);
+
   const float tolerance = depth_tolerance_.load();
   cmd->SetDescriptorHeaps(1, &srv_heap_);
   cmd->SetGraphicsRootSignature(resolve_rs_);
@@ -605,7 +644,7 @@ bool WindMotion::Resolve(ID3D12GraphicsCommandList* cmd, ID3D12Resource* motion,
   const D3D12_RECT scissor = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
   cmd->RSSetViewports(1, &viewport);
   cmd->RSSetScissorRects(1, &scissor);
-  if (resolve_draw_.load()) cmd->DrawInstanced(capacity_, 1, 0, 0);
+  if (resolve_draw_.load()) cmd->ExecuteIndirect(draw_signature_, 1, args_, 0, nullptr, 0);
 
   if (debug_request_.exchange(false)) {
     const D3D12_RESOURCE_BARRIER copy_to[] = {
