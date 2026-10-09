@@ -135,11 +135,12 @@ uint8_t* g_exposure_mapped = nullptr;
 float g_applied_mip_bias = 0.0f;  // bias in effect for this session (fixed at startup)
 std::atomic<uint64_t> g_biased_samplers{0};
 
-// Development dump of the TAA's inputs (remote command "mv <frames> [name]"): g_MoveTex and SourceTex of
-// consecutive frames, copied into readback buffers at the TAA draw and saved to shots/ a few frames later.
+// Development dump of the TAA's inputs (remote command "mv <frames> [name]"): g_MoveTex, SourceTex and
+// g_StencilTex of consecutive frames, copied into readback buffers at the TAA draw and saved to shots/ a few
+// frames later.
 struct Readback {
   resource buffer;
-  uint32_t width, height, row_pitch;
+  uint32_t width, height, row_pitch, bytes_per_pixel;
   format fmt;
   uint64_t frame;
   std::string name;
@@ -425,16 +426,17 @@ void SetInfo(const std::string& info) {
 bool CopyToReadback(command_list* cmd_list, resource res, uint64_t frame, const std::string& name) {
   device* const dev = cmd_list->get_device();
   const resource_desc d = dev->get_resource_desc(res);
-  const uint32_t row_pitch = (d.texture.width * 4 + 255) & ~255u;  // both inputs are 32 bits per pixel
+  const uint32_t bpp = format_row_pitch(d.texture.format, 1);
+  const uint32_t row_pitch = (d.texture.width * bpp + 255) & ~255u;
   resource buffer = {0};
   if (!dev->create_resource(resource_desc(static_cast<uint64_t>(row_pitch) * d.texture.height, memory_heap::readback,
                                           resource_usage::copy_dest),
                             nullptr, resource_usage::copy_dest, &buffer))
     return false;
   cmd_list->barrier(res, resource_usage::shader_resource, resource_usage::copy_source);
-  cmd_list->copy_texture_to_buffer(res, 0, nullptr, buffer, 0, row_pitch / 4, d.texture.height);
+  cmd_list->copy_texture_to_buffer(res, 0, nullptr, buffer, 0, row_pitch / bpp, d.texture.height);
   cmd_list->barrier(res, resource_usage::copy_source, resource_usage::shader_resource);
-  g_dumps.push_back({buffer, d.texture.width, d.texture.height, row_pitch, d.texture.format, frame, name});
+  g_dumps.push_back({buffer, d.texture.width, d.texture.height, row_pitch, bpp, d.texture.format, frame, name});
   return true;
 }
 
@@ -446,6 +448,7 @@ void DumpTaaInputs(command_list* cmd_list) {
   device* const dev = cmd_list->get_device();
   const resource color = BoundResource(cmd_list, shader_stage::pixel, 0);   // SourceTex
   const resource motion = BoundResource(cmd_list, shader_stage::pixel, 3);  // g_MoveTex
+  const resource stencil = BoundResource(cmd_list, shader_stage::pixel, 5);  // g_StencilTex
   if (color == 0 || motion == 0) return;
   const resource_desc md = dev->get_resource_desc(motion);
   const resource_desc cd = dev->get_resource_desc(color);
@@ -457,7 +460,9 @@ void DumpTaaInputs(command_list* cmd_list) {
   char suffix[16];
   std::snprintf(suffix, sizeof(suffix), "_%02d", index);
   if (!CopyToReadback(cmd_list, motion, frame, g_dump_name + "_mv" + suffix) ||
-      !CopyToReadback(cmd_list, color, frame, g_dump_name + "_color" + suffix)) {
+      !CopyToReadback(cmd_list, color, frame, g_dump_name + "_color" + suffix) ||
+      (stencil != 0 && format_to_typeless(dev->get_resource_desc(stencil).texture.format) == format::r8_typeless &&
+       !CopyToReadback(cmd_list, stencil, frame, g_dump_name + "_stencil" + suffix))) {
     Log(reshade::log::level::error, "Could not create a readback buffer for the TAA dump.");
     g_dump_remaining = 0;
     return;
@@ -479,22 +484,25 @@ std::string WriteDumps(command_queue* queue) {
     std::lock_guard scene_lock(g_scene_mutex);
     exposure = g_scene.exposure;
   }
-  size_t written = 0;
+  size_t frames = 0, stencils = 0;
   for (const Readback& r : g_dumps) {
     void* mapped = nullptr;
     if (g_device->map_buffer_region(r.buffer, 0, UINT64_MAX, map_access::read_only, &mapped)) {
       std::ofstream out(dir / (r.name + ".bin"), std::ios::binary);
       for (uint32_t y = 0; y < r.height; ++y)
-        out.write(static_cast<const char*>(mapped) + static_cast<size_t>(y) * r.row_pitch, r.width * 4);
+        out.write(static_cast<const char*>(mapped) + static_cast<size_t>(y) * r.row_pitch,
+                  static_cast<std::streamsize>(r.width) * r.bytes_per_pixel);
       g_device->unmap_buffer_region(r.buffer);
       std::ofstream(dir / (r.name + ".txt")) << r.width << " " << r.height << " " << static_cast<int>(r.fmt) << " "
                                              << (r.frame - g_dump_start) << " " << exposure << "\n";
-      ++written;
+      frames += r.fmt == format::r16g16_float;
+      stencils += r.bytes_per_pixel == 1;
     }
     g_device->destroy_resource(r.buffer);
   }
   g_dumps.clear();
-  return "saved " + std::to_string(written / 2) + " frames as shots/" + g_dump_name + "_mv_NN.bin";
+  return "saved " + std::to_string(frames) + " frames (" + std::to_string(stencils) + " with stencil) as shots/" +
+         g_dump_name + "_mv_NN.bin";
 }
 
 // Returns true when DLSS replaced the draw.

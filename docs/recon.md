@@ -189,3 +189,23 @@ under 1.5 px its history factor is `w = a[s & 3] + (1 - a[s & 3]) * b[(s >> 2) &
 `CB_AA.g_FeedbackWeightScale[4]` (byte 160; open world: a = .x = 0.9, 0.85, 0.85, 0.8 and b = .y = 0, 0.2, 0.4,
 0.8). For larger motion it rejects history when the low two stencil bits of the current and previous pixel differ.
 Not known yet: which stencil class grass and trees get. If they get a class of their own, that is a vegetation mask.
+
+### Stencil classes (2026-10-09)
+
+The dump also saves `g_StencilTex` (R8_UINT); `tools/stencil_check.py` maps each value. Two Limgrave views (a grass
+field at night, then close to a ruin wall):
+
+| value | low bits / next bits | covers | TAA history factor `a + (1 - a) * b` |
+| --- | --- | --- | --- |
+| 0 | 0 / 0 | terrain, the ruin wall, wooden posts | 0.90 |
+| 1 | 1 / 0 | the player character | 0.85 |
+| 3 | 3 / 0 | grass, bushes, trees, natural rock humps | 0.80 |
+| 4, 8 | 0 / 1, 0 / 2 | distant terrain and a far tree | 0.92, 0.94 |
+| 7, 11 | 3 / 1, 3 / 2 | the same class-3 kinds of objects farther away | 0.84, 0.88 |
+| 12 | 0 / 3 | sky | 0.98 |
+
+The low two bits are an object class; the next two look like distance bands (more history further away). Class 3 is
+"vegetation and natural rocks" rather than vegetation alone (the close ruin wall is class 0). It lines up with the
+wind motion. In the ruin view, class 3 (58% of the screen) had 33% of its pixels change by more than 6% over one
+second, with motion vectors on 0.1% of them. Class 0 (38%) changed on 1.6%. The game's TAA handles this by
+giving class 3 the least history (0.80 against 0.90 for terrain).
