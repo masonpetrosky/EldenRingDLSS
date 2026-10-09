@@ -85,6 +85,63 @@ buffer_range Descriptors::Buffer(descriptor_heap heap, uint32_t offset) const {
              : buffer_range{};
 }
 
+bool Descriptors::HasMaterialVertexTables(pipeline_layout layout) const {
+  const auto it = layouts_.find(layout.handle);
+  if (it == layouts_.end() || it->second.size() < 7) return false;
+  struct Expected {
+    descriptor_type type;
+    uint32_t first, count;
+  };
+  static const Expected kExpected[] = {
+      {descriptor_type::constant_buffer, 0, 4},       {descriptor_type::constant_buffer, 4, 10},
+      {descriptor_type::shader_resource_view, 0, 4},  {descriptor_type::shader_resource_view, 4, 16},
+      {descriptor_type::shader_resource_view, 20, 46}, {descriptor_type::sampler, 0, 4},
+      {descriptor_type::sampler, 4, 12},
+  };
+  for (size_t i = 0; i < 7; ++i) {
+    const Param& param = it->second[i];
+    if ((param.type != pipeline_layout_param_type::descriptor_table &&
+         param.type != pipeline_layout_param_type::descriptor_table_with_flags) ||
+        param.ranges.size() != 1)
+      return false;
+    const descriptor_range& r = param.ranges[0];
+    const bool view = kExpected[i].type == descriptor_type::shader_resource_view;
+    const bool type_ok = view ? Matches(RegisterKind::kShaderResource, r.type) : r.type == kExpected[i].type;
+    if (!type_ok || r.dx_register_index != kExpected[i].first || r.count != kExpected[i].count ||
+        r.dx_register_space != 0 || r.binding != 0 || (r.visibility & shader_stage::vertex) == 0)
+      return false;
+  }
+  return true;
+}
+
+std::string Descriptors::Describe(pipeline_layout layout) const {
+  const auto it = layouts_.find(layout.handle);
+  if (it == layouts_.end()) return "unknown layout\n";
+  static const char* kTypes[] = {"table", "root constants", "root descriptor", "push ranges", "table", "push ranges"};
+  static const char* kKinds[] = {"s", "s+view", "t", "u", "t(buf)", "u(buf)", "b", "st", "b(dyn)", "st(dyn)", "as"};
+  std::string out;
+  for (size_t i = 0; i < it->second.size(); ++i) {
+    const Param& param = it->second[i];
+    const auto type = static_cast<uint32_t>(param.type);
+    out += "  [" + std::to_string(i) + "] " + (type < 6 ? kTypes[type] : "?") + ":";
+    for (const descriptor_range& r : param.ranges) {
+      if (param.type == pipeline_layout_param_type::push_constants) {
+        out += " b" + std::to_string(r.dx_register_index) + " (" + std::to_string(r.count) + " dwords) vis" +
+               std::to_string(static_cast<uint32_t>(r.visibility)) + ";";
+        continue;
+      }
+      const auto kind = static_cast<uint32_t>(r.type);
+      const std::string last =
+          r.count == UINT32_MAX ? "+" : r.count > 1 ? "-" + std::to_string(r.dx_register_index + r.count - 1) : "";
+      out += " " + std::string(kind < 11 ? kKinds[kind] : "?") + std::to_string(r.dx_register_index) + last +
+             (r.dx_register_space != 0 ? " space" + std::to_string(r.dx_register_space) : "") + " @" +
+             std::to_string(r.binding) + " vis" + std::to_string(static_cast<uint32_t>(r.visibility)) + ";";
+    }
+    out += "\n";
+  }
+  return out;
+}
+
 void Descriptors::OnInitDevice(device* device) { device->create_private_data<Descriptors>(); }
 
 void Descriptors::OnDestroyDevice(device* device) { device->destroy_private_data<Descriptors>(); }
@@ -108,6 +165,12 @@ void Descriptors::OnInitPipelineLayout(device* device, uint32_t count, const pip
       case pipeline_layout_param_type::push_descriptors:
         copy[i].ranges.push_back(params[i].push_descriptors);
         break;
+      case pipeline_layout_param_type::push_constants: {
+        const constant_range& c = params[i].push_constants;
+        copy[i].ranges.push_back({c.binding, c.dx_register_index, c.dx_register_space, c.count, c.visibility, 1,
+                                  descriptor_type::constant_buffer});
+        break;
+      }
       default:
         break;
     }

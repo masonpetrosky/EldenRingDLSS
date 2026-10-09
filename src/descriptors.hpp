@@ -12,6 +12,7 @@
 #include <concurrent_vector.h>
 
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -33,6 +34,11 @@ class __declspec(uuid("7d3f0a52-8b1e-4d6a-9c3e-2f5b8e4a1c07")) Descriptors {
             uint32_t* offset) const;
 
   reshade::api::resource_view View(reshade::api::descriptor_heap heap, uint32_t offset) const;
+  // True when root parameters 0-6 are the vertex-stage tables of the game's material layout: b0-3, b4-13, t0-3,
+  // t4-19, t20-65, s0-3, s4-15 (what the wind stream-output root signature mirrors).
+  bool HasMaterialVertexTables(reshade::api::pipeline_layout layout) const;
+  // One line per root parameter: its type and register ranges (for development logs).
+  std::string Describe(reshade::api::pipeline_layout layout) const;
   reshade::api::buffer_range Buffer(reshade::api::descriptor_heap heap, uint32_t offset) const;
 
  private:

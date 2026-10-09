@@ -12,8 +12,14 @@
 # -Round vmaskpresets: the whole-screen mask off and on with presets F (CNN, documented to read the mask), L and M,
 # then back to the ini preset with the mask off.
 # -Round maskcheck: dumps the vegetation mask (whole screen, then vegetation only) next to the stencil.
+# -Round vegstats: material draw statistics over 120 frames (shots/vegstats.txt) and a 5 s frame-time log.
+# -Round wind: motion-vector dumps (4 frames) and 5 s frame-time logs with wind motion vectors off, then on; then back
+# to the ini setting. Analyze with tools\wind_check.py.
+# -Round winddiag: wind on; a debug capture (shots/winddebug.txt) and motion dump with the game's time step, then with
+# a 0.5 s step; frame times with the resolve draw skipped, with everything on, and with wind off.
 param(
-  [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck')][string]$Round = 'sharpen',
+  [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
+               'winddiag')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -64,6 +70,24 @@ if ($Round -eq 'sharpen') {
     Send 'vmask 1' 1.5; Send "capture vmp_$($p[1])_all"
   }
   Send 'vmask 0'; Send 'vmaskall off'; Send "preset $preset" 1.0
+} elseif ($Round -eq 'wind') {
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
+  Send 'dlss on'; Send 'wind off' 1.0; Send 'mv 4 windoff'; LogFrames 'wind_off'
+  Send 'wind on' 3.0; Send 'windstats' 1.0; Send 'mv 4 windon'; LogFrames 'wind_on'; Send 'windstats'
+  Send "wind $restore"
+} elseif ($Round -eq 'winddiag') {
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
+  Remove-Item (Join-Path $Folder 'shots\winddebug.txt') -ErrorAction SilentlyContinue
+  Send 'dlss on'; Send 'wind on' 3.0; Send 'windstats' 1.0; Send 'winddebug'; Send 'mv 2 wind_dt'; Send 'windstats'
+  Send 'windtime 0.5' 1.0; Send 'winddebug'; Send 'mv 2 wind_half'; Send 'windtime 0'
+  Send 'windresolve off' 1.0; LogFrames 'wind_so_only'
+  Send 'windresolve on' 1.0; LogFrames 'wind_on2'
+  Send 'wind off' 1.0; LogFrames 'wind_off2'
+  Send "wind $restore"
+} elseif ($Round -eq 'vegstats') {
+  Send 'vegstats 120'; LogFrames 'veg_baseline'
 } elseif ($Round -eq 'maskcheck') {
   Send 'dlss on'; Send 'vmaskall on'; Send 'vmask 1' 0.5; Send 'mv 2 maskall'
   Send 'vmaskall off' 0.5; Send 'mv 2 maskveg'

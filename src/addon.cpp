@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <mutex>
 #include <shared_mutex>
@@ -32,6 +33,7 @@
 #include "dlss.hpp"
 #include "state_tracking.hpp"
 #include "vegetation_mask_cs.h"
+#include "wind.hpp"
 
 extern "C" __declspec(dllexport) const char* NAME = "Elden Ring DLSS";
 extern "C" __declspec(dllexport) const char* DESCRIPTION =
@@ -55,12 +57,14 @@ constexpr size_t kMatrixProj = 256 / 4;          // float4x4 FC_MatrixProj, colu
 constexpr size_t kSceneExposure = 1152 / 4;      // float SC_SceneExposure
 constexpr size_t kPreExposure = 1160 / 4;        // float SC_PreExposure
 constexpr size_t kScreenPercentage = 1376 / 4;   // float4 SC_DynamicResolution_ScreenPercentage
+constexpr size_t kVelocityEncode = 1120 / 4;     // float4 FC_VelocityEncodeParam (scale, bias)
 
 struct SceneParams {
   float width = 0, height = 0;
   float jitter_ndc_x = 0, jitter_ndc_y = 0;
   float exposure = 1, pre_exposure = 1;
   float screen_percentage = 1;
+  float velocity_scale = 1, velocity_bias = 0;
 };
 
 struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
@@ -72,6 +76,9 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   resource depth = {0};       // main depth, bound to the motion-vector prep pass as its stencil source
   resource depth_copy = {0};  // the depth copy the same pass samples
   bool dlss_applied = false;  // DLSS replaced the TAA in this command list
+  // Wind: the game's cbSceneParam/cbPerFrame addresses last patched in this command list and the patched slot.
+  uint64_t wind_scene = 0, wind_frame = 0, wind_prev = 0;
+  bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
 };
 
 struct Config {
@@ -92,6 +99,10 @@ struct Config {
   // for testing newer DLSS versions.
   float vegetation_mask = 0.0f;
   bool mask_everything = false;  // development test: mask the whole screen (not saved)
+  // Motion vectors for wind-animated vegetation (wind.hpp). Experimental; costs GPU time and about 16 * 2 * capacity
+  // bytes of video memory.
+  bool wind_motion = false;
+  int wind_capacity = 8;  // millions of streamed vertices per frame
   bool flip_jitter_x = false;
   bool flip_jitter_y = false;
   bool flip_motion = false;
@@ -104,6 +115,24 @@ fs::path g_ini_path;
 
 device* g_device = nullptr;
 erdlss::Dlss g_dlss;
+
+// Wind motion vectors. The vertex shaders and input layouts of animated materials' G-buffer pipelines are kept from
+// pipeline creation, so the stream-output copies can be built whenever the feature is switched on.
+struct WindSource {
+  std::string name;
+  std::vector<uint8_t> vs;
+  std::vector<std::string> semantics;  // one per input element
+  std::vector<input_element> elements;  // semantic pointers are refreshed from `semantics` before use
+  D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+};
+std::mutex g_wind_mutex;
+std::unordered_map<uint64_t, WindSource> g_wind_sources;
+erdlss::WindMotion g_wind;
+std::atomic<bool> g_wind_ready{false};
+std::atomic<bool> g_wind_failed{false};
+std::atomic<uint64_t> g_wind_errors{0};
+std::atomic<uint64_t> g_wind_resolves{0};
+std::string g_wind_error;  // first error, under g_wind_mutex
 std::mutex g_dlss_mutex;
 
 std::shared_mutex g_pipeline_mutex;
@@ -167,6 +196,31 @@ std::string g_dump_name;
 uint64_t g_dump_start = 0, g_dump_last = 0;
 std::vector<Readback> g_dumps;
 
+// Development statistics of the game's material draws (remote command "vegstats <frames>"). Material vertex shaders
+// keep their debug names (...\rasterize\M[...]\Shader\<name>@[cl].vpo.pdb); wind-animated ones read
+// cbPerFrame.FC_GlobalTime.
+struct MaterialVs {
+  std::string name;
+  pipeline_layout layout = {0};
+  bool reads_time = false;
+  bool reads_forces = false;
+};
+std::shared_mutex g_material_mutex;
+std::unordered_map<uint64_t, MaterialVs> g_material_vs;  // pipeline -> its material vertex shader
+struct MaterialStat {
+  uint64_t draws = 0, vertices = 0;
+  bool reads_time = false, reads_forces = false;
+  pipeline_layout layout = {0};
+};
+struct TimeSample {
+  uint64_t frame;
+  float time, dt;
+};
+std::mutex g_stats_mutex;
+std::atomic<int> g_stats_remaining{0};          // frames left to count
+std::map<std::string, MaterialStat> g_stats;  // "<pass> <shader>"
+std::vector<TimeSample> g_time_samples;
+
 std::atomic<uint64_t> g_taa_draws{0};
 std::atomic<uint64_t> g_dlss_frames{0};
 std::atomic<uint64_t> g_failures{0};
@@ -212,6 +266,8 @@ void LoadConfig() {
   g_config.mip_bias = ReadFloat(L"MipBias", -1.0f);
   g_config.chromatic_aberration = ReadInt(L"ChromaticAberration", 1) != 0;
   g_config.vegetation_mask = ReadFloat(L"VegetationMask", 0.0f);
+  g_config.wind_motion = ReadInt(L"WindMotion", 0) != 0;
+  g_config.wind_capacity = std::max(1, std::min(ReadInt(L"WindCapacity", 8), 24));
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
   g_config.flip_motion = ReadInt(L"FlipMotion", 0) != 0;
@@ -228,6 +284,8 @@ void SaveConfig() {
   WriteFloat(L"MipBias", g_config.mip_bias);
   WriteInt(L"ChromaticAberration", g_config.chromatic_aberration);
   WriteFloat(L"VegetationMask", g_config.vegetation_mask);
+  WriteInt(L"WindMotion", g_config.wind_motion);
+  WriteInt(L"WindCapacity", g_config.wind_capacity);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
   WriteInt(L"FlipJitterY", g_config.flip_jitter_y);
   WriteInt(L"FlipMotion", g_config.flip_motion);
@@ -313,6 +371,8 @@ bool ReadSceneParams(command_list* cmd_list, SceneParams* out) {
   out->exposure = f[kSceneExposure];
   out->pre_exposure = f[kPreExposure];
   out->screen_percentage = f[kScreenPercentage];
+  out->velocity_scale = f[kVelocityEncode];
+  out->velocity_bias = f[kVelocityEncode + 1];
   return true;
 }
 
@@ -600,7 +660,8 @@ bool BuildMask(command_list* cmd_list, resource stencil, uint32_t width, uint32_
   cmd_list->bind_pipeline(pipeline_stage::all_compute, g_mask_pipeline);
   cmd_list->push_constants(shader_stage::compute, g_mask_layout, 0, 0, 4, &constants);
   cmd_list->push_descriptors(shader_stage::compute, g_mask_layout, 1,
-                             descriptor_table_update{{}, 0, 0, 1, descriptor_type::texture_shader_resource_view, &view});
+                             descriptor_table_update{{}, 0, 0, 1, descriptor_type::texture_shader_resource_view,
+                                                     &view});
   cmd_list->push_descriptors(shader_stage::compute, g_mask_layout, 2,
                              descriptor_table_update{{}, 0, 0, 1, descriptor_type::texture_unordered_access_view,
                                                      &g_mask_uav});
@@ -691,7 +752,8 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   }
   if (game_exposure) UploadExposure(cmd_list, scene.exposure);
   const bool masked = g_config.vegetation_mask > 0.0f &&
-                      BuildMask(cmd_list, BoundResource(cmd_list, shader_stage::pixel, 5), width, height);  // g_StencilTex
+                      BuildMask(cmd_list, BoundResource(cmd_list, shader_stage::pixel, 5) /* g_StencilTex */, width,
+                                height);
 
   erdlss::DlssInputs in;
   in.color = reinterpret_cast<ID3D12Resource*>(color.handle);
@@ -866,6 +928,11 @@ void OnDestroyDevice(device* dev) {
   if (g_mask_layout != 0) dev->destroy_pipeline_layout(g_mask_layout);
   g_mask_pipeline = {0};
   g_mask_layout = {0};
+  {
+    std::lock_guard wind_lock(g_wind_mutex);
+    g_wind_ready = false;
+    g_wind.Shutdown();
+  }
   g_dlss.Shutdown();
   g_device = nullptr;
 }
@@ -893,7 +960,91 @@ void OnResetCommandList(command_list* cmd_list) {
   if (auto* data = cmd_list->get_private_data<CmdData>()) *data = CmdData();
 }
 
-void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_subobject* subobjects, pipeline p) {
+// The material name from a vertex shader's debug path, or empty for shaders outside the material library.
+std::string MaterialName(const shader_desc* vs) {
+  if (vs == nullptr || vs->code == nullptr) return {};
+  const std::string_view code(static_cast<const char*>(vs->code), vs->code_size);
+  const size_t end = code.find(".vpo.pdb");
+  if (end == std::string_view::npos || code.rfind("\\rasterize\\", end) == std::string_view::npos) return {};
+  const size_t start = code.rfind('\\', end);
+  return std::string(code.substr(start + 1, end - start - 1));
+}
+
+// G-buffer shaders of the materials the game sways in the wind (grass, bushes, SpeedTree trees, Erdtree leaves).
+bool IsWindMaterial(const std::string& name) {
+  if (name.find("_Gbuf@") == std::string::npos) return false;
+  for (const char* key : {"Grass", "Vesitation", "SpeedTree", "WorldTree_Leaves", "[Sway]"})
+    if (name.find(key) != std::string::npos) return true;
+  return false;
+}
+
+void SetWindError(const std::string& error) {
+  ++g_wind_errors;
+  if (g_wind_error.empty()) {
+    g_wind_error = error;
+    Log(reshade::log::level::warning, "Wind motion: " + error);
+  }
+}
+
+// Builds the stream-output copy of a remembered pipeline. Called with g_wind_mutex held.
+void AddWindPipeline(uint64_t pipeline, WindSource& source) {
+  std::vector<D3D12_INPUT_ELEMENT_DESC> layout(source.elements.size());
+  for (size_t i = 0; i < layout.size(); ++i) {
+    const input_element& e = source.elements[i];
+    layout[i] = {source.semantics[i].c_str(), e.semantic_index, static_cast<DXGI_FORMAT>(e.format), e.buffer_binding,
+                 e.offset,
+                 e.instance_step_rate != 0 ? D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+                                           : D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                 e.instance_step_rate};
+  }
+  if (!g_wind.AddPipeline(pipeline, source.name, source.vs.data(), source.vs.size(), layout, source.topology))
+    SetWindError(g_wind.status());
+}
+
+void RememberWindPipeline(device* dev, pipeline_layout layout, uint32_t count, const pipeline_subobject* subobjects,
+                          pipeline p, const shader_desc* vs, const std::string& name) {
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (descriptors == nullptr || !descriptors->HasMaterialVertexTables(layout)) {
+    std::lock_guard lock(g_wind_mutex);
+    SetWindError("unexpected root layout for " + name);
+    return;
+  }
+  WindSource source;
+  source.name = name;
+  source.vs.assign(static_cast<const uint8_t*>(vs->code), static_cast<const uint8_t*>(vs->code) + vs->code_size);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (subobjects[i].type == pipeline_subobject_type::input_layout) {
+      const auto* elements = static_cast<const input_element*>(subobjects[i].data);
+      for (uint32_t k = 0; k < subobjects[i].count; ++k) {
+        source.semantics.emplace_back(elements[k].semantic != nullptr ? elements[k].semantic : "");
+        source.elements.push_back(elements[k]);
+      }
+    } else if (subobjects[i].type == pipeline_subobject_type::primitive_topology && subobjects[i].count != 0) {
+      const auto topology = *static_cast<const primitive_topology*>(subobjects[i].data);
+      source.topology = topology == primitive_topology::point_list ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
+                        : topology == primitive_topology::line_list || topology == primitive_topology::line_strip
+                            ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
+                            : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    }
+  }
+  std::lock_guard lock(g_wind_mutex);
+  WindSource& stored = g_wind_sources[p.handle];
+  stored = std::move(source);
+  if (g_wind_ready.load()) AddWindPipeline(p.handle, stored);
+}
+
+void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const pipeline_subobject* subobjects,
+                    pipeline p) {
+  for (uint32_t i = 0; i < count; ++i) {
+    if (subobjects[i].type != pipeline_subobject_type::vertex_shader) continue;
+    const auto* vs = static_cast<const shader_desc*>(subobjects[i].data);
+    std::string name = MaterialName(vs);
+    if (name.empty()) break;
+    if (IsWindMaterial(name)) RememberWindPipeline(dev, layout, count, subobjects, p, vs, name);
+    std::unique_lock lock(g_material_mutex);
+    g_material_vs[p.handle] = {std::move(name), layout, Contains(vs, "FC_GlobalTime"), Contains(vs, "g_forceParam")};
+    break;
+  }
   const Pass pass = Classify(count, subobjects);
   if (pass == Pass::kOther) return;
   std::unique_lock lock(g_pipeline_mutex);
@@ -901,6 +1052,14 @@ void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_sub
 }
 
 void OnDestroyPipeline(device*, pipeline p) {
+  {
+    std::unique_lock lock(g_material_mutex);
+    g_material_vs.erase(p.handle);
+  }
+  {
+    std::lock_guard lock(g_wind_mutex);
+    if (g_wind_sources.erase(p.handle) != 0) g_wind.RemovePipeline(p.handle);
+  }
   std::unique_lock lock(g_pipeline_mutex);
   g_pipelines.erase(p.handle);
 }
@@ -931,9 +1090,253 @@ void LogSceneResolution(command_list* cmd_list, const SceneParams& scene) {
   Log(reshade::log::level::info, text);
 }
 
-bool OnDrawIndexed(command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
+// cbPerFrame (vertex shader b9): FC_GlobalTime at byte 432, FC_GlobalDt at byte 440.
+bool ReadFrameTime(command_list* cmd_list, float* time, float* dt) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr) return false;
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it == state->descriptor_tables.end()) return false;
+  descriptor_heap heap = {0};
+  uint32_t offset = 0;
+  if (!descriptors->Find(dev, it->second.first, it->second.second, shader_stage::vertex, RegisterKind::kConstantBuffer,
+                         9, 0, &heap, &offset))
+    return false;
+  const buffer_range range = descriptors->Buffer(heap, offset);
+  if (range.buffer == 0 || range.size < 448) return false;
+  void* mapped = nullptr;
+  if (!dev->map_buffer_region(range.buffer, range.offset + 432, 12, map_access::read_only, &mapped)) return false;
+  const float* const f = static_cast<const float*>(mapped);
+  *time = f[0];
+  *dt = f[2];
+  dev->unmap_buffer_region(range.buffer);
+  return true;
+}
+
+void CountMaterialDraw(command_list* cmd_list, const CmdData& data, uint32_t index_count, uint32_t instance_count) {
+  MaterialVs vs;
+  {
+    std::shared_lock lock(g_material_mutex);
+    const auto it = g_material_vs.find(data.current.handle);
+    if (it == g_material_vs.end()) return;
+    vs = it->second;
+  }
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  const size_t targets = state != nullptr ? state->render_targets.size() : 0;
+  const bool gbuffer = targets == 5;
+  const char* const pass = gbuffer ? "gbuf " : targets == 0 ? "depth" : "other";
+  const uint64_t frame = g_frame.load();
+  bool want_time;
+  {
+    std::lock_guard lock(g_stats_mutex);
+    if (g_stats_remaining.load() <= 0) return;
+    MaterialStat& stat = g_stats[std::string(pass) + " " + vs.name];
+    ++stat.draws;
+    stat.vertices += static_cast<uint64_t>(index_count) * instance_count;
+    stat.reads_time = vs.reads_time;
+    stat.reads_forces = vs.reads_forces;
+    stat.layout = vs.layout;
+    want_time = gbuffer && vs.reads_time && (g_time_samples.empty() || g_time_samples.back().frame != frame);
+  }
+  float time = 0, dt = 0;
+  if (!want_time || !ReadFrameTime(cmd_list, &time, &dt)) return;
+  std::lock_guard lock(g_stats_mutex);
+  if (g_time_samples.empty() || g_time_samples.back().frame != frame) g_time_samples.push_back({frame, time, dt});
+}
+
+// Writes shots/vegstats.txt: per pass and material shader the draws and vertices per frame, the root parameters of
+// the wind-animated G-buffer shaders, and FC_GlobalTime/FC_GlobalDt per frame.
+std::string WriteMaterialStats(int frames) {
+  std::lock_guard lock(g_stats_mutex);
+  const fs::path dir = g_addon_dir / L"shots";
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  std::ofstream out(dir / L"vegstats.txt");
+  out << "frames " << frames << "\n\npass  draws/frame  vertices/frame  time forces  shader\n";
+  std::vector<std::pair<uint64_t, std::string>> order;
+  for (const auto& [key, stat] : g_stats) order.push_back({stat.vertices, key});
+  std::sort(order.rbegin(), order.rend());
+  char line[256];
+  for (const auto& [vertices, key] : order) {
+    const MaterialStat& stat = g_stats[key];
+    std::snprintf(line, sizeof(line), "%s %9.1f %14.0f  %-4s %-6s %s\n", key.substr(0, 5).c_str(),
+                  static_cast<double>(stat.draws) / frames, static_cast<double>(stat.vertices) / frames,
+                  stat.reads_time ? "yes" : "-", stat.reads_forces ? "yes" : "-", key.substr(6).c_str());
+    out << line;
+  }
+  auto* const descriptors = g_device != nullptr ? g_device->get_private_data<erdlss::Descriptors>() : nullptr;
+  std::vector<uint64_t> described;
+  for (const auto& [key, stat] : g_stats) {
+    if (key.rfind("gbuf", 0) != 0 || !stat.reads_time || descriptors == nullptr) continue;
+    if (std::find(described.begin(), described.end(), stat.layout.handle) != described.end()) continue;
+    described.push_back(stat.layout.handle);
+    out << "\nroot parameters of " << key.substr(6) << ":\n" << descriptors->Describe(stat.layout);
+  }
+  out << "\nframe  FC_GlobalTime  FC_GlobalDt  time step\n";
+  for (size_t i = 0; i < g_time_samples.size(); ++i) {
+    const TimeSample& t = g_time_samples[i];
+    std::snprintf(line, sizeof(line), "%llu %12.5f %10.6f %10.6f\n", static_cast<unsigned long long>(t.frame), t.time,
+                  t.dt, i == 0 ? 0.0 : static_cast<double>(t.time - g_time_samples[i - 1].time));
+    out << line;
+  }
+  g_stats.clear();
+  g_time_samples.clear();
+  return "wrote shots/vegstats.txt (" + std::to_string(order.size()) + " shader/pass entries)";
+}
+
+// Streams the previous and current positions of an animated vegetation draw in the main camera's G-buffer pass.
+void StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count, uint32_t instance_count,
+                    uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr || state->render_targets.size() != 5) return;
+  const resource rt0 = dev->get_resource_from_view(state->render_targets[0]);
+  const uint32_t width = g_render_width.load();
+  if (rt0 == 0 || (width != 0 && dev->get_resource_desc(rt0).texture.width != width)) return;
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it == state->descriptor_tables.end() || it->second.second.size() < 7) return;
+  const pipeline_layout layout = it->second.first;
+  const std::vector<descriptor_table> tables = it->second.second;
+
+  // cbSceneParam (b8) and cbPerFrame (b9) of this draw.
+  D3D12_GPU_VIRTUAL_ADDRESS va[2];
+  for (uint32_t i = 0; i < 2; ++i) {
+    descriptor_heap heap = {0};
+    uint32_t offset = 0;
+    buffer_range range = {};
+    if (!descriptors->Find(dev, layout, tables, shader_stage::vertex, RegisterKind::kConstantBuffer, 8 + i, 0, &heap,
+                           &offset) ||
+        (range = descriptors->Buffer(heap, offset)).buffer == 0 || range.size < (i == 0 ? 2016u : 448u)) {
+      std::lock_guard lock(g_wind_mutex);
+      SetWindError(std::string("no usable ") + (i == 0 ? "cbSceneParam" : "cbPerFrame") + " at a vegetation draw");
+      return;
+    }
+    va[i] = reinterpret_cast<ID3D12Resource*>(range.buffer.handle)->GetGPUVirtualAddress() + range.offset;
+  }
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  if (data.wind_scene != va[0] || data.wind_frame != va[1] || data.wind_prev == 0) {
+    data.wind_prev = g_wind.RecordPrevious(native, va[0], va[1]);
+    data.wind_scene = va[0];
+    data.wind_frame = va[1];
+    // The patch replaced the compute root signature and its arguments; put back any the game had set.
+    for (const auto& [stages, entry] : state->descriptor_tables) {
+      if ((stages & shader_stage::all_compute) == 0 || entry.first == 0) continue;
+      native->SetComputeRootSignature(reinterpret_cast<ID3D12RootSignature*>(entry.first.handle));
+      for (uint32_t i = 0; i < entry.second.size(); ++i)
+        if (entry.second[i] != 0) cmd_list->bind_descriptor_tables(stages, entry.first, i, 1, &entry.second[i]);
+    }
+  }
+  const D3D12_GPU_VIRTUAL_ADDRESS prev[2] = {data.wind_prev, data.wind_prev + erdlss::WindMotion::kPrevFrameOffset};
+
+  const pipeline_layout stream_layout = {reinterpret_cast<uint64_t>(g_wind.stream_root_signature())};
+  cmd_list->bind_descriptor_tables(shader_stage::all_graphics, stream_layout, 0, 7, tables.data());
+  if (!data.wind_streams_bound) {
+    g_wind.BindStreams(native);
+    data.wind_streams_bound = true;
+  }
+  g_wind.RecordStreams(native, data.current.handle, va[0], va[1], prev[0], prev[1], index_count, instance_count,
+                       first_index, vertex_offset, first_instance);
+  // Changing the root signature dropped every root argument; put the game's back, then its pipeline.
+  for (uint32_t i = 0; i < tables.size(); ++i)
+    if (tables[i] != 0) cmd_list->bind_descriptor_tables(shader_stage::all_graphics, layout, i, 1, &tables[i]);
+  cmd_list->bind_pipeline(pipeline_stage::all, data.current);
+}
+
+// Writes the streamed vegetation's motion into the TAA's motion texture, then puts the TAA draw's state back.
+void ResolveWind(command_list* cmd_list, const CmdData& data) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  if (state == nullptr) return;
+  const resource motion = BoundResource(cmd_list, shader_stage::pixel, 3);  // g_MoveTex
+  const resource depth = data.depth != 0 ? data.depth : resource{g_depth.load()};
+  if (motion == 0 || depth == 0) return;
+  const resource_desc md = dev->get_resource_desc(motion);
+  if (md.texture.format != format::r16g16_float) return;
+  SceneParams scene;
+  if (data.scene_valid) {
+    scene = data.scene;
+  } else {
+    std::lock_guard lock(g_scene_mutex);
+    scene = g_scene;
+  }
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  if (!g_wind.Resolve(native, reinterpret_cast<ID3D12Resource*>(motion.handle),
+                      reinterpret_cast<ID3D12Resource*>(depth.handle), md.texture.width, md.texture.height,
+                      scene.velocity_scale, scene.velocity_bias)) {
+    std::lock_guard lock(g_wind_mutex);
+    SetWindError("unexpected depth format at the TAA");
+    return;
+  }
+  ++g_wind_resolves;
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it != state->descriptor_tables.end() && it->second.first != 0)
+    native->SetGraphicsRootSignature(reinterpret_cast<ID3D12RootSignature*>(it->second.first.handle));
+  RestoreState(cmd_list, data);
+  cmd_list->bind_render_targets_and_depth_stencil(static_cast<uint32_t>(state->render_targets.size()),
+                                                  state->render_targets.data(), state->depth_stencil);
+  if (!state->viewports.empty())
+    cmd_list->bind_viewports(0, static_cast<uint32_t>(state->viewports.size()), state->viewports.data());
+  if (!state->scissor_rects.empty())
+    cmd_list->bind_scissor_rects(0, static_cast<uint32_t>(state->scissor_rects.size()), state->scissor_rects.data());
+  if (state->primitive_topology != primitive_topology::undefined) {
+    const dynamic_state topology_state = dynamic_state::primitive_topology;
+    const auto topology = static_cast<uint32_t>(state->primitive_topology);
+    cmd_list->bind_pipeline_states(1, &topology_state, &topology);
+  }
+}
+
+// Creates the wind resources on first use (they take video memory) and builds the stream-output pipelines.
+void StartWind(effect_runtime* runtime) {
+  std::lock_guard lock(g_wind_mutex);
+  if (g_device == nullptr) return;
+  const uint32_t capacity = static_cast<uint32_t>(g_config.wind_capacity) * 1000000u;
+  if (!g_wind.Init(reinterpret_cast<ID3D12Device*>(g_device->get_native()), capacity)) {
+    Log(reshade::log::level::error, "Wind motion vectors unavailable: " + g_wind.status());
+    g_wind.Shutdown();
+    g_wind_failed = true;
+    return;
+  }
+  command_queue* const queue = runtime->get_command_queue();
+  g_wind.RecordSetup(reinterpret_cast<ID3D12GraphicsCommandList*>(queue->get_immediate_command_list()->get_native()));
+  queue->flush_immediate_command_list();
+  queue->wait_idle();
+  for (auto& [pipeline, source] : g_wind_sources) AddWindPipeline(pipeline, source);
+  g_wind.MarkReady();
+  g_wind_ready = true;
+  Log(reshade::log::level::info, "Wind motion vectors on: " + std::to_string(g_wind.pipeline_count()) + " of " +
+                                     std::to_string(g_wind_sources.size()) + " vegetation pipelines, room for " +
+                                     std::to_string(capacity) + " vertices per frame.");
+}
+
+std::string WindStats() {
+  static uint64_t last_frame = 0, last_draws = 0, last_vertices = 0, last_resolves = 0, last_patches = 0;
+  const uint64_t frame = g_frame.load(), draws = g_wind.streamed_draws(), vertices = g_wind.streamed_vertices();
+  const uint64_t resolves = g_wind_resolves.load();
+  const double frames = static_cast<double>(std::max<uint64_t>(1, frame - last_frame));
+  char text[256];
+  std::snprintf(text, sizeof(text),
+                "wind: %zu pipelines, %.0f draws and %.2f M vertices streamed per frame, %.1f constant patches and "
+                "%.2f resolves per frame, %llu errors",
+                g_wind.pipeline_count(), (draws - last_draws) / frames, (vertices - last_vertices) / frames / 1e6,
+                (g_wind.patches() - last_patches) / frames, (resolves - last_resolves) / frames,
+                static_cast<unsigned long long>(g_wind_errors.load()));
+  last_patches = g_wind.patches();
+  last_frame = frame;
+  last_draws = draws;
+  last_vertices = vertices;
+  last_resolves = resolves;
+  return text;
+}
+
+bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index,
+                   int32_t vertex_offset, uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
+  if (g_config.wind_motion && g_wind_ready.load() && g_wind.IsWindPipeline(data->current.handle))
+    StreamWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance);
+  if (g_stats_remaining.load() > 0) CountMaterialDraw(cmd_list, *data, index_count, instance_count);
   if (data->pass == Pass::kToneMap) {
     if (!g_config.chromatic_aberration) RemoveChromaticAberration(cmd_list);
     return false;
@@ -964,6 +1367,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     return false;
   }
   if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) {
+    if (g_config.wind_motion && g_wind_ready.load()) ResolveWind(cmd_list, *data);
     if (g_dump_remaining.load() > 0) DumpTaaInputs(cmd_list);
     return ReplaceTaa(cmd_list, *data);
   }
@@ -1076,7 +1480,33 @@ void FinishRemote(const std::string& request, const std::string& result) {
 // "dlss off", "sharpen on", "strength 0.1", "preset 10", "ca off", "mv 8 grass", "vmask 1", "vmaskall on". The
 // result goes to remote.done.
 void OnReshadePresent(effect_runtime* runtime) {
+  if (g_config.wind_motion && !g_wind_ready.load() && !g_wind_failed.load()) StartWind(runtime);
   static std::string dump_request;  // the pending "mv" command, answered once its frames are saved
+  static std::string stats_request;  // the pending "vegstats" command
+  static int stats_frames = 0;
+  static std::string wind_debug_request;  // the pending "winddebug" command
+  static uint64_t wind_debug_frame = 0;
+  if (!wind_debug_request.empty()) {
+    if (g_wind.debug_captured() || g_frame.load() > wind_debug_frame + 300) {
+      runtime->get_command_queue()->wait_idle();
+      std::string text = g_wind.DebugText();
+      const fs::path dir = g_addon_dir / L"shots";
+      std::error_code dir_ec;
+      fs::create_directories(dir, dir_ec);
+      std::ofstream(dir / L"winddebug.txt", std::ios::app) << "== frame " << g_frame.load() << "\n" << text;
+      FinishRemote(wind_debug_request, "appended to shots/winddebug.txt");
+      wind_debug_request.clear();
+    }
+    return;
+  }
+  if (!stats_request.empty()) {
+    if (--g_stats_remaining <= 0) {
+      g_stats_remaining = 0;
+      FinishRemote(stats_request, WriteMaterialStats(stats_frames));
+      stats_request.clear();
+    }
+    return;
+  }
   if (!dump_request.empty()) {
     const uint64_t frame = g_frame.load();
     bool done;
@@ -1103,6 +1533,17 @@ void OnReshadePresent(effect_runtime* runtime) {
   }
   fs::remove(request, ec);
   std::string result = "ok";
+  if (command == "vegstats") {
+    stats_frames = std::max(1, std::min(std::atoi(arg.c_str()), 600));
+    {
+      std::lock_guard lock(g_stats_mutex);
+      g_stats.clear();
+      g_time_samples.clear();
+    }
+    g_stats_remaining = stats_frames;
+    stats_request = command + " " + arg;
+    return;
+  }
   if (command == "mv") {
     std::lock_guard lock(g_dump_mutex);
     g_dump_name = arg2.empty() ? "taa" : arg2;
@@ -1124,6 +1565,19 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "preset") {
     g_config.preset = std::atoi(arg.c_str());
     g_recreate = true;
+  } else if (command == "wind") {
+    g_config.wind_motion = arg == "on";
+  } else if (command == "windstats") {
+    result = WindStats();
+  } else if (command == "windtime") {
+    g_wind.set_time_step(std::strtof(arg.c_str(), nullptr));
+  } else if (command == "windresolve") {
+    g_wind.set_resolve_draw(arg != "off");
+  } else if (command == "winddebug") {
+    g_wind.RequestDebug();
+    wind_debug_request = command;
+    wind_debug_frame = g_frame.load();
+    return;
   } else if (command == "vmask") {
     g_config.vegetation_mask = std::strtof(arg.c_str(), nullptr);
   } else if (command == "vmaskall") {
@@ -1169,6 +1623,17 @@ void OnOverlay(effect_runtime*) {
   if (ImGui::Checkbox("Chromatic aberration (game default)", &g_config.chromatic_aberration)) SaveConfig();
   ImGui::SetItemTooltip("The game's lens effect: red and blue shift up to a pixel apart toward the left and right "
                         "edges, which softens the image there. Works with DLSS on or off.");
+  if (ImGui::Checkbox("Wind motion vectors (experimental)", &g_config.wind_motion)) SaveConfig();
+  ImGui::SetItemTooltip("Gives grass, bushes and trees swaying in the wind motion vectors, so DLSS (or the game's TAA) "
+                        "can follow them instead of smearing. Costs GPU time and about %d MB of video memory.",
+                        g_config.wind_capacity * 32);
+  if (g_config.wind_motion) {
+    std::unique_lock lock(g_wind_mutex, std::try_to_lock);
+    if (lock.owns_lock())
+      ImGui::Text("  %s, %zu pipelines, %llu errors%s%s", g_wind_ready.load() ? "running" : g_wind.status().c_str(),
+                  g_wind.pipeline_count(), static_cast<unsigned long long>(g_wind_errors.load()),
+                  g_wind_error.empty() ? "" : ": ", g_wind_error.c_str());
+  }
   ImGui::Text("Texture mip bias: %+.2f on %llu samplers (MipBias in EldenRingDLSS.ini, needs a restart)",
               g_applied_mip_bias, static_cast<unsigned long long>(g_biased_samplers.load()));
 

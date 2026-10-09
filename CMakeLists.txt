@@ -29,8 +29,26 @@ add_custom_command(
           ${CMAKE_SOURCE_DIR}/src/vegetation_mask.hlsl
   DEPENDS src/vegetation_mask.hlsl
   VERBATIM)
+add_custom_command(
+  OUTPUT ${SHADER_DIR}/wind_resolve_vs.h ${SHADER_DIR}/wind_resolve_ps.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
+  COMMAND ${FXC} /nologo /T vs_5_0 /E VSMain /O3 /Vn kWindResolveVs /Fh ${SHADER_DIR}/wind_resolve_vs.h
+          ${CMAKE_SOURCE_DIR}/src/wind_resolve.hlsl
+  COMMAND ${FXC} /nologo /T ps_5_0 /E PSMain /O3 /Vn kWindResolvePs /Fh ${SHADER_DIR}/wind_resolve_ps.h
+          ${CMAKE_SOURCE_DIR}/src/wind_resolve.hlsl
+  DEPENDS src/wind_resolve.hlsl
+  VERBATIM)
+add_custom_command(
+  OUTPUT ${SHADER_DIR}/wind_patch_cs.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
+  COMMAND ${FXC} /nologo /T cs_5_0 /E main /O3 /Vn kWindPatchCs /Fh ${SHADER_DIR}/wind_patch_cs.h
+          ${CMAKE_SOURCE_DIR}/src/wind_patch.hlsl
+  DEPENDS src/wind_patch.hlsl
+  VERBATIM)
 
-add_library(EldenRingDLSS SHARED src/addon.cpp src/descriptors.cpp src/dlss.cpp ${SHADER_DIR}/vegetation_mask_cs.h)
+add_library(EldenRingDLSS SHARED src/addon.cpp src/descriptors.cpp src/dlss.cpp src/wind.cpp
+            ${SHADER_DIR}/vegetation_mask_cs.h ${SHADER_DIR}/wind_resolve_vs.h ${SHADER_DIR}/wind_resolve_ps.h
+            ${SHADER_DIR}/wind_patch_cs.h)
 target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui ${SHADER_DIR})
 target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
 target_link_libraries(EldenRingDLSS PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib d3d12)
