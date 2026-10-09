@@ -60,3 +60,11 @@ percentage, so forcing a lower percentage and letting DLSS upscale looks feasibl
 - `cbSceneParam` (2048 bytes, register b8 in the object-velocity VS): `FC_ScreenSize` @16,
   `FC_MatrixProj` @256, `VC_MatrixViewProj` @384, `VC_PrevMatrixViewProj` @464, `FC_VelocityEncodeParam`
   @1120, `SC_SceneExposure` @1152, `SC_PreExposure` @1160, `SC_BackBufferSize` @1360.
+
+## Stage 2 result (2026-10-08)
+
+The prototype add-on (ReShade 6.8.0 loaded as `ReShade64.asi` through the `eldenring-dlss-dev` me3 profile, next
+to UnlockTheFps) detected the TAA inputs in game and ran DLSS 310.9.1 DLAA at 3840x2160 with no evaluation
+failures. Toggling with F9 showed less noise than the game's TAA. Jitter from `FC_MatrixProj` with the
+"projection offset in pixels, y down" convention and motion scale (-H, -H) gave a stable image (no smearing
+reported).
