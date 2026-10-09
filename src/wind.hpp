@@ -18,6 +18,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "d3d12_util.hpp"
+
 namespace erdlss {
 
 class WindMotion {
@@ -25,13 +27,7 @@ class WindMotion {
   // Offset of the previous cbPerFrame behind the previous cbSceneParam in a RecordPrevious slot.
   static constexpr uint32_t kPrevFrameOffset = 2048;
 
-  // A root parameter of the game's layout in D3D12 terms (tables, root constants or root descriptors).
-  struct RootParam {
-    D3D12_ROOT_PARAMETER_TYPE type = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    D3D12_SHADER_VISIBILITY visibility = D3D12_SHADER_VISIBILITY_ALL;
-    std::vector<D3D12_DESCRIPTOR_RANGE> ranges;  // tables
-    uint32_t reg = 0, space = 0, count = 0;      // root constants (count = 32-bit values) and root descriptors
-  };
+  using RootParam = erdlss::RootParam;
 
   // Creates the resolve and patch pipelines and the buffers. `capacity` is the number of streamed vertices per frame.
   bool Init(ID3D12Device* device, uint32_t capacity);

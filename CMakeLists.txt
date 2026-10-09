@@ -20,10 +20,15 @@ target_include_directories(reshade_utils PUBLIC third_party/reshade)
 target_compile_options(reshade_utils PRIVATE /W0)
 
 # Shaders are compiled to DXBC headers with the Windows SDK's fxc: shader(<symbol> <file> <profile> <entry> [defines])
-# writes ${SHADER_DIR}/<symbol>.h with the bytecode array <symbol>.
+# writes ${SHADER_DIR}/<symbol>.h with the bytecode array <symbol>. dxil_shader() does the same with the SDK's dxc
+# for shaders that join the game's own (DXIL) shaders in one pipeline; dxc signs them with the dxil.dll next to it.
 find_program(FXC fxc REQUIRED)
+get_filename_component(SDK_BIN_DIR ${FXC} DIRECTORY)
+find_program(DXC dxc HINTS ${SDK_BIN_DIR} NO_DEFAULT_PATH)
+find_program(DXC dxc REQUIRED)
 set(SHADER_DIR ${CMAKE_BINARY_DIR}/shaders)
 set(SHADER_HEADERS)
+set(SHADER_INCLUDES src/wind_common.hlsli)
 function(shader symbol file profile entry)
   set(defines)
   foreach(define ${ARGN})
@@ -35,7 +40,22 @@ function(shader symbol file profile entry)
     COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
     COMMAND ${FXC} /nologo /T ${profile} /E ${entry} /O3 ${defines} /Vn ${symbol} /Fh ${header}
             ${CMAKE_SOURCE_DIR}/src/${file}
-    DEPENDS src/${file}
+    DEPENDS src/${file} ${SHADER_INCLUDES}
+    VERBATIM)
+  set(SHADER_HEADERS ${SHADER_HEADERS} ${header} PARENT_SCOPE)
+endfunction()
+function(dxil_shader symbol file profile entry)
+  set(defines)
+  foreach(define ${ARGN})
+    list(APPEND defines -D ${define})
+  endforeach()
+  set(header ${SHADER_DIR}/${symbol}.h)
+  add_custom_command(
+    OUTPUT ${header}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
+    COMMAND ${DXC} -nologo -T ${profile} -E ${entry} -O3 -HV 2018 ${defines} -Vn ${symbol} -Fh ${header}
+            ${CMAKE_SOURCE_DIR}/src/${file}
+    DEPENDS src/${file} ${SHADER_INCLUDES}
     VERBATIM)
   set(SHADER_HEADERS ${SHADER_HEADERS} ${header} PARENT_SCOPE)
 endfunction()
@@ -68,6 +88,9 @@ shader(kWindPortPsDiscard wind_port.hlsl ps_5_0 PSDiscard)
 shader(kWindPortPsGrass2 wind_port.hlsl ps_5_0 PSMain ALPHA_TEST=1)
 shader(kWindPortPsVesitation wind_port.hlsl ps_5_0 PSMain ALPHA_TEST=2)
 shader(kWindPortPsLod1 wind_port.hlsl ps_5_0 PSMain ALPHA_TEST=3)
+# Replacement pixel shaders for the grass depth prepasses.
+dxil_shader(kWindPrepassPsGrass2 wind_prepass.hlsl ps_6_0 PSMain ALPHA_TEST=1 PHASE_COMP=y BEND_COMP=z)
+dxil_shader(kWindPrepassPsVesitation wind_prepass.hlsl ps_6_0 PSMain ALPHA_TEST=2 PHASE_COMP=x BEND_COMP=w)
 
 add_library(EldenRingDLSS SHARED src/addon.cpp src/descriptors.cpp src/dlss.cpp src/wind.cpp src/wind_port.cpp
             ${SHADER_HEADERS})

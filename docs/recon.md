@@ -330,3 +330,33 @@ Depth states (capture f12837): the Grass2 prepass `GBufDpt` writes with `Greater
 the same goes for Vesitation's few prepasses. Vesitation's usual draw (`_Gbuf_[A]`, 123 of 131 draws) and LOD1 are
 standalone and write depth with `GreaterEqual`. The port therefore follows every grass-family draw whose pipeline
 writes depth. Limgrave grass field: 408 draws per frame, +1.14 ms, near grass 95%, mid grass 71%.
+
+### Prepass replacement: correct, but slower (2026-10-09)
+
+To drop the second geometry pass for the prepass batches, `WindPrepass=1` (dev remote `windprepass on|off`) keeps the
+game's vertex shader in the Grass2/Vesitation `GBufDpt` prepass and swaps only its pixel shader for
+`wind_prepass.hlsl`, so depth and stencil stay the game's own. That shader repeats the game's alpha test (the
+prepass shader's only work; same inputs and the same order of operations as the decompiled `GBufDpt` shaders) and
+writes the motion into the side targets. It rebuilds the motion per pixel from the game vertex shader's outputs:
+world position from `POSITION1` through `FC_MatrixInvViewProj` (as the game's shader does for its fade), the instance
+from `NORMAL.w`, pivot `TEXCOORD5.xyz`, phase `TEXCOORD0.z` and stiffness `TEXCOORD0.w`. The current bend is inverted
+in closed form (in the plane across the bend axis, the blend of rest and rotated position is a scaled rotation) and
+the rest position is bent again with the previous wind. Prerequisites checked in capture f12837: all 435 grass-family
+draws have `VC_InstanceIdxOffset` 0 and an identity `g_InstanceIndexBuffer`, so `NORMAL.w` is the raw instance. The
+game's shaders are DXIL, so this one is built with dxc; the pixel stage lacks `cbPerFrame` and `g_forceParam`, so the
+replacement root signature is the game's layout plus a root CBV and a root SRV in space 1.
+
+Limgrave grass field (`ab_capture.ps1 -Round windprepass`, `tools/prepass_check.py`): 77 of 409 grass draws per frame
+are prepasses (the rest are standalone Vesitation and LOD1 draws, which keep the extra draw). Screenshots show no
+holes or specks, and coverage matches the extra-draw path (vegetation drawn 55.7% against 55.0%, merged 53.1% against
+52.5%).
+
+| | frame time |
+| --- | --- |
+| wind off | 9.63 ms |
+| extra velocity draws | 10.59 ms (+0.96) |
+| prepass replacement | 11.27 ms (+1.64) |
+
+The extra draw evaluates the wind once per vertex and, testing against the finished depth without writing it, shades
+roughly one fragment per pixel. The replacement evaluates it for every fragment the prepass rasterizes, overdraw
+included, and that costs more than the geometry pass it saves. Off by default.

@@ -24,7 +24,7 @@
 # step and with wind off, frame times with everything on, without the merge, and with wind off.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
-               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel')][string]$Round = 'sharpen',
+               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -91,6 +91,23 @@ if ($Round -eq 'sharpen') {
   foreach ($mode in 0, 5, 6, 7) { Send "windcost $mode" 1.0; LogFrames "pix_$mode" }
   Send 'windcost 0'; Send 'wind off' 1.0; LogFrames 'pix_off2'
   Send "wind $restore"
+} elseif ($Round -eq 'windprepass') {
+  # Prepass replacement against the velocity-draw path: coverage markers and motion for both, then frame times
+  # (wind off, velocity draws, replaced prepasses, wind off again).
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
+  $prepass = if ($ini -match '^WindPrepass=1') { 'on' } else { 'off' }
+  Send 'dlss on'; Send 'wind on' 3.0
+  foreach ($mode in 'off', 'on') {
+    Send "windprepass $mode" 1.0; Send 'windstats' 1.0; Send 'windstats'
+    Send 'windmerge drawn' 0.5; Send "mv 1 pre_${mode}_drawn"; Send 'windmerge merged' 0.5; Send "mv 1 pre_${mode}_merged"
+    Send 'windmerge on' 0.5; Send "mv 2 pre_${mode}"; Send "capture pre_shot_$mode"
+  }
+  Send 'wind off' 1.0; LogFrames 'pre_wind_off'
+  Send 'wind on'; Send 'windprepass off' 3.0; LogFrames 'pre_draws'
+  Send 'windprepass on' 1.0; LogFrames 'pre_replaced'
+  Send 'wind off' 1.0; LogFrames 'pre_wind_off2'
+  Send "windprepass $prepass"; Send "wind $restore"
 } elseif ($Round -eq 'windcost') {
   # Ported path cost breakdown: frame times per cost mode (0 fused, 1 unfused, 2 no wind math, 3 switches only,
   # 4 game draw only), between two wind-off baselines; motion dumps for the fused and unfused shaders.

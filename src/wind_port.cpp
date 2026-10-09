@@ -24,6 +24,8 @@
 #include "kWindPortVsVesitation.h"
 #include "kWindPortVsVesitationStatic.h"
 #include "kWindPortVsVesitationUnfused.h"
+#include "kWindPrepassPsGrass2.h"
+#include "kWindPrepassPsVesitation.h"
 
 namespace erdlss {
 namespace {
@@ -101,6 +103,10 @@ void WindPort::Shutdown() {
     for (auto& [game, psos] : pipelines_)
       for (ID3D12PipelineState*& pso : psos.pso) Release(pso);
     pipelines_.clear();
+    for (auto& [game, replacement] : replacements_) Release(replacement.pso);
+    replacements_.clear();
+    for (auto& [layout, root] : roots_) Release(root);
+    roots_.clear();
     for (ID3D12PipelineState*& pso : retired_) Release(pso);
     retired_.clear();
   }
@@ -191,13 +197,135 @@ bool WindPort::AddPipeline(uint64_t pipeline, const std::string& name, Variant v
   return true;
 }
 
+bool WindPort::AddReplacement(uint64_t pipeline, const std::string& name, Variant variant, uint64_t layout_key,
+                              const std::vector<RootParam>& layout, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+  if (device_ == nullptr || variant == Variant::kGrass2Lod1) return false;
+  ID3D12RootSignature* root = nullptr;
+  {
+    std::shared_lock lock(pipelines_mutex_);
+    const auto it = roots_.find(layout_key);
+    if (it != roots_.end()) root = it->second;
+  }
+  if (root == nullptr) {
+    // The game's parameters unchanged, then cbPerFrame and g_forceParam for the pixel stage.
+    std::vector<D3D12_ROOT_PARAMETER> params(layout.size());
+    for (size_t i = 0; i < layout.size(); ++i) {
+      const RootParam& p = layout[i];
+      D3D12_ROOT_PARAMETER& out = params[i];
+      out.ParameterType = p.type;
+      out.ShaderVisibility = p.visibility;
+      if (p.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+        out.Constants = {p.reg, p.space, p.count};
+      else if (p.type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+        out.Descriptor = {p.reg, p.space};
+      else
+        out.DescriptorTable = {static_cast<UINT>(p.ranges.size()), p.ranges.data()};
+    }
+    D3D12_ROOT_PARAMETER extra = {};
+    extra.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    extra.Descriptor = {0, 1};
+    extra.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params.push_back(extra);
+    extra.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params.push_back(extra);
+    const D3D12_ROOT_SIGNATURE_DESC rs = {static_cast<UINT>(params.size()), params.data(), 0, nullptr,
+                                          D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    ID3D12RootSignature* made = CreateRootSignature(device_, rs);
+    if (made == nullptr) {
+      status_ = "replacement root signature creation failed for " + name;
+      return false;
+    }
+    std::unique_lock lock(pipelines_mutex_);
+    ID3D12RootSignature*& stored = roots_[layout_key];
+    if (stored == nullptr) stored = made;
+    else Release(made);  // another thread was faster
+    root = stored;
+  }
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC d = desc;
+  d.pRootSignature = root;
+  d.PS = variant == Variant::kGrass2 ? D3D12_SHADER_BYTECODE{kWindPrepassPsGrass2, sizeof(kWindPrepassPsGrass2)}
+                                     : D3D12_SHADER_BYTECODE{kWindPrepassPsVesitation, sizeof(kWindPrepassPsVesitation)};
+  d.BlendState.AlphaToCoverageEnable = FALSE;
+  for (int i = 0; i < 8; ++i)
+    d.BlendState.RenderTarget[i] = {FALSE,
+                                    FALSE,
+                                    D3D12_BLEND_ONE,
+                                    D3D12_BLEND_ZERO,
+                                    D3D12_BLEND_OP_ADD,
+                                    D3D12_BLEND_ONE,
+                                    D3D12_BLEND_ZERO,
+                                    D3D12_BLEND_OP_ADD,
+                                    D3D12_LOGIC_OP_NOOP,
+                                    D3D12_COLOR_WRITE_ENABLE_ALL};
+  d.NumRenderTargets = 2;
+  d.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+  d.RTVFormats[1] = DXGI_FORMAT_R32_FLOAT;
+  for (int i = 2; i < 8; ++i) d.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
+  Replacement replacement;
+  replacement.root = root;
+  replacement.frame_param = static_cast<UINT>(layout.size());
+  if (FAILED(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&replacement.pso)))) {
+    status_ = "replacement pipeline creation failed for " + name;
+    return false;
+  }
+  std::unique_lock lock(pipelines_mutex_);
+  Replacement& stored = replacements_[pipeline];
+  if (stored.pso != nullptr) retired_.push_back(stored.pso);
+  stored = replacement;
+  return true;
+}
+
+bool WindPort::IsReplaceable(uint64_t pipeline) const {
+  std::shared_lock lock(pipelines_mutex_);
+  return replacements_.count(pipeline) != 0;
+}
+
+ID3D12RootSignature* WindPort::replacement_root(uint64_t pipeline) const {
+  std::shared_lock lock(pipelines_mutex_);
+  const auto it = replacements_.find(pipeline);
+  return it != replacements_.end() ? it->second.root : nullptr;
+}
+
+size_t WindPort::replacement_count() const {
+  std::shared_lock lock(pipelines_mutex_);
+  return replacements_.size();
+}
+
+bool WindPort::RecordReplacedDraw(ID3D12GraphicsCommandList* cmd, uint64_t pipeline, D3D12_GPU_VIRTUAL_ADDRESS frame,
+                                  D3D12_GPU_VIRTUAL_ADDRESS forces, D3D12_CPU_DESCRIPTOR_HANDLE dsv,
+                                  uint32_t index_count, uint32_t instance_count, uint32_t first_index,
+                                  int32_t vertex_offset, uint32_t first_instance) {
+  Replacement replacement;
+  {
+    std::shared_lock lock(pipelines_mutex_);
+    const auto it = replacements_.find(pipeline);
+    if (it == replacements_.end()) return false;
+    replacement = it->second;
+  }
+  cmd->SetGraphicsRootConstantBufferView(replacement.frame_param, frame);
+  cmd->SetGraphicsRootShaderResourceView(replacement.frame_param + 1, forces);
+  cmd->SetPipelineState(replacement.pso);
+  const D3D12_CPU_DESCRIPTOR_HANDLE targets = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+  cmd->OMSetRenderTargets(2, &targets, TRUE, &dsv);
+  cmd->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
+  ++replaced_;
+  return true;
+}
+
 void WindPort::RemovePipeline(uint64_t pipeline) {
   std::unique_lock lock(pipelines_mutex_);
   const auto it = pipelines_.find(pipeline);
-  if (it == pipelines_.end()) return;
-  for (ID3D12PipelineState* pso : it->second.pso)
-    retired_.push_back(pso);  // in-flight command lists may still use them; released at shutdown
-  pipelines_.erase(it);
+  if (it != pipelines_.end()) {
+    for (ID3D12PipelineState* pso : it->second.pso)
+      retired_.push_back(pso);  // in-flight command lists may still use them; released at shutdown
+    pipelines_.erase(it);
+  }
+  const auto replaced = replacements_.find(pipeline);
+  if (replaced != replacements_.end()) {
+    retired_.push_back(replaced->second.pso);
+    replacements_.erase(replaced);
+  }
 }
 
 bool WindPort::IsPortPipeline(uint64_t pipeline) const {

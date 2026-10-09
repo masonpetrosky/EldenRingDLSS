@@ -107,6 +107,10 @@ struct Config {
   // animated materials (wind.hpp). Read at startup.
   int wind_mode = 1;
   int wind_capacity = 8;  // stream output: millions of streamed vertices per frame
+  // Ported path, development option: replace the grass depth prepasses' pixel shader so they write the motion
+  // themselves instead of drawing the batch a second time (wind_prepass.hlsl). Works, but costs more than the second
+  // draw: the wind math runs for every prepass fragment, overdraw included (docs/recon.md).
+  bool wind_prepass = false;
   bool flip_jitter_x = false;
   bool flip_jitter_y = false;
   bool flip_motion = false;
@@ -283,6 +287,7 @@ void LoadConfig() {
   g_config.wind_motion = ReadInt(L"WindMotion", 0) != 0;
   g_config.wind_capacity = std::max(1, std::min(ReadInt(L"WindCapacity", 8), 24));
   g_config.wind_mode = ReadInt(L"WindMode", 1) == 0 ? 0 : 1;
+  g_config.wind_prepass = ReadInt(L"WindPrepass", 0) != 0;
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
   g_config.flip_motion = ReadInt(L"FlipMotion", 0) != 0;
@@ -302,6 +307,7 @@ void SaveConfig() {
   WriteInt(L"WindMotion", g_config.wind_motion);
   WriteInt(L"WindCapacity", g_config.wind_capacity);
   WriteInt(L"WindMode", g_config.wind_mode);
+  WriteInt(L"WindPrepass", g_config.wind_prepass);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
   WriteInt(L"FlipJitterY", g_config.flip_jitter_y);
   WriteInt(L"FlipMotion", g_config.flip_motion);
@@ -1159,7 +1165,16 @@ bool PortVariant(const WindSource& source, erdlss::WindPort::Variant* variant) {
   return false;
 }
 
-// Builds the ported velocity pipeline of a remembered pipeline. Called with g_wind_mutex held.
+// True for the depth prepass of a Grass2 or Vesitation batch (pixel shader M[AMSN_V]_*_GBufDpt): the pipelines whose
+// pixel shader the prepass replacement swaps.
+bool IsPrepass(const WindSource& source, erdlss::WindPort::Variant variant) {
+  if (variant == erdlss::WindPort::Variant::kGrass2Lod1 || source.ps.empty()) return false;
+  const std::string_view code(reinterpret_cast<const char*>(source.ps.data()), source.ps.size());
+  return code.find("_GBufDpt") != std::string_view::npos;
+}
+
+// Builds the ported velocity pipeline of a remembered pipeline, and for a depth prepass its replacement. Called with
+// g_wind_mutex held.
 void AddPortPipeline(uint64_t pipeline, WindSource& source) {
   erdlss::WindPort::Variant variant;
   if (!PortVariant(source, &variant)) return;
@@ -1167,6 +1182,15 @@ void AddPortPipeline(uint64_t pipeline, WindSource& source) {
   const D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = ToPipelineDesc(source, &input_layout);
   if (!g_wind_port.AddPipeline(pipeline, source.name, variant,
                                reinterpret_cast<ID3D12RootSignature*>(source.layout.handle), desc))
+    SetWindError(g_wind_port.status());
+  if (!IsPrepass(source, variant)) return;
+  auto* const descriptors = g_device != nullptr ? g_device->get_private_data<erdlss::Descriptors>() : nullptr;
+  std::vector<erdlss::RootParam> layout;
+  if (descriptors == nullptr || !ToRootParams(descriptors->Params(source.layout), &layout)) {
+    SetWindError("unsupported root layout for the prepass of " + source.name);
+    return;
+  }
+  if (!g_wind_port.AddReplacement(pipeline, source.name, variant, source.layout.handle, layout, desc))
     SetWindError(g_wind_port.status());
 }
 
@@ -1505,6 +1529,75 @@ bool PortWindDraw(command_list* cmd_list, const CmdData& data, uint32_t index_co
   return true;
 }
 
+// Draws a Grass2 or Vesitation depth prepass with its replacement pipeline, which also writes the batch's motion.
+// Returns true when it did (the caller skips the original draw).
+bool ReplaceWindDraw(command_list* cmd_list, const CmdData& data, uint32_t index_count, uint32_t instance_count,
+                     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr || state->render_targets.size() != 5 || state->depth_stencil == 0)
+    return false;
+  const resource rt0 = dev->get_resource_from_view(state->render_targets[0]);
+  if (rt0 == 0) return false;
+  const resource_desc rd = dev->get_resource_desc(rt0);
+  if (rd.texture.width != g_wind_port.width() || rd.texture.height != g_wind_port.height()) return false;
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it == state->descriptor_tables.end() || it->second.first == 0) return false;
+  ID3D12RootSignature* const root = g_wind_port.replacement_root(data.current.handle);
+  if (root == nullptr) return false;
+  const pipeline_layout layout = it->second.first;
+  const std::vector<descriptor_table> tables = it->second.second;
+
+  // The vertex stage's cbPerFrame (b9) and g_forceParam (t26), which the replacement gets as root descriptors.
+  descriptor_heap heap = {0};
+  uint32_t offset = 0;
+  buffer_range frame = {};
+  if (!descriptors->Find(dev, layout, tables, shader_stage::vertex, RegisterKind::kConstantBuffer, 9, 0, &heap,
+                         &offset) ||
+      (frame = descriptors->Buffer(heap, offset)).buffer == 0 || frame.size < 448) {
+    std::lock_guard lock(g_wind_mutex);
+    SetWindError("no usable cbPerFrame at a grass prepass");
+    return false;
+  }
+  resource_view forces = {0};
+  if (!descriptors->Find(dev, layout, tables, shader_stage::vertex, RegisterKind::kShaderResource, 26, 0, &heap,
+                         &offset) ||
+      (forces = descriptors->View(heap, offset)) == 0) {
+    std::lock_guard lock(g_wind_mutex);
+    SetWindError("no usable g_forceParam at a grass prepass");
+    return false;
+  }
+  const resource forces_buffer = dev->get_resource_from_view(forces);
+  const resource_view_desc forces_view = dev->get_resource_view_desc(forces);
+  if (forces_buffer == 0 || forces_view.type != resource_view_type::buffer) {
+    std::lock_guard lock(g_wind_mutex);
+    SetWindError("g_forceParam at a grass prepass is not a buffer view");
+    return false;
+  }
+  const D3D12_GPU_VIRTUAL_ADDRESS frame_va =
+      reinterpret_cast<ID3D12Resource*>(frame.buffer.handle)->GetGPUVirtualAddress() + frame.offset;
+  const D3D12_GPU_VIRTUAL_ADDRESS forces_va =
+      reinterpret_cast<ID3D12Resource*>(forces_buffer.handle)->GetGPUVirtualAddress() + forces_view.buffer.offset;
+
+  // The replacement's root signature has the game's parameters at the same indices.
+  const pipeline_layout replacement_layout = {reinterpret_cast<uint64_t>(root)};
+  for (uint32_t i = 0; i < tables.size(); ++i)
+    if (tables[i] != 0)
+      cmd_list->bind_descriptor_tables(shader_stage::all_graphics, replacement_layout, i, 1, &tables[i]);
+  const D3D12_CPU_DESCRIPTOR_HANDLE dsv = {static_cast<SIZE_T>(state->depth_stencil.handle)};
+  const bool drawn = g_wind_port.RecordReplacedDraw(
+      reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()), data.current.handle, frame_va, forces_va,
+      dsv, index_count, instance_count, first_index, vertex_offset, first_instance);
+  // Changing the root signature dropped every root argument; put the game's back, then its targets and pipeline.
+  for (uint32_t i = 0; i < tables.size(); ++i)
+    if (tables[i] != 0) cmd_list->bind_descriptor_tables(shader_stage::all_graphics, layout, i, 1, &tables[i]);
+  cmd_list->bind_render_targets_and_depth_stencil(static_cast<uint32_t>(state->render_targets.size()),
+                                                  state->render_targets.data(), state->depth_stencil);
+  cmd_list->bind_pipeline(pipeline_stage::all, data.current);
+  return drawn;
+}
+
 // Puts the TAA draw's state back after the wind resolve or merge bound their own.
 void RestoreTaaState(command_list* cmd_list, const CmdData& data) {
   auto* const state = cmd_list->get_private_data<state_tracking>();
@@ -1594,7 +1687,8 @@ void StartWind(effect_runtime* runtime) {
     g_wind_port.MarkReady();
     g_port_ready = true;
     Log(reshade::log::level::info, "Wind motion vectors on (ported shader): " +
-                                       std::to_string(g_wind_port.pipeline_count()) + " grass-family pipelines.");
+                                       std::to_string(g_wind_port.pipeline_count()) + " grass-family pipelines, " +
+                                       std::to_string(g_wind_port.replacement_count()) + " prepass replacements.");
     return;
   }
   const uint32_t capacity = static_cast<uint32_t>(g_config.wind_capacity) * 1000000u;
@@ -1617,17 +1711,21 @@ void StartWind(effect_runtime* runtime) {
 }
 
 std::string PortStats() {
-  static uint64_t last_frame = 0, last_draws = 0, last_merges = 0;
+  static uint64_t last_frame = 0, last_draws = 0, last_merges = 0, last_replaced = 0;
   const uint64_t frame = g_frame.load(), draws = g_wind_port.draws(), merges = g_wind_port.merges();
+  const uint64_t replaced = g_wind_port.replaced_draws();
   const double frames = static_cast<double>(std::max<uint64_t>(1, frame - last_frame));
-  char text[192];
+  char text[256];
   std::snprintf(text, sizeof(text),
-                "wind (ported): %zu pipelines, %.0f draws and %.2f merges per frame, %llu errors",
-                g_wind_port.pipeline_count(), (draws - last_draws) / frames, (merges - last_merges) / frames,
+                "wind (ported): %zu pipelines (%zu prepass replacements, %s), %.0f velocity draws, %.0f replaced "
+                "prepasses and %.2f merges per frame, %llu errors",
+                g_wind_port.pipeline_count(), g_wind_port.replacement_count(), g_config.wind_prepass ? "on" : "off",
+                (draws - last_draws) / frames, (replaced - last_replaced) / frames, (merges - last_merges) / frames,
                 static_cast<unsigned long long>(g_wind_errors.load()));
   last_frame = frame;
   last_draws = draws;
   last_merges = merges;
+  last_replaced = replaced;
   return text;
 }
 
@@ -1662,6 +1760,10 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   if (g_config.wind_motion && g_wind_ready.load() && g_wind.IsWindPipeline(data->current.handle) &&
       StreamWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance))
     return true;  // drawn by the stream-output copy of the game's pipeline
+  if (g_config.wind_motion && g_config.wind_prepass && g_port_ready.load() &&
+      g_wind_port.IsReplaceable(data->current.handle) &&
+      ReplaceWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance))
+    return true;  // the grass prepass, drawn here with a pixel shader that also writes its motion
   if (g_config.wind_motion && g_port_ready.load() && g_wind_port.IsPortPipeline(data->current.handle) &&
       PortWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance))
     return true;  // drawn here, followed by its motion
@@ -1907,6 +2009,8 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "winddepth") {
     g_wind.set_depth_tolerance(std::strtof(arg.c_str(), nullptr));
     g_wind_port.set_depth_tolerance(std::strtof(arg.c_str(), nullptr));
+  } else if (command == "windprepass") {
+    g_config.wind_prepass = arg != "off";
   } else if (command == "windcost") {
     g_wind_port.set_cost_mode(std::atoi(arg.c_str()));
   } else if (command == "windmerge") {

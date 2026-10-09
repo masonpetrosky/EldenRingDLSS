@@ -6,8 +6,17 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace erdlss {
+
+// A root parameter of the game's layout in D3D12 terms (tables, root constants or root descriptors).
+struct RootParam {
+  D3D12_ROOT_PARAMETER_TYPE type = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  D3D12_SHADER_VISIBILITY visibility = D3D12_SHADER_VISIBILITY_ALL;
+  std::vector<D3D12_DESCRIPTOR_RANGE> ranges;  // tables
+  uint32_t reg = 0, space = 0, count = 0;      // root constants (count = 32-bit values) and root descriptors
+};
 
 template <typename T>
 void Release(T*& p) {

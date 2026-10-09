@@ -3,6 +3,11 @@
 // wind for the current and the previous frame in one pass and writes the motion and its depth into two side targets.
 // At the TAA, the motion is merged into the game's motion texture where that depth is still the visible one.
 // Unlike the stream-output path (wind.hpp) this keeps the GPU's vertex reuse and needs no extra root signature.
+//
+// Development option (WindPrepass=1): the depth prepasses of Grass2 and Vesitation skip the extra draw. Their
+// pipeline is replaced by one with the game's vertex shader and a pixel shader (wind_prepass.hlsl) that runs the
+// game's alpha test and writes the motion, rebuilt per pixel from what the game's vertex shader passes on. It renders
+// identically but costs more than the extra draw, since the wind math then runs per fragment, overdraw included.
 // SPDX-License-Identifier: MIT
 
 #pragma once
@@ -16,6 +21,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "d3d12_util.hpp"
 
 namespace erdlss {
 
@@ -55,6 +62,24 @@ class WindPort {
   // pipeline, target, viewport and scissor; the caller restores the game's.
   bool Merge(ID3D12GraphicsCommandList* cmd, ID3D12Resource* motion, ID3D12Resource* depth);
 
+  // Builds the replacement of a Grass2 or Vesitation depth prepass pipeline: the game's pipeline `desc` with the
+  // replacement pixel shader and the two side targets, on the game's root layout `layout` (identified by `layout_key`)
+  // plus a root CBV (cbPerFrame) and a root SRV (g_forceParam) for the pixel stage in register space 1.
+  bool AddReplacement(uint64_t pipeline, const std::string& name, Variant variant, uint64_t layout_key,
+                      const std::vector<RootParam>& layout, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc);
+  bool IsReplaceable(uint64_t pipeline) const;
+  // The root signature of `pipeline`'s replacement: the game's parameters at their own indices, so the game's
+  // descriptor tables can be bound to it as they are.
+  ID3D12RootSignature* replacement_root(uint64_t pipeline) const;
+  size_t replacement_count() const;
+  // Records the game's prepass draw with its replacement into the side targets and the game's depth-stencil view
+  // `dsv`; `frame` and `forces` are the GPU addresses of the draw's cbPerFrame and g_forceParam. The game's
+  // descriptor tables must be bound to replacement_root(). Leaves the replacement pipeline and the side targets bound.
+  bool RecordReplacedDraw(ID3D12GraphicsCommandList* cmd, uint64_t pipeline, D3D12_GPU_VIRTUAL_ADDRESS frame,
+                          D3D12_GPU_VIRTUAL_ADDRESS forces, D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t index_count,
+                          uint32_t instance_count, uint32_t first_index, int32_t vertex_offset,
+                          uint32_t first_instance);
+
   void set_depth_tolerance(float tolerance) { depth_tolerance_ = tolerance; }
   void set_merge(bool merge) { merge_ = merge; }
   void set_merge_debug(uint32_t mode) { merge_debug_ = mode; }  // 1: mark merged pixels, 2: mark drawn pixels
@@ -64,6 +89,7 @@ class WindPort {
   void set_cost_mode(int mode) { cost_mode_ = mode; }
   uint64_t draws() const { return draws_.load(); }
   uint64_t merges() const { return merges_.load(); }
+  uint64_t replaced_draws() const { return replaced_.load(); }
 
  private:
   ID3D12Device* device_ = nullptr;
@@ -89,10 +115,18 @@ class WindPort {
     ID3D12PipelineState* pso[6] = {};  // see AddPipeline
   };
   std::unordered_map<uint64_t, Pipelines> pipelines_;
+  struct Replacement {
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12RootSignature* root = nullptr;  // owned by roots_
+    UINT frame_param = 0;                 // root CBV of cbPerFrame; g_forceParam's root SRV follows
+  };
+  std::unordered_map<uint64_t, Replacement> replacements_;
+  std::unordered_map<uint64_t, ID3D12RootSignature*> roots_;  // per game layout
   std::vector<ID3D12PipelineState*> retired_;
 
   std::atomic<uint64_t> draws_{0};
   std::atomic<uint64_t> merges_{0};
+  std::atomic<uint64_t> replaced_{0};
 };
 
 }  // namespace erdlss
