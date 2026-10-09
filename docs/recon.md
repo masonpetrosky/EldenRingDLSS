@@ -76,6 +76,39 @@ cleaner; the sharpening filter's artifacts stand out in HDR). In SDR the unsharp
 Feeding DLSS the tonemapper exposure instead of auto-exposure made a small difference (some highlights
 popped more). Defaults: game sharpening off, game exposure on.
 
+## Sharpness A/B (2026-10-09)
+
+The game's samplers have no mip bias, so DLAA sampled textures as blurry as the engine's own TAA expects. A -1.0
+bias (NVIDIA's value for DLAA) on the anisotropic and wrapping samplers was a "noticeable improvement" in game.
+
+The user still found grass "noisy with TAA + sharpening, a little blurry with DLAA + no sharpening". Shots taken
+through the add-on's remote control (`tools/ab_capture.ps1`, `tools/shots.py`, SDR, standing still in a Limgrave
+field) with RMS detail per feature size:
+
+| region (640x360 crop) | variant | 1 px | 2 px | 4 px | 8 px |
+| --- | --- | --- | --- | --- | --- |
+| midground grass | TAA + sharpen 0.25 | 20.9 | 19.5 | 16.5 | 12.5 |
+| | DLAA | 10.1 | 13.4 | 14.0 | 12.0 |
+| | DLAA + sharpen 0.10 | 12.2 | 14.8 | 14.8 | 12.0 |
+| | DLAA + sharpen 0.25 | 14.7 | 16.5 | 15.5 | 12.3 |
+| distant trees | TAA + sharpen 0.25 | 14.4 | 12.2 | 10.2 | 9.6 |
+| | DLAA | 6.3 | 7.9 | 8.7 | 9.0 |
+| | DLAA + sharpen 0.25 | 9.7 | 10.0 | 9.5 | 9.1 |
+| stone ruin | TAA + sharpen 0.25 | 18.0 | 17.0 | 15.1 | 14.4 |
+| | DLAA | 12.1 | 13.6 | 13.9 | 14.0 |
+| | DLAA + sharpen 0.25 | 18.3 | 16.7 | 14.9 | 14.2 |
+
+- Brightness and everything at 8 px and up match, so DLSS doesn't change the image's tone or shapes.
+- On stone, DLAA plus the game's sharpening at its own strength (0.25) equals TAA, so the sharpen pass is the only
+  difference there.
+- On vegetation, TAA keeps 1.5-2x more 1-2 px detail even against sharpened DLAA, and its pixel noise (Laplacian
+  energy) is 4-9x DLAA's. Most of that is the shimmer the user calls noise; it also reads as the grass's crunchy
+  texture.
+- Preset J measured the same as K.
+- Untested so far: presets L/M (NVIDIA: sharper and less ghosting than K, but they cost more and always use
+  auto-exposure). Another open question is whether wind-animated vegetation writes motion vectors. NVIDIA's guide
+  names animated foliage as the most common place where motion vectors go missing.
+
 ## Stage 3 findings so far (2026-10-08)
 
 - Strings in `eldenring.exe` show the engine's dynamic-resolution plumbing: the system property

@@ -2,7 +2,8 @@
 
 usage: shots.py <shots dir> <out dir> <name> [<name> ...] [--crop x y w h] [--scale N]
 HDR10 (PQ) captures are converted to an SDR preview with a fixed exposure, so all variants are comparable.
-Prints a sharpness (mean gradient) and fine-noise (Laplacian energy) figure per crop.
+Prints a sharpness (mean gradient) and fine-noise (Laplacian energy) figure per crop, plus RMS detail per octave
+(1-8 px feature sizes) and mean brightness, to tell lost texture apart from removed pixel noise.
 """
 import os
 import sys
@@ -49,6 +50,18 @@ def metrics(img):
     return float(np.mean(np.hypot(gx, gy))) * 1000, float(np.mean(lap ** 2)) * 1e5
 
 
+def octaves(img, levels=4):
+    """RMS detail (x1000) at 1, 2, 4, 8 px feature sizes: the difference between each level and its 2x2 average."""
+    y = img @ np.array([0.2126, 0.7152, 0.0722])
+    out = []
+    for _ in range(levels):
+        y = y[:y.shape[0] // 2 * 2, :y.shape[1] // 2 * 2]
+        small = 0.25 * (y[0::2, 0::2] + y[1::2, 0::2] + y[0::2, 1::2] + y[1::2, 1::2])
+        out.append(float(np.sqrt(np.mean((y - np.repeat(np.repeat(small, 2, 0), 2, 1)) ** 2))) * 1000)
+        y = small
+    return out
+
+
 def main():
     args = sys.argv[1:]
     crop = None
@@ -72,7 +85,9 @@ def main():
         x, y, cw, ch = crop or (w // 2 - 240, h * 2 // 3 - 135, 480, 270)
         part = img[y:y + ch, x:x + cw]
         sharp, noise = metrics(part)
-        print("%-18s sharpness %6.2f  fine noise %7.2f" % (name, sharp, noise))
+        detail = " ".join("%5.1f" % v for v in octaves(part))
+        print("%-18s sharpness %6.2f  fine noise %7.2f  detail 1/2/4/8px %s  brightness %4.1f" % (
+            name, sharp, noise, detail, part.mean() * 100))
         tile = Image.fromarray((part * 255).astype(np.uint8)).resize((cw * scale, ch * scale), Image.NEAREST)
         ImageDraw.Draw(tile).text((8, 8), name, fill=(255, 255, 255))
         tiles.append(tile)
