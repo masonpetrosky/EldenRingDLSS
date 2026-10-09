@@ -127,6 +127,11 @@ brightness terms it is a slight sideways smear at the screen sides.
 The add-on's `ChromaticAberration=0` (overlay checkbox) zeroes both offset vectors in every `ToneMap_*` pass. It finds
 the buffer by `g_vScreenSize` (byte 336: width, height, 1/width, 1/height).
 
+In-game test (`ab_capture.ps1 -Round ca`, Limgrave, SDR): the add-on found `cbToneMap` at b1 with open-world offsets
+RG (0, 0, -0.0002, 0) and B (-0.0004, 0), i.e. green and blue shifted horizontally only. With the offsets zeroed,
+`ca_measure.py` reads 0.00 px in every column. Sharpness (mean gradient) rose 29% on the stone ruin at the right
+edge and 13% on leaves at the left edge. The center was unchanged apart from grass moving in the wind.
+
 ## Stage 3 findings so far (2026-10-08)
 
 - Strings in `eldenring.exe` show the engine's dynamic-resolution plumbing: the system property
