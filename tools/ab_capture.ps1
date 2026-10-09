@@ -1,6 +1,13 @@
 # Captures the same spot with several anti-aliasing settings through the add-on's remote control.
 # Stand still in game first. Writes shots to <add-on folder>\shots and restores DLAA without sharpening.
-param([string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev")
+# -Round sharpen: DLAA with sharpening 0/0.10/0.25, preset J, game TAA.
+# -Round presets: DLAA presets K/M/L, sharpening 0.15, game TAA, each with a 5 s PresentMon frame-time log
+# (shots\<name>.csv).
+param(
+  [ValidateSet('sharpen', 'presets')][string]$Round = 'sharpen',
+  [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
+  [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
+)
 $ErrorActionPreference = 'Stop'
 
 function Send([string]$Command, [double]$Settle = 0) {
@@ -13,9 +20,26 @@ function Send([string]$Command, [double]$Settle = 0) {
   if ($Settle -gt 0) { Start-Sleep -Milliseconds ([int]($Settle * 1000)) }
 }
 
-Send 'dlss on'; Send 'sharpen off' 1.5; Send 'capture dlaa'
-Send 'sharpen on'; Send 'strength 0.25' 0.5; Send 'capture dlaa_sharp25'
-Send 'strength 0.10' 0.5; Send 'capture dlaa_sharp10'
-Send 'sharpen off'; Send 'preset 10' 2.5; Send 'capture dlaa_presetJ'
-Send 'preset 0'; Send 'dlss off' 2.0; Send 'capture taa'
-Send 'dlss on' 1.0
+function LogFrames([string]$Name) {
+  $csv = Join-Path $Folder "shots\$Name.csv"
+  Remove-Item $csv -ErrorAction SilentlyContinue
+  & $PresentMon --process_name eldenring.exe --output_file $csv --timed 5 --terminate_after_timed `
+    --stop_existing_session --no_console_stats | Out-Null
+  "measured $Name"
+}
+
+if ($Round -eq 'sharpen') {
+  Send 'dlss on'; Send 'sharpen off' 1.5; Send 'capture dlaa'
+  Send 'sharpen on'; Send 'strength 0.25' 0.5; Send 'capture dlaa_sharp25'
+  Send 'strength 0.10' 0.5; Send 'capture dlaa_sharp10'
+  Send 'sharpen off'; Send 'preset 10' 2.5; Send 'capture dlaa_presetJ'
+  Send 'preset 0'; Send 'dlss off' 2.0; Send 'capture taa'
+  Send 'dlss on' 1.0
+} else {
+  Send 'dlss on'; Send 'sharpen off'; Send 'preset 0' 2.5; Send 'capture dlaa'; LogFrames 'dlaa'
+  Send 'preset 13' 2.5; Send 'capture dlaa_presetM'; LogFrames 'dlaa_presetM'
+  Send 'preset 12' 2.5; Send 'capture dlaa_presetL'; LogFrames 'dlaa_presetL'
+  Send 'preset 0' 2.5; Send 'sharpen on'; Send 'strength 0.15' 0.5; Send 'capture dlaa_sharp15'
+  Send 'sharpen off'; Send 'dlss off' 2.0; Send 'capture taa'; LogFrames 'taa'
+  Send 'dlss on' 1.0
+}
