@@ -620,8 +620,34 @@ bool KeyPressed(int vk) {
   return pressed;
 }
 
-void OnPresent(command_queue* queue, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
+const char* ColorSpaceName(color_space cs) {
+  switch (cs) {
+    case color_space::srgb_nonlinear: return "SDR (sRGB)";
+    case color_space::extended_srgb_linear: return "scRGB (linear HDR)";
+    case color_space::hdr10_st2084: return "HDR10 (PQ)";
+    case color_space::hdr10_hlg: return "HDR (HLG)";
+    default: return "unknown";
+  }
+}
+
+// Logs the game's output whenever it changes, e.g. when HDR is switched in the game's options.
+void LogOutputMode(swapchain* sc) {
+  static format last_format = format::unknown;
+  static color_space last_space = color_space::unknown;
+  const resource back_buffer = sc->get_current_back_buffer();
+  if (back_buffer == 0) return;
+  const format fmt = sc->get_device()->get_resource_desc(back_buffer).texture.format;
+  const color_space space = sc->get_color_space();
+  if (fmt == last_format && space == last_space) return;
+  last_format = fmt;
+  last_space = space;
+  Log(reshade::log::level::info, std::string("Game output: ") + Describe(sc->get_device(), back_buffer) + ", " +
+                                     ColorSpaceName(space) + ".");
+}
+
+void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
   const uint64_t frame = ++g_frame;
+  if (sc != nullptr) LogOutputMode(sc);
   static LARGE_INTEGER frequency = {}, last = {};
   LARGE_INTEGER now;
   QueryPerformanceCounter(&now);
