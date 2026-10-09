@@ -43,11 +43,12 @@ class WindPort {
   size_t pipeline_count() const;
 
   // Records the game's indexed draw (its pipeline, targets and bindings must be current) followed by the velocity
-  // draw against the game's depth-stencil view `dsv`. Leaves the velocity pipeline and the side targets bound; the
-  // caller restores the game's targets and pipeline.
-  bool RecordDraw(ID3D12GraphicsCommandList* cmd, uint64_t pipeline, D3D12_CPU_DESCRIPTOR_HANDLE dsv,
-                  uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset,
-                  uint32_t first_instance);
+  // draw against the game's depth-stencil view `dsv`. kWithVelocity leaves the velocity pipeline and the side targets
+  // bound (the caller restores the game's targets and pipeline); kGameOnly (cost mode 4) changed nothing.
+  enum class Drawn { kNo, kGameOnly, kWithVelocity };
+  Drawn RecordDraw(ID3D12GraphicsCommandList* cmd, uint64_t pipeline, D3D12_CPU_DESCRIPTOR_HANDLE dsv,
+                   uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset,
+                   uint32_t first_instance);
 
   // Merges the side targets into `motion` (R16G16_FLOAT, all-shader-resource state) where their depth matches `depth`
   // (D32_FLOAT_S8X24 or D32_FLOAT, readable), then clears them for the next frame. Binds its own heap, root signature,
@@ -57,6 +58,10 @@ class WindPort {
   void set_depth_tolerance(float tolerance) { depth_tolerance_ = tolerance; }
   void set_merge(bool merge) { merge_ = merge; }
   void set_merge_debug(uint32_t mode) { merge_debug_ = mode; }  // 1: mark merged pixels, 2: mark drawn pixels
+  // Cost measurements: 0 normal (fused shader), 1 unfused shader, 2 static shader (no wind math), 3 pipeline and target
+  // switches without the velocity draw, 4 only the game's draw, 5 a pixel shader that only discards, 6 no pixel
+  // shader, 7 the pixel shader without the alpha test.
+  void set_cost_mode(int mode) { cost_mode_ = mode; }
   uint64_t draws() const { return draws_.load(); }
   uint64_t merges() const { return merges_.load(); }
 
@@ -77,9 +82,13 @@ class WindPort {
   std::atomic<float> depth_tolerance_{1e-3f};
   std::atomic<bool> merge_{true};
   std::atomic<uint32_t> merge_debug_{0};
+  std::atomic<int> cost_mode_{0};
 
   mutable std::shared_mutex pipelines_mutex_;
-  std::unordered_map<uint64_t, ID3D12PipelineState*> pipelines_;
+  struct Pipelines {
+    ID3D12PipelineState* pso[6] = {};  // see AddPipeline
+  };
+  std::unordered_map<uint64_t, Pipelines> pipelines_;
   std::vector<ID3D12PipelineState*> retired_;
 
   std::atomic<uint64_t> draws_{0};

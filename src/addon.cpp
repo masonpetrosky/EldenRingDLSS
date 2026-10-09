@@ -32,7 +32,7 @@
 #include "descriptors.hpp"
 #include "dlss.hpp"
 #include "state_tracking.hpp"
-#include "vegetation_mask_cs.h"
+#include "kVegetationMaskCs.h"
 #include "wind.hpp"
 #include "wind_port.hpp"
 
@@ -1138,29 +1138,21 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC ToPipelineDesc(const WindSource& source,
   return d;
 }
 
-// The pixel shader's name from its debug path, e.g. "M[AMSN_V]_Grass2_GBufDpt_[A]".
-std::string PixelShaderName(const std::vector<uint8_t>& ps) {
-  const std::string_view code(reinterpret_cast<const char*>(ps.data()), ps.size());
-  const size_t end = code.find(".ppo.pdb");
-  if (end == std::string_view::npos) return {};
-  const size_t start = code.rfind('\\', end);
-  return start == std::string_view::npos ? std::string() : std::string(code.substr(start + 1, end - start - 1));
-}
-
-// The ported shader variant for a material's pipeline, if it gets one. Grass2 and Vesitation draw every batch twice
-// in the G-buffer pass (depth prepass, then shading with the same vertex shader): only the prepass gets the velocity
-// pass, matching the alpha test ported from its pixel shader.
-bool PortVariant(const std::string& name, const std::vector<uint8_t>& ps, erdlss::WindPort::Variant* variant) {
-  const bool prepass = PixelShaderName(ps).find("_GBufDpt") != std::string::npos;
-  if (name.rfind("M[AMSN_V]_Grass2_Gbuf@", 0) == 0 && prepass) {
+// The ported shader variant for a material's pipeline, if it gets one. Every grass-family G-buffer draw that writes
+// depth gets the velocity pass: the depth prepasses of Grass2 and Vesitation and the standalone draws (Vesitation's
+// usual draw, LOD1). Their shading draws after a prepass test depth for equality without writing it and are skipped
+// (the batch was handled at its prepass). The alpha tests of all of these are ported.
+bool PortVariant(const WindSource& source, erdlss::WindPort::Variant* variant) {
+  if (!source.depth_stencil.depth_enable || !source.depth_stencil.depth_write_mask) return false;
+  if (source.name.rfind("M[AMSN_V]_Grass2_Gbuf@", 0) == 0) {
     *variant = erdlss::WindPort::Variant::kGrass2;
     return true;
   }
-  if (name.rfind("M[AMSN_V]_Vesitation_Gbuf@", 0) == 0 && prepass) {
+  if (source.name.rfind("M[AMSN_V]_Vesitation_Gbuf@", 0) == 0) {
     *variant = erdlss::WindPort::Variant::kVesitation;
     return true;
   }
-  if (name.rfind("M[AMSN_V]_Grass2_LOD1_Gbuf@", 0) == 0) {
+  if (source.name.rfind("M[AMSN_V]_Grass2_LOD1_Gbuf@", 0) == 0) {
     *variant = erdlss::WindPort::Variant::kGrass2Lod1;
     return true;
   }
@@ -1170,7 +1162,7 @@ bool PortVariant(const std::string& name, const std::vector<uint8_t>& ps, erdlss
 // Builds the ported velocity pipeline of a remembered pipeline. Called with g_wind_mutex held.
 void AddPortPipeline(uint64_t pipeline, WindSource& source) {
   erdlss::WindPort::Variant variant;
-  if (!PortVariant(source.name, source.ps, &variant)) return;
+  if (!PortVariant(source, &variant)) return;
   std::vector<D3D12_INPUT_ELEMENT_DESC> input_layout;
   const D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = ToPipelineDesc(source, &input_layout);
   if (!g_wind_port.AddPipeline(pipeline, source.name, variant,
@@ -1502,10 +1494,11 @@ bool PortWindDraw(command_list* cmd_list, const CmdData& data, uint32_t index_co
   const resource_desc rd = dev->get_resource_desc(rt0);
   if (rd.texture.width != g_wind_port.width() || rd.texture.height != g_wind_port.height()) return false;
   const D3D12_CPU_DESCRIPTOR_HANDLE dsv = {static_cast<SIZE_T>(state->depth_stencil.handle)};
-  if (!g_wind_port.RecordDraw(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()),
-                              data.current.handle, dsv, index_count, instance_count, first_index, vertex_offset,
-                              first_instance))
-    return false;
+  const auto drawn = g_wind_port.RecordDraw(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()),
+                                            data.current.handle, dsv, index_count, instance_count, first_index,
+                                            vertex_offset, first_instance);
+  if (drawn == erdlss::WindPort::Drawn::kNo) return false;
+  if (drawn == erdlss::WindPort::Drawn::kGameOnly) return true;
   cmd_list->bind_render_targets_and_depth_stencil(static_cast<uint32_t>(state->render_targets.size()),
                                                   state->render_targets.data(), state->depth_stencil);
   cmd_list->bind_pipeline(pipeline_stage::all, data.current);
@@ -1914,6 +1907,8 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "winddepth") {
     g_wind.set_depth_tolerance(std::strtof(arg.c_str(), nullptr));
     g_wind_port.set_depth_tolerance(std::strtof(arg.c_str(), nullptr));
+  } else if (command == "windcost") {
+    g_wind_port.set_cost_mode(std::atoi(arg.c_str()));
   } else if (command == "windmerge") {
     g_wind_port.set_merge(arg != "off");
     g_wind_port.set_merge_debug(arg == "drawn" ? 2 : arg == "merged" ? 1 : 0);

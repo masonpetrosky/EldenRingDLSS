@@ -14,6 +14,10 @@
 // FC_AlphaRef. 1: Grass2 (one far fade, cbMtdParam byte 144), 2: Vesitation (plus a near fade, byte 160), 3: the
 // Grass2_LOD1 G-buffer shader (FC_CameraFadeParam near/far fade). Without it, transparent parts of blade cards would
 // record their depth over the blades behind them.
+//
+// By default both poses are evaluated together (FusedPoses): force loads, distances, falloffs and the blade's frame are
+// shared and only the time-dependent terms run twice. Development variants for cost measurements: UNFUSED evaluates
+// the two poses separately (the first version), STATIC skips the wind entirely.
 // SPDX-License-Identifier: MIT
 
 #ifndef PHASE_COMP
@@ -146,6 +150,69 @@ float3 ForceDisplacement(uint instance, float3 pivot, float t) {
   return acc;
 }
 
+// The same displacement for the current and the previous wind time at once (x: current, y: previous).
+void ForceDisplacements(uint instance, float3 pivot, float2 t, out float3 acc_cur, out float3 acc_prev) {
+  const int4 row7 = asint(g_Instance[instance * 13 + 7]);
+  const uint count = min((uint)row7.y, 8u);
+  acc_cur = 0;
+  acc_prev = 0;
+  uint packed = (uint)row7.z;
+  for (uint i = 0; i < count; ++i) {
+    const ForceParam f = g_forceParam[packed & 255];
+    const bool directional = f.flags.x == 1, gusts = f.flags.y == 1, cone = f.flags.z == 1;
+    const float3 d = pivot - f.origin.xyz;
+    const float3 v = directional ? f.dir.xyz : d;
+    if (dot(v, v) > 0) {
+      const float dist = sqrt(dot(d, d));
+      const float3 vn = v * rsqrt(dot(v, v));
+      float falloff = saturate(1 - dist / max(f.wave.y, 0.001));
+      if (cone) falloff *= saturate(dot(vn, d * rsqrt(dot(d, d))) * 0.8 + 0.2);
+      if (falloff > 0) {
+        const bool plane = directional && !cone;
+        const float omega = 6.28318 / max(f.wave.x, 0.001);
+        const float along = dot(vn.xz, d.xz);
+        const float2 s = sin(omega * t + ((plane ? 0 : dist * -4) - omega * (plane ? 1 : 0) * along));
+        const float2 sway = s * f.dir.w;
+        const float2 side = directional ? f.wave.w * f.dir.w * s : 0;
+        float2 pulse = 0;
+        if (gusts) {
+          const float len = f.gust.x * 2;
+          const float cycle = f.pulse.y + f.pulse.z + f.pulse.w;
+          const float across = dot(float2(vn.z, -vn.x), d.xz) / len;
+          const float wobble = sin(f.gust.x * 12.5664 * FracSigned(across) / len) * min(f.gust.x, 5);
+          const float2 run = f.pulse.x * t;
+          const float2 phase = (run - f.gust.x * 0.25 - along - wobble) / max(cycle * f.pulse.x, 0.001);
+          const float2 fr = phase - floor(phase);
+          const float2 p = phase < 0 ? 1 - fr : fr;
+          const float rise = f.pulse.y / cycle;
+          const float2 shape = p < rise ? p / rise
+                               : p < (f.pulse.y + f.pulse.z) / cycle ? 1 - (p - rise) * cycle / f.pulse.z
+                                                                     : 0;
+          pulse = shape * f.gust.z * abs(sin(6.28318 / max(f.gust.x, 0.001) * (run - along)) + f.gust.y);
+        }
+        const float2 push = sway + f.origin.w + pulse;
+        const float k = falloff * 0.05;
+        acc_cur += float3(k * (push.x * vn.x - side.x * vn.z), vn.y * k * push.x, k * (push.x * vn.z + side.x * vn.x));
+        acc_prev += float3(k * (push.y * vn.x - side.y * vn.z), vn.y * k * push.y, k * (push.y * vn.z + side.y * vn.x));
+      }
+    }
+    packed = i != 3 ? packed >> 8 : (uint)row7.w;
+  }
+}
+
+// Bend around the pivot: rotate by log2(|disp| + 1) * k about the axis perpendicular to the instance's up and the
+// displacement, weighted per vertex.
+float3 Bend(float3 base_pos, float3 pivot, float3 up, float3 disp, float bend_scale, float weight) {
+  const float len = sqrt(dot(disp, disp));
+  if (len < 0.00011) return base_pos;
+  const float3 axis = normalize(cross(up, disp * rsqrt(dot(disp, disp))));
+  const float angle = log2(len + 1) * bend_scale;
+  const float3 center = dot(axis, base_pos - pivot) * axis + pivot;
+  const float3 radial = base_pos - center;
+  const float3 bent = center + cos(angle) * radial + sin(angle) * cross(axis, radial);
+  return base_pos + (bent - base_pos) * weight;
+}
+
 uint IndirectInstance(Input input) {
   return g_InstanceIndexBuffer.Load((uint)(g_InstanceIdxOffset + (int)input.instance) << 2);
 }
@@ -190,6 +257,47 @@ float3 WorldPosition(Input input, float t, float3 camera) {
   return base_pos + (bent - base_pos) * weight;
 }
 
+// Current and previous world positions of the vertex, sharing everything that does not depend on time or camera.
+void FusedPoses(Input input, float time, float dt, out float3 cur, out float3 prev) {
+  const uint inst = input.instance;
+  const int base = (int)(asint(g_Instance[IndirectInstance(input) * 13 + 4].x) + (int)input.normal.w) * 3;
+  const float4 p = float4(input.position, 1);
+  const float3 world = float3(dot(g_ObjMatrix[base], p), dot(g_ObjMatrix[base + 1], p), dot(g_ObjMatrix[base + 2], p));
+#ifdef STATIC
+  cur = world;
+  prev = world;
+#else
+  const float4 r0 = g_Instance[inst * 13], r1 = g_Instance[inst * 13 + 1], r2 = g_Instance[inst * 13 + 2];
+#ifdef LOD1
+  const float4 q = float4(input.texcoord2.xyz, 1);
+#else
+  const float4 q = float4(input.texcoord3.xyz, 1);
+#endif
+  const float3 pivot = float3(dot(r0, q), dot(r1, q), dot(r2, q));
+  const float3 up = normalize(float3(r0.y, r1.y, r2.y));
+#ifdef LOD1
+  const float4 m = g_Mtd[10];
+  const float keep = 1 - m.z, range = 1 / m.x;
+  const float fade_cur = saturate((length(g_Scene[kCameraPos].xyz - world) - m.y) * range);
+  const float fade_prev = saturate((length(g_Scene[kPrevCameraPos].xyz - world) - m.y) * range);
+  const float3 base_cur = world + fade_cur * (pivot - world) * keep;
+  const float3 base_prev = world + fade_prev * (pivot - world) * keep;
+  const float t = time + m.w * input.texcoord1.x;
+  const float bend_scale = g_Mtd[11].x;
+  const float weight = saturate(world.y - pivot.y);
+#else
+  const float3 base_cur = world, base_prev = world;
+  const float t = time + g_Mtd[10].PHASE_COMP * input.texcoord1.x;
+  const float bend_scale = g_Mtd[10].BEND_COMP;
+  const float weight = 1 - input.texcoord2.z;
+#endif
+  float3 disp_cur, disp_prev;
+  ForceDisplacements(inst, pivot, float2(t, t - dt), disp_cur, disp_prev);
+  cur = Bend(base_cur, pivot, up, disp_cur, bend_scale, weight);
+  prev = Bend(base_prev, pivot, up, disp_prev, bend_scale, weight);
+#endif
+}
+
 float4 Clip(float3 world, uint camera, uint vp) {
   const float4 rel = float4(world - g_Scene[camera].xyz, 1);
   return float4(dot(g_Scene[vp], rel), dot(g_Scene[vp + 1], rel), dot(g_Scene[vp + 2], rel), dot(g_Scene[vp + 3], rel));
@@ -202,9 +310,15 @@ static const float kZScale = 1.0001;
 Vertex VSMain(Input input) {
   const float time = g_Frame[27].x, dt = g_Frame[27].z;
   Vertex v;
+#ifdef UNFUSED
   v.world = WorldPosition(input, time, g_Scene[kCameraPos].xyz);
+  const float3 prev_world = WorldPosition(input, time - dt, g_Scene[kPrevCameraPos].xyz);
+#else
+  float3 prev_world;
+  FusedPoses(input, time, dt, v.world, prev_world);
+#endif
   v.cur = Clip(v.world, kCameraPos, kViewProj);
-  v.prev = Clip(WorldPosition(input, time - dt, g_Scene[kPrevCameraPos].xyz), kPrevCameraPos, kPrevViewProj);
+  v.prev = Clip(prev_world, kPrevCameraPos, kPrevViewProj);
   v.position = v.cur;
   v.position.z *= kZScale;
   const float2 size = g_Scene[kScreenSize].xy;
@@ -254,6 +368,9 @@ struct Output {
   float2 velocity : SV_Target0;  // the game's encoding: (cur - prev) NDC * (0.5 * width / height, -0.5)
   float depth : SV_Target1;      // this surface's depth, for the merge
 };
+
+// Cost measurement: rasterization and pixel shader launches without any pixel work.
+void PSDiscard() { discard; }
 
 Output PSMain(Vertex v) {
 #if ALPHA_TEST

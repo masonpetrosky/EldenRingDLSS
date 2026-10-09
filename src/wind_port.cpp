@@ -8,15 +8,22 @@
 #include <climits>
 
 #include "d3d12_util.hpp"
-#include "wind_merge_ps.h"
-#include "wind_merge_vs.h"
-#include "wind_port_ps.h"
-#include "wind_port_ps_grass2.h"
-#include "wind_port_ps_lod1.h"
-#include "wind_port_ps_vesitation.h"
-#include "wind_port_vs_grass2.h"
-#include "wind_port_vs_grass2_lod1.h"
-#include "wind_port_vs_vesitation.h"
+#include "kWindMergePs.h"
+#include "kWindMergeVs.h"
+#include "kWindPortPs.h"
+#include "kWindPortPsDiscard.h"
+#include "kWindPortPsGrass2.h"
+#include "kWindPortPsLod1.h"
+#include "kWindPortPsVesitation.h"
+#include "kWindPortVsGrass2.h"
+#include "kWindPortVsGrass2Lod1.h"
+#include "kWindPortVsGrass2Lod1Static.h"
+#include "kWindPortVsGrass2Lod1Unfused.h"
+#include "kWindPortVsGrass2Static.h"
+#include "kWindPortVsGrass2Unfused.h"
+#include "kWindPortVsVesitation.h"
+#include "kWindPortVsVesitationStatic.h"
+#include "kWindPortVsVesitationUnfused.h"
 
 namespace erdlss {
 namespace {
@@ -91,7 +98,8 @@ void WindPort::Shutdown() {
   ready_ = false;
   {
     std::unique_lock lock(pipelines_mutex_);
-    for (auto& [game, pso] : pipelines_) Release(pso);
+    for (auto& [game, psos] : pipelines_)
+      for (ID3D12PipelineState*& pso : psos.pso) Release(pso);
     pipelines_.clear();
     for (ID3D12PipelineState*& pso : retired_) Release(pso);
     retired_.clear();
@@ -117,19 +125,30 @@ void WindPort::RecordSetup(ID3D12GraphicsCommandList* cmd) {
 bool WindPort::AddPipeline(uint64_t pipeline, const std::string& name, Variant variant,
                            ID3D12RootSignature* game_root, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
   if (device_ == nullptr || game_root == nullptr) return false;
+  // Vertex shaders per variant: fused (the real one), unfused and static (cost measurements).
+  static const D3D12_SHADER_BYTECODE kGrass2[3] = {{kWindPortVsGrass2, sizeof(kWindPortVsGrass2)},
+                                                   {kWindPortVsGrass2Unfused, sizeof(kWindPortVsGrass2Unfused)},
+                                                   {kWindPortVsGrass2Static, sizeof(kWindPortVsGrass2Static)}};
+  static const D3D12_SHADER_BYTECODE kVesitation[3] = {
+      {kWindPortVsVesitation, sizeof(kWindPortVsVesitation)},
+      {kWindPortVsVesitationUnfused, sizeof(kWindPortVsVesitationUnfused)},
+      {kWindPortVsVesitationStatic, sizeof(kWindPortVsVesitationStatic)}};
+  static const D3D12_SHADER_BYTECODE kLod1[3] = {{kWindPortVsGrass2Lod1, sizeof(kWindPortVsGrass2Lod1)},
+                                                 {kWindPortVsGrass2Lod1Unfused, sizeof(kWindPortVsGrass2Lod1Unfused)},
+                                                 {kWindPortVsGrass2Lod1Static, sizeof(kWindPortVsGrass2Lod1Static)}};
+  const D3D12_SHADER_BYTECODE* vs = kGrass2;
   D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
   d.pRootSignature = game_root;
   switch (variant) {
     case Variant::kGrass2:
-      d.VS = {kWindPortVsGrass2, sizeof(kWindPortVsGrass2)};
       d.PS = {kWindPortPsGrass2, sizeof(kWindPortPsGrass2)};
       break;
     case Variant::kVesitation:
-      d.VS = {kWindPortVsVesitation, sizeof(kWindPortVsVesitation)};
+      vs = kVesitation;
       d.PS = {kWindPortPsVesitation, sizeof(kWindPortPsVesitation)};
       break;
     case Variant::kGrass2Lod1:
-      d.VS = {kWindPortVsGrass2Lod1, sizeof(kWindPortVsGrass2Lod1)};
+      vs = kLod1;
       d.PS = {kWindPortPsLod1, sizeof(kWindPortPsLod1)};
       break;
   }
@@ -148,15 +167,27 @@ bool WindPort::AddPipeline(uint64_t pipeline, const std::string& name, Variant v
   d.RTVFormats[1] = DXGI_FORMAT_R32_FLOAT;
   d.DSVFormat = desc.DSVFormat;
   d.SampleDesc = desc.SampleDesc;
-  ID3D12PipelineState* pso = nullptr;
-  if (FAILED(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
-    status_ = "velocity pipeline creation failed for " + name;
-    return false;
+  // 0-2: fused, unfused and static vertex shader with the real pixel shader; 3-5 (cost measurements, fused vertex
+  // shader): a pixel shader that only discards, no pixel shader, and the pixel shader without the alpha test.
+  const D3D12_SHADER_BYTECODE alpha_ps = d.PS;
+  const D3D12_SHADER_BYTECODE pixel[6] = {alpha_ps,     alpha_ps,
+                                          alpha_ps,     {kWindPortPsDiscard, sizeof(kWindPortPsDiscard)},
+                                          {nullptr, 0}, {kWindPortPs, sizeof(kWindPortPs)}};
+  Pipelines psos;
+  for (int i = 0; i < 6; ++i) {
+    d.VS = vs[i < 3 ? i : 0];
+    d.PS = pixel[i];
+    if (FAILED(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&psos.pso[i])))) {
+      for (ID3D12PipelineState*& made : psos.pso) Release(made);
+      status_ = "velocity pipeline creation failed for " + name;
+      return false;
+    }
   }
   std::unique_lock lock(pipelines_mutex_);
-  ID3D12PipelineState*& stored = pipelines_[pipeline];
-  if (stored != nullptr) retired_.push_back(stored);
-  stored = pso;
+  Pipelines& stored = pipelines_[pipeline];
+  for (ID3D12PipelineState* old : stored.pso)
+    if (old != nullptr) retired_.push_back(old);
+  stored = psos;
   return true;
 }
 
@@ -164,7 +195,8 @@ void WindPort::RemovePipeline(uint64_t pipeline) {
   std::unique_lock lock(pipelines_mutex_);
   const auto it = pipelines_.find(pipeline);
   if (it == pipelines_.end()) return;
-  retired_.push_back(it->second);  // in-flight command lists may still use it; released at shutdown
+  for (ID3D12PipelineState* pso : it->second.pso)
+    retired_.push_back(pso);  // in-flight command lists may still use them; released at shutdown
   pipelines_.erase(it);
 }
 
@@ -178,23 +210,26 @@ size_t WindPort::pipeline_count() const {
   return pipelines_.size();
 }
 
-bool WindPort::RecordDraw(ID3D12GraphicsCommandList* cmd, uint64_t pipeline, D3D12_CPU_DESCRIPTOR_HANDLE dsv,
-                          uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset,
-                          uint32_t first_instance) {
-  ID3D12PipelineState* pso;
+WindPort::Drawn WindPort::RecordDraw(ID3D12GraphicsCommandList* cmd, uint64_t pipeline,
+                                     D3D12_CPU_DESCRIPTOR_HANDLE dsv, uint32_t index_count, uint32_t instance_count,
+                                     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
+  Pipelines psos;
   {
     std::shared_lock lock(pipelines_mutex_);
     const auto it = pipelines_.find(pipeline);
-    if (it == pipelines_.end()) return false;
-    pso = it->second;
+    if (it == pipelines_.end()) return Drawn::kNo;
+    psos = it->second;
   }
   cmd->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);  // the game's
-  cmd->SetPipelineState(pso);
+  const int mode = cost_mode_.load();
+  if (mode == 4) return Drawn::kGameOnly;
+  static const int kPso[8] = {0, 1, 2, 0, 0, 3, 4, 5};  // cost mode -> pipeline
+  cmd->SetPipelineState(psos.pso[kPso[mode >= 0 && mode < 8 ? mode : 0]]);
   const D3D12_CPU_DESCRIPTOR_HANDLE targets = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
   cmd->OMSetRenderTargets(2, &targets, TRUE, &dsv);
-  cmd->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
+  if (mode != 3) cmd->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
   ++draws_;
-  return true;
+  return Drawn::kWithVelocity;
 }
 
 bool WindPort::Merge(ID3D12GraphicsCommandList* cmd, ID3D12Resource* motion, ID3D12Resource* depth) {

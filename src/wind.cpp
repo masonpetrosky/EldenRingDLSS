@@ -10,9 +10,9 @@
 #include <cstring>
 
 #include "d3d12_util.hpp"
-#include "wind_patch_cs.h"
-#include "wind_resolve_ps.h"
-#include "wind_resolve_vs.h"
+#include "kWindPatchCs.h"
+#include "kWindResolvePs.h"
+#include "kWindResolveVs.h"
 
 namespace erdlss {
 namespace {

@@ -24,7 +24,7 @@
 # step and with wind off, frame times with everything on, without the merge, and with wind off.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
-               'winddiag', 'windopt', 'windport', 'windcov')][string]$Round = 'sharpen',
+               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -80,6 +80,27 @@ if ($Round -eq 'sharpen') {
   $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
   Send 'dlss on'; Send 'wind off' 1.0; Send 'mv 4 windoff'; LogFrames 'wind_off'
   Send 'wind on' 3.0; Send 'windstats' 1.0; Send 'mv 4 windon'; LogFrames 'wind_on'; Send 'windstats'
+  Send "wind $restore"
+} elseif ($Round -eq 'windpixel') {
+  # Where the velocity draw's cost goes: cost modes 0 (normal), 5 (discard-only pixel shader), 6 (no pixel shader),
+  # 7 (no alpha test), between two wind-off baselines.
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
+  Send 'dlss on'; Send 'wind off' 1.0; LogFrames 'pix_off'
+  Send 'wind on' 3.0
+  foreach ($mode in 0, 5, 6, 7) { Send "windcost $mode" 1.0; LogFrames "pix_$mode" }
+  Send 'windcost 0'; Send 'wind off' 1.0; LogFrames 'pix_off2'
+  Send "wind $restore"
+} elseif ($Round -eq 'windcost') {
+  # Ported path cost breakdown: frame times per cost mode (0 fused, 1 unfused, 2 no wind math, 3 switches only,
+  # 4 game draw only), between two wind-off baselines; motion dumps for the fused and unfused shaders.
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
+  Send 'dlss on'; Send 'wind off' 1.0; LogFrames 'cost_off'
+  Send 'wind on' 3.0; Send 'windcost 0' 1.0; Send 'mv 2 cost_fused'; LogFrames 'cost_0'
+  Send 'windcost 1' 1.0; Send 'mv 2 cost_unfused'; LogFrames 'cost_1'
+  foreach ($mode in 2, 3, 4) { Send "windcost $mode" 1.0; LogFrames "cost_$mode" }
+  Send 'windcost 0'; Send 'wind off' 1.0; LogFrames 'cost_off2'
   Send "wind $restore"
 } elseif ($Round -eq 'windcov') {
   # Ported path: coverage markers (pixels the vegetation pass drew, pixels the merge kept), real motion, frame times.
