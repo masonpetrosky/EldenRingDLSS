@@ -41,7 +41,7 @@ namespace {
 namespace fs = std::filesystem;
 
 // Passes recognized by the shader debug names the game ships in its bytecode.
-enum class Pass : uint8_t { kOther, kScene, kMotionPrep, kTaa };
+enum class Pass : uint8_t { kOther, kScene, kMotionPrep, kTaa, kSharpen };
 
 // cbSceneParam, bound at vertex shader register b8 by the scene shaders. Offsets are in floats.
 constexpr uint32_t kSceneParamRegister = 8;
@@ -67,12 +67,15 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   SceneParams scene;
   resource depth = {0};       // main depth, bound to the motion-vector prep pass as its stencil source
   resource depth_copy = {0};  // the depth copy the same pass samples
+  bool dlss_applied = false;  // DLSS replaced the TAA in this command list
 };
 
 struct Config {
   bool enabled = false;
   int preset = 0;  // 0 = NGX default, which is preset K for DLAA
   int toggle_key = VK_F9;
+  bool game_sharpening = false;  // run the game's TAA sharpening filter on the DLSS output
+  bool game_exposure = true;     // give DLSS the tonemapper's exposure instead of letting it estimate one
   bool flip_jitter_x = false;
   bool flip_jitter_y = false;
   bool flip_motion = false;
@@ -112,6 +115,14 @@ struct Retired {
 };
 std::vector<Retired> g_retired;
 
+// The tonemapper's exposure (cbSceneParam.SC_SceneExposure, equal to cbToneMap.g_ToneMapSceneLumScale) for DLSS,
+// uploaded every frame through a small ring in an upload heap.
+constexpr uint32_t kExposureSlots = 8;
+constexpr uint32_t kExposureSlotBytes = 512;  // D3D12 texture copies need 512-byte aligned buffer offsets
+resource g_exposure = {0};
+resource g_exposure_upload = {0};
+uint8_t* g_exposure_mapped = nullptr;
+
 std::atomic<uint64_t> g_taa_draws{0};
 std::atomic<uint64_t> g_dlss_frames{0};
 std::atomic<uint64_t> g_failures{0};
@@ -137,6 +148,8 @@ void LoadConfig() {
   g_config.enabled = ReadInt(L"Enabled", 0) != 0;
   g_config.preset = ReadInt(L"Preset", 0);
   g_config.toggle_key = ReadInt(L"ToggleKey", VK_F9);
+  g_config.game_sharpening = ReadInt(L"GameSharpening", 0) != 0;
+  g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
   g_config.flip_motion = ReadInt(L"FlipMotion", 0) != 0;
@@ -147,6 +160,8 @@ void SaveConfig() {
   WriteInt(L"Enabled", g_config.enabled);
   WriteInt(L"Preset", g_config.preset);
   WriteInt(L"ToggleKey", g_config.toggle_key);
+  WriteInt(L"GameSharpening", g_config.game_sharpening);
+  WriteInt(L"GameExposure", g_config.game_exposure);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
   WriteInt(L"FlipJitterY", g_config.flip_jitter_y);
   WriteInt(L"FlipMotion", g_config.flip_motion);
@@ -172,6 +187,7 @@ Pass Classify(uint32_t count, const pipeline_subobject* subobjects) {
   }
   if (Contains(ps, "\\PostProcess\\TempAA")) return Pass::kTaa;
   if (Contains(ps, "\\PostProcess\\StencilAndMotionVectorPreprocess")) return Pass::kMotionPrep;
+  if (Contains(ps, "\\PostProcess\\SharpenFilter")) return Pass::kSharpen;
   if (Contains(vs, "_Velo")) return Pass::kScene;
   return Pass::kOther;
 }
@@ -282,6 +298,36 @@ bool EnsureOutput(device* dev, uint32_t width, uint32_t height, format fmt) {
   return true;
 }
 
+bool EnsureExposure(device* dev) {
+  if (g_exposure != 0) return true;
+  const resource_desc tex(1, 1, 1, 1, format::r32_float, 1, memory_heap::default_,
+                          resource_usage::shader_resource | resource_usage::copy_dest);
+  const resource_desc upload(kExposureSlots * kExposureSlotBytes, memory_heap::upload, resource_usage::copy_source);
+  void* mapped = nullptr;
+  if (!dev->create_resource(tex, nullptr, resource_usage::shader_resource, &g_exposure) ||
+      !dev->create_resource(upload, nullptr, resource_usage::cpu_access, &g_exposure_upload) ||
+      !dev->map_buffer_region(g_exposure_upload, 0, UINT64_MAX, map_access::write_only, &mapped)) {
+    Log(reshade::log::level::error, "Could not create the DLSS exposure texture; using auto-exposure.");
+    if (g_exposure_upload != 0) dev->destroy_resource(g_exposure_upload);
+    if (g_exposure != 0) dev->destroy_resource(g_exposure);
+    g_exposure = g_exposure_upload = {0};
+    g_config.game_exposure = false;
+    return false;
+  }
+  dev->set_resource_name(g_exposure, "EldenRingDLSS exposure");
+  g_exposure_mapped = static_cast<uint8_t*>(mapped);
+  return true;
+}
+
+// Records the copy of this frame's exposure into the 1x1 texture DLSS reads.
+void UploadExposure(command_list* cmd_list, float exposure) {
+  const uint64_t offset = (g_frame.load() % kExposureSlots) * kExposureSlotBytes;
+  std::memcpy(g_exposure_mapped + offset, &exposure, sizeof(exposure));
+  cmd_list->barrier(g_exposure, resource_usage::shader_resource, resource_usage::copy_dest);
+  cmd_list->copy_buffer_to_texture(g_exposure_upload, offset, 1, 1, g_exposure, 0);
+  cmd_list->barrier(g_exposure, resource_usage::copy_dest, resource_usage::shader_resource);
+}
+
 // NGX records its own descriptor heaps, compute root signature and pipeline state into the game's command
 // list. Put the game's back: descriptor heaps and compute root signature directly (ReShade still believes the
 // game's are bound), then every descriptor table the game has set and its current pipeline.
@@ -384,25 +430,34 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   if (!g_dlss.available()) return false;
   auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
   if (!EnsureOutput(dev, width, height, td.texture.format)) return false;
-  if (!g_dlss.has_feature() || g_dlss.feature_width() != width || g_dlss.feature_height() != height) {
-    const bool created = g_dlss.Create(native, width, height, g_config.preset);
+  const bool game_exposure = g_config.game_exposure && EnsureExposure(dev);
+  if (g_dlss.has_feature() && (g_dlss.feature_width() != width || g_dlss.feature_height() != height ||
+                               g_dlss.feature_auto_exposure() == game_exposure)) {
+    g_recreate = true;  // the old feature may still be in flight; it is released at present once the GPU is idle
+    return false;
+  }
+  if (!g_dlss.has_feature()) {
+    const bool created = g_dlss.Create(native, width, height, g_config.preset, !game_exposure);
     RestoreState(cmd_list, data);
     if (!created) {
       g_config.enabled = false;
       Log(reshade::log::level::error, g_dlss.status() + "; DLSS disabled.");
     } else {
       Log(reshade::log::level::info, "Created DLSS feature at " + std::to_string(width) + "x" +
-                                         std::to_string(height) + ", preset " + std::to_string(g_config.preset));
+                                         std::to_string(height) + ", preset " + std::to_string(g_config.preset) +
+                                         (game_exposure ? ", game exposure" : ", auto-exposure"));
     }
     g_reset = true;
     return false;  // DLSS takes over from the next frame
   }
+  if (game_exposure) UploadExposure(cmd_list, scene.exposure);
 
   erdlss::DlssInputs in;
   in.color = reinterpret_cast<ID3D12Resource*>(color.handle);
   in.depth = reinterpret_cast<ID3D12Resource*>(depth.handle);
   in.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
   in.output = reinterpret_cast<ID3D12Resource*>(g_output.handle);
+  in.exposure = game_exposure ? reinterpret_cast<ID3D12Resource*>(g_exposure.handle) : nullptr;
   in.width = width;
   in.height = height;
   // Projection offset in pixels with x right and y down.
@@ -427,7 +482,38 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   cmd_list->copy_resource(g_output, target);
   cmd_list->barrier(target, resource_usage::copy_dest, resource_usage::render_target);
   cmd_list->barrier(g_output, resource_usage::copy_source, resource_usage::unordered_access);
-  ++g_dlss_frames;
+  data.dlss_applied = true;
+  const uint64_t frames = ++g_dlss_frames;
+  if (frames == 1 || frames % 3000 == 0) {
+    char text[256];
+    std::snprintf(text, sizeof(text),
+                  "DLSS frame %llu: jitter %+.3f %+.3f px, exposure %.3g (%s), failures %llu, game sharpening %s",
+                  static_cast<unsigned long long>(frames), in.jitter_x, in.jitter_y, scene.exposure,
+                  game_exposure ? "game" : "auto", static_cast<unsigned long long>(g_failures.load()),
+                  g_config.game_sharpening ? "on" : "off");
+    Log(reshade::log::level::info, text);
+  }
+  return true;
+}
+
+// Without the game's sharpening, the sharpen pass becomes a plain copy of the DLSS result into the scene color.
+bool SkipSharpen(command_list* cmd_list) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  if (state == nullptr || state->render_targets.size() != 1) return false;
+  const resource source = BoundResource(cmd_list, shader_stage::pixel, 0);  // SourceTex: the TAA/DLSS result
+  const resource target = dev->get_resource_from_view(state->render_targets[0]);
+  if (source == 0 || target == 0 || source == target) return false;
+  const resource_desc sd = dev->get_resource_desc(source);
+  const resource_desc td = dev->get_resource_desc(target);
+  if (sd.texture.width != td.texture.width || sd.texture.height != td.texture.height ||
+      sd.texture.format != td.texture.format)
+    return false;
+  cmd_list->barrier(source, resource_usage::shader_resource, resource_usage::copy_source);
+  cmd_list->barrier(target, resource_usage::render_target, resource_usage::copy_dest);
+  cmd_list->copy_resource(source, target);
+  cmd_list->barrier(target, resource_usage::copy_dest, resource_usage::render_target);
+  cmd_list->barrier(source, resource_usage::copy_source, resource_usage::shader_resource);
   return true;
 }
 
@@ -452,6 +538,13 @@ void OnDestroyDevice(device* dev) {
   RetireOutput();
   for (const Retired& r : g_retired) dev->destroy_resource(r.res);
   g_retired.clear();
+  if (g_exposure_upload != 0) {
+    dev->unmap_buffer_region(g_exposure_upload);
+    dev->destroy_resource(g_exposure_upload);
+  }
+  if (g_exposure != 0) dev->destroy_resource(g_exposure);
+  g_exposure = g_exposure_upload = {0};
+  g_exposure_mapped = nullptr;
   g_dlss.Shutdown();
   g_device = nullptr;
 }
@@ -512,6 +605,9 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     return false;
   }
   if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) return ReplaceTaa(cmd_list, *data);
+  if (data->pass == Pass::kSharpen && data->dlss_applied && !g_config.game_sharpening && vertex_count == 3 &&
+      instance_count == 1)
+    return SkipSharpen(cmd_list);
   return false;
 }
 
@@ -578,6 +674,13 @@ void OnOverlay(effect_runtime*) {
     g_recreate = true;
     SaveConfig();
   }
+  if (ImGui::Checkbox("Game sharpening on top of DLSS", &g_config.game_sharpening)) SaveConfig();
+  ImGui::SetItemTooltip("The game's TAA sharpening filter (strength 0.25). Off shows DLSS's output as is.");
+  if (ImGui::Checkbox("Use the game's exposure", &g_config.game_exposure)) {
+    g_reset = true;
+    SaveConfig();
+  }
+  ImGui::SetItemTooltip("Gives DLSS the tonemapper's exposure. Off lets DLSS estimate exposure itself.");
 
   {
     std::unique_lock lock(g_dlss_mutex, std::try_to_lock);

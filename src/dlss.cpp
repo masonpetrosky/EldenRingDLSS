@@ -89,7 +89,7 @@ void Dlss::Shutdown() {
   status_ = "shut down";
 }
 
-bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, int preset) {
+bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, int preset, bool auto_exposure) {
   if (!available_) return false;
   ReleaseFeature();
   NVSDK_NGX_Parameter_SetUI(params_, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned>(preset));
@@ -102,8 +102,8 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
   create.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
   // HDR linear color, motion vectors at render resolution without jitter, reverse-Z depth.
   create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-                                NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
-                                NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+                                NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+  if (auto_exposure) create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
   const NVSDK_NGX_Result result = NGX_D3D12_CREATE_DLSS_EXT(cmd, 1, 1, &feature_, params_, &create);
   if (NVSDK_NGX_FAILED(result)) {
     feature_ = nullptr;
@@ -112,7 +112,8 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
   }
   width_ = width;
   height_ = height;
-  status_ = "running";
+  auto_exposure_ = auto_exposure;
+  status_ = auto_exposure ? "running (auto-exposure)" : "running (game exposure)";
   return true;
 }
 
@@ -135,6 +136,7 @@ bool Dlss::Evaluate(ID3D12GraphicsCommandList* cmd, const DlssInputs& in) {
   eval.InReset = in.reset ? 1 : 0;
   eval.InMVScaleX = in.mv_scale_x;
   eval.InMVScaleY = in.mv_scale_y;
+  eval.pInExposureTexture = in.exposure;
   eval.InPreExposure = 1.0f;
   eval.InExposureScale = 1.0f;
   eval.InFrameTimeDeltaInMsec = in.frame_time_ms;

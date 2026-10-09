@@ -18,6 +18,7 @@ struct DlssInputs {
   ID3D12Resource* depth = nullptr;
   ID3D12Resource* motion = nullptr;
   ID3D12Resource* output = nullptr;  // output resolution, in UNORDERED_ACCESS state
+  ID3D12Resource* exposure = nullptr;  // 1x1 R32_FLOAT, or null when the feature uses auto-exposure
   uint32_t width = 0;                // render resolution
   uint32_t height = 0;
   float jitter_x = 0.0f;             // render pixels
@@ -34,8 +35,9 @@ class Dlss {
   bool Init(ID3D12Device* device, const std::wstring& dll_dir, const std::wstring& log_dir);
   void Shutdown();
 
-  // Records feature creation on the command list. Output and render size are equal (DLAA).
-  bool Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, int preset);
+  // Records feature creation on the command list. Output and render size are equal (DLAA). Without
+  // `auto_exposure`, every evaluation must pass an exposure texture.
+  bool Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, int preset, bool auto_exposure);
   // Releases the feature. The GPU must no longer use it.
   void ReleaseFeature();
   bool Evaluate(ID3D12GraphicsCommandList* cmd, const DlssInputs& inputs);
@@ -44,6 +46,7 @@ class Dlss {
   bool has_feature() const { return feature_ != nullptr; }
   uint32_t feature_width() const { return width_; }
   uint32_t feature_height() const { return height_; }
+  bool feature_auto_exposure() const { return auto_exposure_; }
   const std::string& status() const { return status_; }
 
  private:
@@ -54,6 +57,7 @@ class Dlss {
   bool available_ = false;
   uint32_t width_ = 0;
   uint32_t height_ = 0;
+  bool auto_exposure_ = true;
   std::string status_ = "not initialized";
 };
 
