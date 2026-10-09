@@ -242,3 +242,31 @@ vegetation-only post effect.
   `g_forceParam` as well). No velocity variant of these shaders is drawn.
 - G-buffer vertex counts in that capture (index count x instances): Grass2 4.66 M, Vesitation 2.12 M, Grass2_LOD1
   1.07 M, WorldTree leaves 0.94 M, Sway 0.32 M. That's about 9 M per frame for the animated materials.
+
+## Wind motion vectors: working for grass, visually negligible (2026-10-09)
+
+`src/wind.*` (ini `WindMotion`, off by default; overlay checkbox "Wind motion vectors (experimental)"). For every
+G-buffer draw of a wind-animated material (`Grass`, `Vesitation`, `SpeedTree`, `WorldTree_Leaves`, `[Sway]`), the
+add-on replays the game's own vertex shader twice with stream output. The first pass uses the previous camera and
+wind time; a compute shader builds those from the game's `cbSceneParam`/`cbPerFrame`, which live in GPU memory. The
+second pass uses the current ones. At the TAA draw the streamed triangles are rasterized into `g_MoveTex` where
+their depth matches the scene, in the game's own velocity encoding (from `C[DetailBlend]_Velo_Skin`).
+
+What it took:
+- The previous constants can't be read on the CPU, so `wind_patch.hlsl` copies and patches them on the GPU.
+- Both stream buffers must stay bound for a whole command list, each in its own output slot. Re-binding per pass
+  reloads the fill counters before earlier draws have written them back; appends get lost and the two streams drift
+  apart, which made screen-sized garbage motion.
+
+Result at a Limgrave grass field (`ab_capture.ps1 -Round winddiag`, `tools/wind_check.py`):
+- Both streams hold 9.68 M vertices per frame and stay aligned. Near grass gets 0.7 px/frame of motion (92% of its
+  pixels), mid grass 0.08 px. With a 0.5 s step the near grass reads 12 px, so the motion scales as it should.
+- Trees (SpeedTree) get no motion: the resolve never writes on them. Not diagnosed (the depth may come from a
+  `DptA` prepass that doesn't match the G-buffer replay).
+- Cost at 4K: 9.0 -> 16.4 ms per frame (+5.8 ms for the two replays, +1.6 ms for the resolve).
+- The user toggled it in game while looking at grass: "the difference is almost imperceptible". At ~0.7 px/frame of
+  sway, DLSS's own history rejection already hides most of what the missing motion vectors cost. The softness on
+  vegetation is DLAA's character, not missing motion.
+
+Left in the code, off by default, for future use. Ideas if it's ever revisited: replace the game's draw with an
+SO-enabled copy (saves one replay), early-Z in the resolve, skip far-LOD grass, fix the trees.
