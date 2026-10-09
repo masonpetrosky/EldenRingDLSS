@@ -24,7 +24,7 @@
 # step and with wind off, frame times with everything on, without the merge, and with wind off.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
-               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass')][string]$Round = 'sharpen',
+               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -169,6 +169,16 @@ if ($Round -eq 'sharpen') {
   Send 'vmask 0'
 } elseif ($Round -eq 'mv') {
   Send 'mv 8 still_a' 1.0; Send 'mv 8 still_b'
+} elseif ($Round -eq 'survey') {
+  # What still moves without motion vectors with the grass wind motion on: two 8-frame dumps a second apart
+  # (mv_check.py --compare), the grass pass's coverage marks and a screenshot.
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
+  Send 'dlss on'; Send 'wind on' 3.0; Send 'windstats' 1.0; Send 'windstats'
+  Send 'mv 8 surv_a' 1.0; Send 'mv 8 surv_b'
+  Send 'windmerge merged' 0.5; Send 'mv 1 surv_merged'; Send 'windmerge on' 0.5
+  Send 'capture surv_shot'
+  Send "wind $restore"
 } elseif ($Round -eq 'ca') {
   $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
   $restore = if ($ini -match '^ChromaticAberration=0') { 'off' } else { 'on' }

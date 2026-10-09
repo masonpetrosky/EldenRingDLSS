@@ -386,3 +386,31 @@ included, and that costs more than the geometry pass it saves. Off by default.
   (by instance position, on the GPU), or the per-frame clock advance has to be learned per tree model. Then either
   SpeedTree's wind math gets ported (five shader variants of 26-49 KB of decompiled code each), or the game's own
   shader is replayed with the previous clocks (the stream-output approach).
+
+### What still moves without motion vectors: survey at a forest edge (2026-10-09)
+
+Dev build with the grass wind motion on, Limgrave forest edge with grass, bushes and trees in view
+(`ab_capture.ps1 -Round survey`, `mv_check.py surv_a --compare surv_b`, a second apart). Of the pixels whose brightness
+changed by more than 6%, 61% had motion vectors and 39% had none:
+
+| region | changed pixels without motion vectors | share of all uncovered changes |
+| --- | --- | --- |
+| tree canopy, left | 100% | 43% |
+| trees, right | 97% | 17% |
+| bush mass | 55% (leaf edges) | 19% |
+| grass | 3% | 4% |
+
+Which materials those are, from a RenderDoc capture of the same view (`er117_trees_f2056.rdc`;
+`tools/rdc_pixelsource.py` takes the last G-buffer draw passing depth at 2304 grid pixels, and
+`tools/pixelsource_summary.py` groups them):
+
+| region | SpeedTree | other |
+| --- | --- | --- |
+| whole frame | 45% | grass family (covered) 37%, WorldTree leaves 3%, the rest scattered |
+| canopies | 83% | `M[WorldTree_Leaves]_Emissive_Glow` (golden trees) 13% |
+| trees right | 60% | `M[AMSN_V][Ov_N]` ground and rocks 25% |
+| bushes | 75% | the character 12%, grass 5% |
+
+So the bushes here are SpeedTree shrubs too, and SpeedTree is nearly all the motion left uncovered. Each tree's eight
+wind clocks share one per-tree offset, so every tree of a model advances by the same amounts per frame: matching
+one tree per model between frames gives last frame's clocks for all of them.
