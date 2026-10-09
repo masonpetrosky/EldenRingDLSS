@@ -49,7 +49,7 @@ add_custom_command(
 add_custom_command(
   OUTPUT ${SHADER_DIR}/wind_port_vs_grass2.h ${SHADER_DIR}/wind_port_vs_vesitation.h
          ${SHADER_DIR}/wind_port_vs_grass2_lod1.h ${SHADER_DIR}/wind_port_ps.h ${SHADER_DIR}/wind_port_ps_grass2.h
-         ${SHADER_DIR}/wind_port_ps_vesitation.h
+         ${SHADER_DIR}/wind_port_ps_vesitation.h ${SHADER_DIR}/wind_port_ps_lod1.h
   COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
   COMMAND ${FXC} /nologo /T vs_5_0 /E VSMain /O3 /D PHASE_COMP=y /D BEND_COMP=z /Vn kWindPortVsGrass2
           /Fh ${SHADER_DIR}/wind_port_vs_grass2.h ${CMAKE_SOURCE_DIR}/src/wind_port.hlsl
@@ -63,6 +63,8 @@ add_custom_command(
           /Fh ${SHADER_DIR}/wind_port_ps_grass2.h ${CMAKE_SOURCE_DIR}/src/wind_port.hlsl
   COMMAND ${FXC} /nologo /T ps_5_0 /E PSMain /O3 /D ALPHA_TEST=2 /Vn kWindPortPsVesitation
           /Fh ${SHADER_DIR}/wind_port_ps_vesitation.h ${CMAKE_SOURCE_DIR}/src/wind_port.hlsl
+  COMMAND ${FXC} /nologo /T ps_5_0 /E PSMain /O3 /D ALPHA_TEST=3 /Vn kWindPortPsLod1
+          /Fh ${SHADER_DIR}/wind_port_ps_lod1.h ${CMAKE_SOURCE_DIR}/src/wind_port.hlsl
   DEPENDS src/wind_port.hlsl
   VERBATIM)
 add_custom_command(
@@ -79,7 +81,7 @@ add_library(EldenRingDLSS SHARED src/addon.cpp src/descriptors.cpp src/dlss.cpp 
             ${SHADER_DIR}/vegetation_mask_cs.h ${SHADER_DIR}/wind_resolve_vs.h ${SHADER_DIR}/wind_resolve_ps.h
             ${SHADER_DIR}/wind_patch_cs.h ${SHADER_DIR}/wind_port_vs_grass2.h ${SHADER_DIR}/wind_port_vs_vesitation.h
             ${SHADER_DIR}/wind_port_vs_grass2_lod1.h ${SHADER_DIR}/wind_port_ps_grass2.h
-            ${SHADER_DIR}/wind_port_ps_vesitation.h
+            ${SHADER_DIR}/wind_port_ps_vesitation.h ${SHADER_DIR}/wind_port_ps_lod1.h
             ${SHADER_DIR}/wind_port_ps.h ${SHADER_DIR}/wind_merge_vs.h ${SHADER_DIR}/wind_merge_ps.h)
 target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui ${SHADER_DIR})
 target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)

@@ -11,8 +11,9 @@
 //
 // ALPHA_TEST ports the alpha test of the materials' depth-prepass pixel shaders (M[AMSN_V]_Grass2_GBufDpt and
 // _Vesitation_GBufDpt): texture alpha, camera-distance fades with an 8x8 dither, per-instance LOD dither and
-// FC_AlphaRef. 1: Grass2 (one far fade, cbMtdParam byte 144), 2: Vesitation (plus a near fade, byte 160). Without it,
-// transparent parts of blade cards would record their depth over the blades behind them.
+// FC_AlphaRef. 1: Grass2 (one far fade, cbMtdParam byte 144), 2: Vesitation (plus a near fade, byte 160), 3: the
+// Grass2_LOD1 G-buffer shader (FC_CameraFadeParam near/far fade). Without it, transparent parts of blade cards would
+// record their depth over the blades behind them.
 // SPDX-License-Identifier: MIT
 
 #ifndef PHASE_COMP
@@ -47,7 +48,7 @@ cbuffer cbTextureTilingScale : register(b1) {
   float4 g_Tiling;  // FC_TextureTilingScale[0]
 };
 cbuffer cbMatDynParam : register(b2) {
-  float4 g_MatDyn;  // .w: FC_ColorSlotNo
+  float4 g_MatDyn[7];  // [0].w: FC_ColorSlotNo; [5]: FC_CameraFadeParam gradients; [6].x IsEnable, .y MiddleAlpha
 };
 cbuffer cbModelParam : register(b7) {
   float4 g_Model[3];  // [2].x: FC_DitherEnable, .y: FC_DitherFadePatternSwitch
@@ -222,9 +223,18 @@ bool Discarded(Vertex v) {
   const bool fading = asint(g_Scene[kCameraFadeEnable].w) != 0;
   const float dither = g_DitherTexture.Sample(SS_WrapPoint, v.position.xy * 0.125).a;
   const float threshold = dither * 0.99 + 0.01;
+#if ALPHA_TEST == 3
+  if (asint(g_MatDyn[6].x) != 0) {
+    const float4 gradient = g_MatDyn[5];  // far gradient, far intercept, near gradient, near intercept
+    const float far = saturate(gradient.x * dist + gradient.y), near = saturate(gradient.z * dist + gradient.w);
+    if (g_MatDyn[6].y * (near - far) + far < threshold) return true;
+  }
+  const float visible = 1;
+#else
   const float4 far_fade = g_Mtd[9];  // byte 144: .x end, .y start
   const float far = fading ? (dist - far_fade.y) / max(far_fade.x - far_fade.y, 0.001) : 1;
   float visible = far >= threshold ? 1 : 0;
+#endif
 #if ALPHA_TEST == 2
   const float4 near_fade = g_Mtd[10];  // byte 160: .y start, .z end
   const float near = fading ? (dist - near_fade.y) / max(near_fade.z - near_fade.y, 0.001) : 1;
@@ -234,7 +244,7 @@ bool Discarded(Vertex v) {
   const float4 alpha_ref = g_Mtd[1];  // FC_AlphaRef
   const float4 dither_params = g_Model[2];
   if (dither_params.x > 0 && dither_params.y * noise * 0.999 + g_Instance[v.instance * 13 + 7].x < 0.5) return true;
-  const float lod = g_Instance[v.instance * 13 + 9 + (int)g_MatDyn.w].w;
+  const float lod = g_Instance[v.instance * 13 + 9 + (int)g_MatDyn[0].w].w;
   if (lod < 1 && lod + noise * 0.999 < 0.5) return true;
   return noise * alpha_ref.y + visible * alpha < alpha_ref.x;
 }

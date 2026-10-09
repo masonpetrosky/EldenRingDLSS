@@ -12,6 +12,7 @@
 #include "wind_merge_vs.h"
 #include "wind_port_ps.h"
 #include "wind_port_ps_grass2.h"
+#include "wind_port_ps_lod1.h"
 #include "wind_port_ps_vesitation.h"
 #include "wind_port_vs_grass2.h"
 #include "wind_port_vs_grass2_lod1.h"
@@ -129,7 +130,7 @@ bool WindPort::AddPipeline(uint64_t pipeline, const std::string& name, Variant v
       break;
     case Variant::kGrass2Lod1:
       d.VS = {kWindPortVsGrass2Lod1, sizeof(kWindPortVsGrass2Lod1)};
-      d.PS = {kWindPortPs, sizeof(kWindPortPs)};  // no alpha test yet
+      d.PS = {kWindPortPsLod1, sizeof(kWindPortPsLod1)};
       break;
   }
   d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
