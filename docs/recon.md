@@ -75,3 +75,24 @@ With the game in HDR, DLAA with the game's sharpening pass skipped looked clearl
 cleaner; the sharpening filter's artifacts stand out in HDR). In SDR the unsharpened DLAA reads as softer.
 Feeding DLSS the tonemapper exposure instead of auto-exposure made a small difference (some highlights
 popped more). Defaults: game sharpening off, game exposure on.
+
+## Stage 3 findings so far (2026-10-08)
+
+- Strings in `eldenring.exe` show the engine's dynamic-resolution plumbing: the system property
+  `Performance.IsEnableDynamicResolution` (next to `Performance.IsEnableLoadBalancer_GX`, in the
+  `CSSystemProperties` block), the `CSGxLoadBalancerHelper` singleton, and a `ToneMapDynamicResolutionVS` shader.
+- `LoadBalancerParam` (80-byte `LOAD_BALANCER_PARAM_ST` rows, layout from libER/Paramdex) holds the console
+  dynamic-resolution settings: `dynamicResolution` (byte 42, load level at which it starts) and
+  `dynamicResolutionPercentageMin/Max` (bytes 48/49). The game has 16 rows (e.g. 70-100% at 30 FPS, 70-100% at
+  60 FPS, 40-75%). `tools/param_patch.py` finds the table in the running game by its type name and patches it.
+- Test 1 (RenderDoc capture `er117_drs67_f12837`): property on, all rows patched to level 0 and 67-67% while in
+  game. Every screen percentage at the TAA stayed 1.0; viewport 3840x2160.
+- Test 2 (dev profile, add-on logging): properties `IsEnableDynamicResolution` and `IsEnableLoadBalancer_GX` on,
+  params patched at the title screen before loading. Scene still at 100% and a 3840x2160 viewport. The PC build
+  does not drive dynamic resolution from these.
+- The CPU side: the function around `0x141A34560` fills the CPU copy of `cbSceneParam` from a per-view structure
+  (array of 0x120-byte entries at `[r12]`). `SC_DynamicResolution_ScreenPercentage` comes from view+0xF4..0x100
+  and the secondary percentage from view+0x104 onward; view+0xA0/0xA4 feed `FC_ProjectionType`/`FC_SsrMipScale`.
+  `0x141B68C81` then copies the struct field by field into the mapped constant buffer.
+- Next: find who writes view+0xF4 (and whether scene viewports follow it), then force it from the add-on.
+- Note: under RenderDoc the game reports HDR as unsupported and saves HDR off; turn it back on after captures.

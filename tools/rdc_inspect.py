@@ -84,6 +84,11 @@ def inspect(controller, eid, textures, buffers, names, targets):
     controller.SetFrameEvent(eid, True)
     pipe = controller.GetPipelineState()
     lines = ["event %d" % eid]
+    try:
+        vp = pipe.GetViewport(0)
+        lines.append("viewport x=%g y=%g w=%g h=%g" % (vp.x, vp.y, vp.width, vp.height))
+    except Exception as exc:
+        lines.append("viewport unavailable: %s" % exc)
     compute = pipe.GetShader(rd.ShaderStage.Compute) != rd.ResourceId.Null()
     stages = [rd.ShaderStage.Compute] if compute else [rd.ShaderStage.Vertex, rd.ShaderStage.Pixel]
     pipeline_obj = pipe.GetComputePipelineObject() if compute else pipe.GetGraphicsPipelineObject()

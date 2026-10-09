@@ -578,6 +578,23 @@ void OnBindPipeline(command_list* cmd_list, pipeline_stage, pipeline p) {
   data->pass = it == g_pipelines.end() ? Pass::kOther : it->second;
 }
 
+// Logs the scene's render size whenever it changes (dynamic resolution experiments).
+void LogSceneResolution(command_list* cmd_list, const SceneParams& scene) {
+  static float last_percentage = -1;
+  static float last_width = -1, last_height = -1;
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  const float vp_w = state != nullptr && !state->viewports.empty() ? state->viewports[0].width : 0;
+  const float vp_h = state != nullptr && !state->viewports.empty() ? state->viewports[0].height : 0;
+  if (scene.screen_percentage == last_percentage && vp_w == last_width && vp_h == last_height) return;
+  last_percentage = scene.screen_percentage;
+  last_width = vp_w;
+  last_height = vp_h;
+  char text[160];
+  std::snprintf(text, sizeof(text), "Scene: screen percentage %.3f, geometry viewport %.0fx%.0f, screen size %.0fx%.0f",
+                scene.screen_percentage, vp_w, vp_h, scene.width, scene.height);
+  Log(reshade::log::level::info, text);
+}
+
 bool OnDrawIndexed(command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr || data->pass != Pass::kScene || data->scene_valid || data->scene_attempts >= 8) return false;
@@ -591,6 +608,7 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t
   data->scene_valid = true;
   std::lock_guard lock(g_scene_mutex);
   g_scene = scene;
+  LogSceneResolution(cmd_list, scene);
   return false;
 }
 
