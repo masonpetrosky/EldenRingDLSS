@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "d3d12_util.hpp"
 #include "wind_patch_cs.h"
 #include "wind_resolve_ps.h"
 #include "wind_resolve_vs.h"
@@ -26,57 +27,6 @@ constexpr D3D12_RESOURCE_STATES kShaderResource =
 constexpr uint32_t kDebugVertices = 64;
 constexpr uint32_t kDebugFilled = 0, kDebugPrev = 256, kDebugCur = kDebugPrev + kDebugVertices * 16,
                    kDebugSlot = kDebugCur + kDebugVertices * 16, kDebugSize = kDebugSlot + 4096;
-
-template <typename T>
-void Release(T*& p) {
-  if (p != nullptr) p->Release();
-  p = nullptr;
-}
-
-D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
-  D3D12_RESOURCE_BARRIER b = {};
-  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  b.Transition.pResource = res;
-  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  b.Transition.StateBefore = before;
-  b.Transition.StateAfter = after;
-  return b;
-}
-
-ID3D12Resource* CreateBuffer(ID3D12Device* device, uint64_t size, D3D12_HEAP_TYPE heap_type,
-                             D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
-  D3D12_HEAP_PROPERTIES heap = {};
-  heap.Type = heap_type;
-  D3D12_RESOURCE_DESC desc = {};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  desc.Width = size;
-  desc.Height = 1;
-  desc.DepthOrArraySize = 1;
-  desc.MipLevels = 1;
-  desc.SampleDesc.Count = 1;
-  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-  desc.Flags = flags;
-  ID3D12Resource* res = nullptr;
-  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
-                                             IID_PPV_ARGS(&res))))
-    return nullptr;
-  return res;
-}
-
-ID3D12RootSignature* CreateRootSignature(ID3D12Device* device, const D3D12_ROOT_SIGNATURE_DESC& desc) {
-  ID3DBlob* blob = nullptr;
-  ID3DBlob* error = nullptr;
-  ID3D12RootSignature* rs = nullptr;
-  if (SUCCEEDED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error)))
-    device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rs));
-  Release(blob);
-  Release(error);
-  return rs;
-}
-
-D3D12_DESCRIPTOR_RANGE Range(D3D12_DESCRIPTOR_RANGE_TYPE type, uint32_t count, uint32_t base, uint32_t offset) {
-  return {type, count, base, 0, offset};
-}
 
 }  // namespace
 

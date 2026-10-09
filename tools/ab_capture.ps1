@@ -20,9 +20,11 @@
 # -Round windopt: wind on; screenshots with wind on and off (the stream-output copy must draw the grass exactly like
 # the game); motion dumps with the game's time step, a 0.5 s step and a 1% depth tolerance; frame times with
 # everything on, with vertex-only current passes, without the resolve draw, and with wind off.
+# -Round windport: the ported-shader path (WindMode=1): screenshots wind off/on, motion dumps with the game's time
+# step and with wind off, frame times with everything on, without the merge, and with wind off.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
-               'winddiag', 'windopt')][string]$Round = 'sharpen',
+               'winddiag', 'windopt', 'windport', 'windcov')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -78,6 +80,24 @@ if ($Round -eq 'sharpen') {
   $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
   Send 'dlss on'; Send 'wind off' 1.0; Send 'mv 4 windoff'; LogFrames 'wind_off'
   Send 'wind on' 3.0; Send 'windstats' 1.0; Send 'mv 4 windon'; LogFrames 'wind_on'; Send 'windstats'
+  Send "wind $restore"
+} elseif ($Round -eq 'windcov') {
+  # Ported path: coverage markers (pixels the vegetation pass drew, pixels the merge kept), real motion, frame times.
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
+  Send 'dlss on'; Send 'wind on' 3.0; Send 'windstats' 1.0
+  Send 'windmerge drawn' 0.5; Send 'mv 1 cov_drawn'; Send 'windmerge merged' 0.5; Send 'mv 1 cov_merged'
+  Send 'windmerge on' 0.5; Send 'mv 2 port_on'; Send 'windstats'
+  LogFrames 'port_on'; Send 'wind off' 1.0; LogFrames 'port_off'
+  Send "wind $restore"
+} elseif ($Round -eq 'windport') {
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
+  Send 'dlss on'; Send 'wind off' 1.0; Send 'capture port_shot_off'; Send 'mv 2 port_off'
+  Send 'wind on' 3.0; Send 'capture port_shot_on'; Send 'windstats' 1.0; Send 'mv 2 port_on'; Send 'windstats'
+  LogFrames 'port_on'
+  Send 'windmerge off' 1.0; LogFrames 'port_nomerge'; Send 'windmerge on'
+  Send 'wind off' 1.0; LogFrames 'port_off'
   Send "wind $restore"
 } elseif ($Round -eq 'windopt') {
   $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue

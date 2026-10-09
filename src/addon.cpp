@@ -34,6 +34,7 @@
 #include "state_tracking.hpp"
 #include "vegetation_mask_cs.h"
 #include "wind.hpp"
+#include "wind_port.hpp"
 
 extern "C" __declspec(dllexport) const char* NAME = "Elden Ring DLSS";
 extern "C" __declspec(dllexport) const char* DESCRIPTION =
@@ -102,7 +103,10 @@ struct Config {
   // Motion vectors for wind-animated vegetation (wind.hpp). Experimental; costs GPU time and about 16 * 2 * capacity
   // bytes of video memory.
   bool wind_motion = false;
-  int wind_capacity = 8;  // millions of streamed vertices per frame
+  // 1: ported vertex shader for the grass family (wind_port.hpp); 0: stream output of the game's own shaders for all
+  // animated materials (wind.hpp). Read at startup.
+  int wind_mode = 1;
+  int wind_capacity = 8;  // stream output: millions of streamed vertices per frame
   bool flip_jitter_x = false;
   bool flip_jitter_y = false;
   bool flip_motion = false;
@@ -136,7 +140,9 @@ struct WindSource {
 std::mutex g_wind_mutex;
 std::unordered_map<uint64_t, WindSource> g_wind_sources;
 erdlss::WindMotion g_wind;
+erdlss::WindPort g_wind_port;
 std::atomic<bool> g_wind_ready{false};
+std::atomic<bool> g_port_ready{false};
 std::atomic<bool> g_wind_failed{false};
 std::atomic<uint64_t> g_wind_errors{0};
 std::atomic<uint64_t> g_wind_resolves{0};
@@ -276,6 +282,7 @@ void LoadConfig() {
   g_config.vegetation_mask = ReadFloat(L"VegetationMask", 0.0f);
   g_config.wind_motion = ReadInt(L"WindMotion", 0) != 0;
   g_config.wind_capacity = std::max(1, std::min(ReadInt(L"WindCapacity", 8), 24));
+  g_config.wind_mode = ReadInt(L"WindMode", 1) == 0 ? 0 : 1;
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
   g_config.flip_motion = ReadInt(L"FlipMotion", 0) != 0;
@@ -294,6 +301,7 @@ void SaveConfig() {
   WriteFloat(L"VegetationMask", g_config.vegetation_mask);
   WriteInt(L"WindMotion", g_config.wind_motion);
   WriteInt(L"WindCapacity", g_config.wind_capacity);
+  WriteInt(L"WindMode", g_config.wind_mode);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
   WriteInt(L"FlipJitterY", g_config.flip_jitter_y);
   WriteInt(L"FlipMotion", g_config.flip_motion);
@@ -940,6 +948,8 @@ void OnDestroyDevice(device* dev) {
     std::lock_guard wind_lock(g_wind_mutex);
     g_wind_ready = false;
     g_wind.Shutdown();
+    g_port_ready = false;
+    g_wind_port.Shutdown();
   }
   g_dlss.Shutdown();
   g_device = nullptr;
@@ -1128,6 +1138,46 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC ToPipelineDesc(const WindSource& source,
   return d;
 }
 
+// The pixel shader's name from its debug path, e.g. "M[AMSN_V]_Grass2_GBufDpt_[A]".
+std::string PixelShaderName(const std::vector<uint8_t>& ps) {
+  const std::string_view code(reinterpret_cast<const char*>(ps.data()), ps.size());
+  const size_t end = code.find(".ppo.pdb");
+  if (end == std::string_view::npos) return {};
+  const size_t start = code.rfind('\\', end);
+  return start == std::string_view::npos ? std::string() : std::string(code.substr(start + 1, end - start - 1));
+}
+
+// The ported shader variant for a material's pipeline, if it gets one. Grass2 and Vesitation draw every batch twice
+// in the G-buffer pass (depth prepass, then shading with the same vertex shader): only the prepass gets the velocity
+// pass, matching the alpha test ported from its pixel shader.
+bool PortVariant(const std::string& name, const std::vector<uint8_t>& ps, erdlss::WindPort::Variant* variant) {
+  const bool prepass = PixelShaderName(ps).find("_GBufDpt") != std::string::npos;
+  if (name.rfind("M[AMSN_V]_Grass2_Gbuf@", 0) == 0 && prepass) {
+    *variant = erdlss::WindPort::Variant::kGrass2;
+    return true;
+  }
+  if (name.rfind("M[AMSN_V]_Vesitation_Gbuf@", 0) == 0 && prepass) {
+    *variant = erdlss::WindPort::Variant::kVesitation;
+    return true;
+  }
+  if (name.rfind("M[AMSN_V]_Grass2_LOD1_Gbuf@", 0) == 0) {
+    *variant = erdlss::WindPort::Variant::kGrass2Lod1;
+    return true;
+  }
+  return false;
+}
+
+// Builds the ported velocity pipeline of a remembered pipeline. Called with g_wind_mutex held.
+void AddPortPipeline(uint64_t pipeline, WindSource& source) {
+  erdlss::WindPort::Variant variant;
+  if (!PortVariant(source.name, source.ps, &variant)) return;
+  std::vector<D3D12_INPUT_ELEMENT_DESC> input_layout;
+  const D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = ToPipelineDesc(source, &input_layout);
+  if (!g_wind_port.AddPipeline(pipeline, source.name, variant,
+                               reinterpret_cast<ID3D12RootSignature*>(source.layout.handle), desc))
+    SetWindError(g_wind_port.status());
+}
+
 // Builds the stream-output copies of a remembered pipeline. Called with g_wind_mutex held.
 void AddWindPipeline(uint64_t pipeline, WindSource& source) {
   auto* const descriptors = g_device != nullptr ? g_device->get_private_data<erdlss::Descriptors>() : nullptr;
@@ -1216,6 +1266,7 @@ void RememberWindPipeline(device* dev, pipeline_layout layout, uint32_t count, c
   WindSource& stored = g_wind_sources[p.handle];
   stored = std::move(source);
   if (g_wind_ready.load()) AddWindPipeline(p.handle, stored);
+  if (g_port_ready.load()) AddPortPipeline(p.handle, stored);
 }
 
 void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const pipeline_subobject* subobjects,
@@ -1243,7 +1294,10 @@ void OnDestroyPipeline(device*, pipeline p) {
   }
   {
     std::lock_guard lock(g_wind_mutex);
-    if (g_wind_sources.erase(p.handle) != 0) g_wind.RemovePipeline(p.handle);
+    if (g_wind_sources.erase(p.handle) != 0) {
+      g_wind.RemovePipeline(p.handle);
+      g_wind_port.RemovePipeline(p.handle);
+    }
   }
   std::unique_lock lock(g_pipeline_mutex);
   g_pipelines.erase(p.handle);
@@ -1436,6 +1490,66 @@ bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
   return replaced;
 }
 
+// Draws an animated grass-family draw of the main camera's G-buffer pass and then its motion with the ported shader.
+// Returns true when it did (the caller skips the original draw).
+bool PortWindDraw(command_list* cmd_list, const CmdData& data, uint32_t index_count, uint32_t instance_count,
+                  uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  if (state == nullptr || state->render_targets.size() != 5 || state->depth_stencil == 0) return false;
+  const resource rt0 = dev->get_resource_from_view(state->render_targets[0]);
+  if (rt0 == 0) return false;
+  const resource_desc rd = dev->get_resource_desc(rt0);
+  if (rd.texture.width != g_wind_port.width() || rd.texture.height != g_wind_port.height()) return false;
+  const D3D12_CPU_DESCRIPTOR_HANDLE dsv = {static_cast<SIZE_T>(state->depth_stencil.handle)};
+  if (!g_wind_port.RecordDraw(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()),
+                              data.current.handle, dsv, index_count, instance_count, first_index, vertex_offset,
+                              first_instance))
+    return false;
+  cmd_list->bind_render_targets_and_depth_stencil(static_cast<uint32_t>(state->render_targets.size()),
+                                                  state->render_targets.data(), state->depth_stencil);
+  cmd_list->bind_pipeline(pipeline_stage::all, data.current);
+  return true;
+}
+
+// Puts the TAA draw's state back after the wind resolve or merge bound their own.
+void RestoreTaaState(command_list* cmd_list, const CmdData& data) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it != state->descriptor_tables.end() && it->second.first != 0)
+    native->SetGraphicsRootSignature(reinterpret_cast<ID3D12RootSignature*>(it->second.first.handle));
+  RestoreState(cmd_list, data);
+  cmd_list->bind_render_targets_and_depth_stencil(static_cast<uint32_t>(state->render_targets.size()),
+                                                  state->render_targets.data(), state->depth_stencil);
+  if (!state->viewports.empty())
+    cmd_list->bind_viewports(0, static_cast<uint32_t>(state->viewports.size()), state->viewports.data());
+  if (!state->scissor_rects.empty())
+    cmd_list->bind_scissor_rects(0, static_cast<uint32_t>(state->scissor_rects.size()), state->scissor_rects.data());
+  if (state->primitive_topology != primitive_topology::undefined) {
+    const dynamic_state topology_state = dynamic_state::primitive_topology;
+    const auto topology = static_cast<uint32_t>(state->primitive_topology);
+    cmd_list->bind_pipeline_states(1, &topology_state, &topology);
+  }
+}
+
+// Merges the ported pass's motion into the TAA's motion texture.
+void MergeWind(command_list* cmd_list, const CmdData& data) {
+  device* const dev = cmd_list->get_device();
+  if (cmd_list->get_private_data<state_tracking>() == nullptr) return;
+  const resource motion = BoundResource(cmd_list, shader_stage::pixel, 3);  // g_MoveTex
+  const resource depth = data.depth != 0 ? data.depth : resource{g_depth.load()};
+  if (motion == 0 || depth == 0 || dev->get_resource_desc(motion).texture.format != format::r16g16_float) return;
+  if (!g_wind_port.Merge(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()),
+                         reinterpret_cast<ID3D12Resource*>(motion.handle),
+                         reinterpret_cast<ID3D12Resource*>(depth.handle))) {
+    std::lock_guard lock(g_wind_mutex);
+    SetWindError("could not merge (depth format or size)");
+    return;
+  }
+  RestoreTaaState(cmd_list, data);
+}
+
 // Writes the streamed vegetation's motion into the TAA's motion texture, then puts the TAA draw's state back.
 void ResolveWind(command_list* cmd_list, const CmdData& data) {
   device* const dev = cmd_list->get_device();
@@ -1462,27 +1576,34 @@ void ResolveWind(command_list* cmd_list, const CmdData& data) {
     return;
   }
   ++g_wind_resolves;
-  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
-  if (it != state->descriptor_tables.end() && it->second.first != 0)
-    native->SetGraphicsRootSignature(reinterpret_cast<ID3D12RootSignature*>(it->second.first.handle));
-  RestoreState(cmd_list, data);
-  cmd_list->bind_render_targets_and_depth_stencil(static_cast<uint32_t>(state->render_targets.size()),
-                                                  state->render_targets.data(), state->depth_stencil);
-  if (!state->viewports.empty())
-    cmd_list->bind_viewports(0, static_cast<uint32_t>(state->viewports.size()), state->viewports.data());
-  if (!state->scissor_rects.empty())
-    cmd_list->bind_scissor_rects(0, static_cast<uint32_t>(state->scissor_rects.size()), state->scissor_rects.data());
-  if (state->primitive_topology != primitive_topology::undefined) {
-    const dynamic_state topology_state = dynamic_state::primitive_topology;
-    const auto topology = static_cast<uint32_t>(state->primitive_topology);
-    cmd_list->bind_pipeline_states(1, &topology_state, &topology);
-  }
+  RestoreTaaState(cmd_list, data);
 }
 
 // Creates the wind resources on first use (they take video memory) and builds the stream-output pipelines.
 void StartWind(effect_runtime* runtime) {
   std::lock_guard lock(g_wind_mutex);
   if (g_device == nullptr) return;
+  if (g_config.wind_mode == 1) {
+    const uint32_t width = g_render_width.load(), height = g_render_height.load();
+    if (width == 0 || height == 0) return;  // the TAA size is not known yet; try again next frame
+    if (!g_wind_port.Init(reinterpret_cast<ID3D12Device*>(g_device->get_native()), width, height)) {
+      Log(reshade::log::level::error, "Wind motion vectors unavailable: " + g_wind_port.status());
+      g_wind_port.Shutdown();
+      g_wind_failed = true;
+      return;
+    }
+    command_queue* const queue = runtime->get_command_queue();
+    g_wind_port.RecordSetup(
+        reinterpret_cast<ID3D12GraphicsCommandList*>(queue->get_immediate_command_list()->get_native()));
+    queue->flush_immediate_command_list();
+    queue->wait_idle();
+    for (auto& [pipeline, source] : g_wind_sources) AddPortPipeline(pipeline, source);
+    g_wind_port.MarkReady();
+    g_port_ready = true;
+    Log(reshade::log::level::info, "Wind motion vectors on (ported shader): " +
+                                       std::to_string(g_wind_port.pipeline_count()) + " grass-family pipelines.");
+    return;
+  }
   const uint32_t capacity = static_cast<uint32_t>(g_config.wind_capacity) * 1000000u;
   if (!g_wind.Init(reinterpret_cast<ID3D12Device*>(g_device->get_native()), capacity)) {
     Log(reshade::log::level::error, "Wind motion vectors unavailable: " + g_wind.status());
@@ -1502,7 +1623,23 @@ void StartWind(effect_runtime* runtime) {
                                      std::to_string(capacity) + " vertices per frame.");
 }
 
+std::string PortStats() {
+  static uint64_t last_frame = 0, last_draws = 0, last_merges = 0;
+  const uint64_t frame = g_frame.load(), draws = g_wind_port.draws(), merges = g_wind_port.merges();
+  const double frames = static_cast<double>(std::max<uint64_t>(1, frame - last_frame));
+  char text[192];
+  std::snprintf(text, sizeof(text),
+                "wind (ported): %zu pipelines, %.0f draws and %.2f merges per frame, %llu errors",
+                g_wind_port.pipeline_count(), (draws - last_draws) / frames, (merges - last_merges) / frames,
+                static_cast<unsigned long long>(g_wind_errors.load()));
+  last_frame = frame;
+  last_draws = draws;
+  last_merges = merges;
+  return text;
+}
+
 std::string WindStats() {
+  if (g_port_ready.load()) return PortStats();
   static uint64_t last_frame = 0, last_draws = 0, last_vertices = 0, last_resolves = 0, last_patches = 0,
                   last_replaced = 0;
   const uint64_t frame = g_frame.load(), draws = g_wind.streamed_draws(), vertices = g_wind.streamed_vertices();
@@ -1532,6 +1669,9 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   if (g_config.wind_motion && g_wind_ready.load() && g_wind.IsWindPipeline(data->current.handle) &&
       StreamWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance))
     return true;  // drawn by the stream-output copy of the game's pipeline
+  if (g_config.wind_motion && g_port_ready.load() && g_wind_port.IsPortPipeline(data->current.handle) &&
+      PortWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance))
+    return true;  // drawn here, followed by its motion
   if (g_stats_remaining.load() > 0) CountMaterialDraw(cmd_list, *data, index_count, instance_count);
   if (data->pass == Pass::kToneMap) {
     if (!g_config.chromatic_aberration) RemoveChromaticAberration(cmd_list);
@@ -1564,6 +1704,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   }
   if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) {
     if (g_config.wind_motion && g_wind_ready.load()) ResolveWind(cmd_list, *data);
+    if (g_config.wind_motion && g_port_ready.load()) MergeWind(cmd_list, *data);
     if (g_dump_remaining.load() > 0) DumpTaaInputs(cmd_list);
     return ReplaceTaa(cmd_list, *data);
   }
@@ -1676,7 +1817,8 @@ void FinishRemote(const std::string& request, const std::string& result) {
 // "dlss off", "sharpen on", "strength 0.1", "preset 10", "ca off", "mv 8 grass", "vmask 1", "vmaskall on". The
 // result goes to remote.done.
 void OnReshadePresent(effect_runtime* runtime) {
-  if (g_config.wind_motion && !g_wind_ready.load() && !g_wind_failed.load()) StartWind(runtime);
+  if (g_config.wind_motion && !g_wind_ready.load() && !g_port_ready.load() && !g_wind_failed.load())
+    StartWind(runtime);
   static std::string dump_request;  // the pending "mv" command, answered once its frames are saved
   static std::string stats_request;  // the pending "vegstats" command
   static int stats_frames = 0;
@@ -1771,6 +1913,10 @@ void OnReshadePresent(effect_runtime* runtime) {
     g_wind.set_resolve_draw(arg != "off");
   } else if (command == "winddepth") {
     g_wind.set_depth_tolerance(std::strtof(arg.c_str(), nullptr));
+    g_wind_port.set_depth_tolerance(std::strtof(arg.c_str(), nullptr));
+  } else if (command == "windmerge") {
+    g_wind_port.set_merge(arg != "off");
+    g_wind_port.set_merge_debug(arg == "drawn" ? 2 : arg == "merged" ? 1 : 0);
   } else if (command == "windfull") {
     g_wind.set_full_draw(arg != "off");
   } else if (command == "winddebug") {
@@ -1830,9 +1976,13 @@ void OnOverlay(effect_runtime*) {
   if (g_config.wind_motion) {
     std::unique_lock lock(g_wind_mutex, std::try_to_lock);
     if (lock.owns_lock())
-      ImGui::Text("  %s, %zu pipelines, %llu errors%s%s", g_wind_ready.load() ? "running" : g_wind.status().c_str(),
-                  g_wind.pipeline_count(), static_cast<unsigned long long>(g_wind_errors.load()),
-                  g_wind_error.empty() ? "" : ": ", g_wind_error.c_str());
+      ImGui::Text("  %s, %zu pipelines, %llu errors%s%s",
+                  g_port_ready.load()   ? "running (ported shader)"
+                  : g_wind_ready.load() ? "running (stream output)"
+                                        : g_wind.status().c_str(),
+                  g_port_ready.load() ? g_wind_port.pipeline_count() : g_wind.pipeline_count(),
+                  static_cast<unsigned long long>(g_wind_errors.load()), g_wind_error.empty() ? "" : ": ",
+                  g_wind_error.c_str());
   }
   ImGui::Text("Texture mip bias: %+.2f on %llu samplers (MipBias in EldenRingDLSS.ini, needs a restart)",
               g_applied_mip_bias, static_cast<unsigned long long>(g_biased_samplers.load()));
