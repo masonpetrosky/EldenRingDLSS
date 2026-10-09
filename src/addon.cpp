@@ -81,6 +81,7 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   // Wind: the game's cbSceneParam/cbPerFrame addresses last patched in this command list and the patched slot.
   uint64_t wind_scene = 0, wind_frame = 0, wind_prev = 0;
   bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
+  bool tree_wind_patched = false;   // a tree wind copy was written in this command list
 };
 
 struct Config {
@@ -108,6 +109,10 @@ struct Config {
   // animated materials (wind.hpp). Read at startup.
   int wind_mode = 1;
   int wind_capacity = 8;  // stream output: millions of streamed vertices per frame
+  // Ported path: SpeedTree trees and shrubs through the stream-output path, with last frame's tree wind rebuilt on the
+  // GPU (tree_wind.hlsl); WindTreeCapacity is its millions of streamed vertices per frame.
+  bool wind_trees = true;
+  int wind_tree_capacity = 4;
   // Ported path, development option: replace the grass depth prepasses' pixel shader so they write the motion
   // themselves instead of drawing the batch a second time (wind_prepass.hlsl). Works, but costs more than the second
   // draw: the wind math runs for every prepass fragment, overdraw included (docs/recon.md).
@@ -293,6 +298,8 @@ void LoadConfig() {
   g_config.wind_capacity = std::max(1, std::min(ReadInt(L"WindCapacity", 8), 24));
   g_config.wind_mode = ReadInt(L"WindMode", 1) == 0 ? 0 : 1;
   g_config.wind_prepass = ReadInt(L"WindPrepass", 0) != 0;
+  g_config.wind_trees = ReadInt(L"WindTrees", 1) != 0;
+  g_config.wind_tree_capacity = std::max(1, std::min(ReadInt(L"WindTreeCapacity", 4), 16));
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
   g_config.flip_motion = ReadInt(L"FlipMotion", 0) != 0;
@@ -313,6 +320,8 @@ void SaveConfig() {
   WriteInt(L"WindCapacity", g_config.wind_capacity);
   WriteInt(L"WindMode", g_config.wind_mode);
   WriteInt(L"WindPrepass", g_config.wind_prepass);
+  WriteInt(L"WindTrees", g_config.wind_trees);
+  WriteInt(L"WindTreeCapacity", g_config.wind_tree_capacity);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
   WriteInt(L"FlipJitterY", g_config.flip_jitter_y);
   WriteInt(L"FlipMotion", g_config.flip_motion);
@@ -1009,6 +1018,12 @@ bool IsWindMaterial(const std::string& name) {
   return false;
 }
 
+// SpeedTree G-buffer shaders whose trees sway (billboards are flat far-away stand-ins without wind).
+bool IsTreeMaterial(const std::string& name) {
+  return name.rfind("SpeedTree_", 0) == 0 && name.find("_Gbuf@") != std::string::npos &&
+         name.find("billboard") == std::string::npos;
+}
+
 void SetWindError(const std::string& error) {
   ++g_wind_errors;
   if (g_wind_error.empty()) {
@@ -1288,7 +1303,8 @@ void RememberWindPipeline(device* dev, pipeline_layout layout, uint32_t count, c
   }
   WindSource& stored = g_wind_sources[p.handle];
   stored = std::move(source);
-  if (g_wind_ready.load()) AddWindPipeline(p.handle, stored);
+  if (g_wind_ready.load() && (g_config.wind_mode == 0 || IsTreeMaterial(stored.name)))
+    AddWindPipeline(p.handle, stored);
   if (g_port_ready.load()) AddPortPipeline(p.handle, stored);
 }
 
@@ -1448,6 +1464,79 @@ std::string WriteMaterialStats(int frames) {
 }
 
 // Streams the previous and current positions of an animated vegetation draw in the main camera's G-buffer pass.
+// Puts back the compute root signature and descriptor tables the game had bound, after an add-on compute pass.
+void RestoreCompute(command_list* cmd_list) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  if (state == nullptr) return;
+  for (const auto& [stages, entry] : state->descriptor_tables) {
+    if ((stages & shader_stage::all_compute) == 0 || entry.first == 0) continue;
+    native->SetComputeRootSignature(reinterpret_cast<ID3D12RootSignature*>(entry.first.handle));
+    for (uint32_t i = 0; i < entry.second.size(); ++i)
+      if (entry.second[i] != 0) cmd_list->bind_descriptor_tables(stages, entry.first, i, 1, &entry.second[i]);
+  }
+}
+
+// GPU addresses of a SpeedTree draw's wind inputs: cbSpeedTreeWind (vertex b13, and its size), cbInstanceData (pixel
+// b4), cbInstanceIdxParam (vertex b10) and g_InstanceIndexBuffer (vertex t25).
+struct TreeInputs {
+  D3D12_GPU_VIRTUAL_ADDRESS wind = 0, instances = 0, idx_param = 0, index_buffer = 0;
+  uint32_t wind_size = 0;
+};
+bool FindTreeInputs(device* dev, pipeline_layout layout, const std::vector<descriptor_table>& tables,
+                    TreeInputs* out) {
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (descriptors == nullptr) return false;
+  struct Source {
+    shader_stage stage;
+    RegisterKind kind;
+    uint32_t reg;
+  };
+  static const Source kSources[4] = {{shader_stage::vertex, RegisterKind::kConstantBuffer, 13},
+                                     {shader_stage::pixel, RegisterKind::kConstantBuffer, 4},
+                                     {shader_stage::vertex, RegisterKind::kConstantBuffer, 10},
+                                     {shader_stage::vertex, RegisterKind::kShaderResource, 25}};
+  D3D12_GPU_VIRTUAL_ADDRESS va[4] = {};
+  for (int i = 0; i < 4; ++i) {
+    descriptor_heap heap = {0};
+    uint32_t offset = 0;
+    if (!descriptors->Find(dev, layout, tables, kSources[i].stage, kSources[i].kind, kSources[i].reg, 0, &heap,
+                           &offset))
+      return false;
+    if (kSources[i].kind == RegisterKind::kConstantBuffer) {
+      const buffer_range range = descriptors->Buffer(heap, offset);
+      if (range.buffer == 0) return false;
+      va[i] = reinterpret_cast<ID3D12Resource*>(range.buffer.handle)->GetGPUVirtualAddress() + range.offset;
+      if (i == 0) out->wind_size = static_cast<uint32_t>(std::min<uint64_t>(range.size, 65536));
+    } else {
+      const resource_view view = descriptors->View(heap, offset);
+      const resource buffer = view != 0 ? dev->get_resource_from_view(view) : resource{0};
+      if (buffer == 0) return false;
+      va[i] = reinterpret_cast<ID3D12Resource*>(buffer.handle)->GetGPUVirtualAddress() +
+              dev->get_resource_view_desc(view).buffer.offset;
+    }
+  }
+  out->wind = va[0];
+  out->instances = va[1];
+  out->idx_param = va[2];
+  out->index_buffer = va[3];
+  return true;
+}
+
+// The vertex stage's cbSpeedTreeWind (b13) of the current draw, if it has one.
+D3D12_GPU_VIRTUAL_ADDRESS FindWind(device* dev, pipeline_layout layout, const std::vector<descriptor_table>& tables) {
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  descriptor_heap heap = {0};
+  uint32_t offset = 0;
+  buffer_range range = {};
+  if (descriptors == nullptr ||
+      !descriptors->Find(dev, layout, tables, shader_stage::vertex, RegisterKind::kConstantBuffer, 13, 0, &heap,
+                         &offset) ||
+      (range = descriptors->Buffer(heap, offset)).buffer == 0)
+    return 0;
+  return reinterpret_cast<ID3D12Resource*>(range.buffer.handle)->GetGPUVirtualAddress() + range.offset;
+}
+
 // Returns true when the game's draw was recorded here (with the stream-output copy of its pipeline), so the caller
 // skips the original.
 bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count, uint32_t instance_count,
@@ -1486,17 +1575,31 @@ bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
     data.wind_prev = g_wind.RecordPrevious(native, va[0], va[1]);
     data.wind_scene = va[0];
     data.wind_frame = va[1];
-    // The patch replaced the compute root signature and its arguments; put back any the game had set.
-    for (const auto& [stages, entry] : state->descriptor_tables) {
-      if ((stages & shader_stage::all_compute) == 0 || entry.first == 0) continue;
-      native->SetComputeRootSignature(reinterpret_cast<ID3D12RootSignature*>(entry.first.handle));
-      for (uint32_t i = 0; i < entry.second.size(); ++i)
-        if (entry.second[i] != 0) cmd_list->bind_descriptor_tables(stages, entry.first, i, 1, &entry.second[i]);
-    }
+    RestoreCompute(cmd_list);  // the patch replaced the compute root signature and its arguments
   }
   const D3D12_GPU_VIRTUAL_ADDRESS prev[2] = {data.wind_prev, data.wind_prev + erdlss::WindMotion::kPrevFrameOffset};
 
-  // The copies' root signature has the game's parameters at the same indices (b8/b9 come as root CBVs on top).
+  // SpeedTree: a copy of the draw's wind with every tree's wind from the previous frame, for the previous pose.
+  std::string name;
+  {
+    std::shared_lock lock(g_material_mutex);
+    const auto material = g_material_vs.find(data.current.handle);
+    if (material != g_material_vs.end()) name = material->second.name;
+  }
+  D3D12_GPU_VIRTUAL_ADDRESS wind = 0, prev_wind = 0;
+  TreeInputs tree;
+  if (IsTreeMaterial(name) && FindTreeInputs(dev, layout, tables, &tree)) {
+    wind = tree.wind;
+    prev_wind = g_wind.RecordTreeWind(native, tree.wind, tree.wind_size, tree.instances, tree.idx_param,
+                                      tree.index_buffer, instance_count,
+                                      static_cast<uint32_t>(std::hash<std::string>()(name)), !data.tree_wind_patched);
+    data.tree_wind_patched = true;
+    RestoreCompute(cmd_list);
+  } else {
+    wind = FindWind(dev, layout, tables);  // other shaders may still read b13, which the copies take out of the table
+  }
+
+  // The copies' root signature has the game's parameters at the same indices (b8/b9/b13 come as root CBVs on top).
   const pipeline_layout stream_layout = {reinterpret_cast<uint64_t>(stream_rs)};
   for (uint32_t i = 0; i < tables.size(); ++i)
     if (tables[i] != 0) cmd_list->bind_descriptor_tables(shader_stage::all_graphics, stream_layout, i, 1, &tables[i]);
@@ -1504,8 +1607,9 @@ bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
     g_wind.BindStreams(native);
     data.wind_streams_bound = true;
   }
-  const bool replaced = g_wind.RecordStreams(native, data.current.handle, va[0], va[1], prev[0], prev[1], index_count,
-                                             instance_count, first_index, vertex_offset, first_instance);
+  const bool replaced = g_wind.RecordStreams(native, data.current.handle, va[0], va[1], prev[0], prev[1], wind,
+                                             prev_wind, index_count, instance_count, first_index, vertex_offset,
+                                             first_instance);
   // Changing the root signature dropped every root argument; put the game's back, then its pipeline.
   for (uint32_t i = 0; i < tables.size(); ++i)
     if (tables[i] != 0) cmd_list->bind_descriptor_tables(shader_stage::all_graphics, layout, i, 1, &tables[i]);
@@ -1661,15 +1765,18 @@ void ResolveWind(command_list* cmd_list, const CmdData& data) {
     scene = g_scene;
   }
   auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
-  if (!g_wind.Resolve(native, reinterpret_cast<ID3D12Resource*>(motion.handle),
-                      reinterpret_cast<ID3D12Resource*>(depth.handle), md.texture.width, md.texture.height,
-                      scene.velocity_scale, scene.velocity_bias)) {
-    std::lock_guard lock(g_wind_mutex);
-    SetWindError("unexpected depth format at the TAA");
-    return;
+  g_wind.RecordFrameEnd(native);  // the tree wind table counts frames here, whether or not trees are drawn
+  if (g_config.wind_mode == 0 || g_config.wind_trees) {
+    if (g_wind.Resolve(native, reinterpret_cast<ID3D12Resource*>(motion.handle),
+                       reinterpret_cast<ID3D12Resource*>(depth.handle), md.texture.width, md.texture.height,
+                       scene.velocity_scale, scene.velocity_bias)) {
+      ++g_wind_resolves;
+    } else {
+      std::lock_guard lock(g_wind_mutex);
+      SetWindError("unexpected depth format at the TAA");
+    }
   }
-  ++g_wind_resolves;
-  RestoreTaaState(cmd_list, data);
+  RestoreTaaState(cmd_list, data);  // also the compute state and pipeline the frame count replaced
 }
 
 // Creates the wind resources on first use (they take video memory) and builds the stream-output pipelines.
@@ -1696,6 +1803,24 @@ void StartWind(effect_runtime* runtime) {
     Log(reshade::log::level::info, "Wind motion vectors on (ported shader): " +
                                        std::to_string(g_wind_port.pipeline_count()) + " grass-family pipelines, " +
                                        std::to_string(g_wind_port.replacement_count()) + " prepass replacements.");
+    // Trees: the stream-output path, for SpeedTree only.
+    const uint32_t tree_capacity = static_cast<uint32_t>(g_config.wind_tree_capacity) * 1000000u;
+    if (!g_wind.Init(reinterpret_cast<ID3D12Device*>(g_device->get_native()), tree_capacity)) {
+      Log(reshade::log::level::error, "Tree motion vectors unavailable: " + g_wind.status());
+      g_wind.Shutdown();
+      return;
+    }
+    g_wind.RecordSetup(
+        reinterpret_cast<ID3D12GraphicsCommandList*>(queue->get_immediate_command_list()->get_native()));
+    queue->flush_immediate_command_list();
+    queue->wait_idle();
+    for (auto& [pipeline, source] : g_wind_sources)
+      if (IsTreeMaterial(source.name)) AddWindPipeline(pipeline, source);
+    g_wind.MarkReady();
+    g_wind_ready = true;
+    Log(reshade::log::level::info, "Tree motion vectors on: " + std::to_string(g_wind.pipeline_count()) +
+                                       " SpeedTree pipelines, room for " + std::to_string(tree_capacity) +
+                                       " vertices per frame.");
     return;
   }
   const uint32_t capacity = static_cast<uint32_t>(g_config.wind_capacity) * 1000000u;
@@ -1736,8 +1861,25 @@ std::string PortStats() {
   return text;
 }
 
+std::string TreeStats() {
+  static uint64_t last_frame = 0, last_draws = 0, last_patches = 0, last_vertices = 0;
+  const uint64_t frame = g_frame.load(), draws = g_wind.streamed_draws(), patches = g_wind.tree_patches();
+  const uint64_t vertices = g_wind.streamed_vertices();
+  const double frames = static_cast<double>(std::max<uint64_t>(1, frame - last_frame));
+  char text[192];
+  std::snprintf(text, sizeof(text), "; trees (%s): %zu pipelines, %.0f draws, %.0f wind patches and %.2f M vertices "
+                "streamed per frame", g_config.wind_trees ? "on" : "off", g_wind.pipeline_count(),
+                (draws - last_draws) / frames, (patches - last_patches) / frames,
+                (vertices - last_vertices) / frames / 1e6);
+  last_frame = frame;
+  last_draws = draws;
+  last_patches = patches;
+  last_vertices = vertices;
+  return text;
+}
+
 std::string WindStats() {
-  if (g_port_ready.load()) return PortStats();
+  if (g_port_ready.load()) return PortStats() + (g_wind_ready.load() ? TreeStats() : std::string());
   static uint64_t last_frame = 0, last_draws = 0, last_vertices = 0, last_resolves = 0, last_patches = 0,
                   last_replaced = 0;
   const uint64_t frame = g_frame.load(), draws = g_wind.streamed_draws(), vertices = g_wind.streamed_vertices();
@@ -1771,57 +1913,21 @@ void TreeDumpDraw(command_list* cmd_list, const CmdData& data, uint32_t instance
     if (it == g_material_vs.end()) return;
     name = it->second.name;
   }
-  if (name.rfind("SpeedTree_", 0) != 0 || name.find("_Gbuf@") == std::string::npos) return;
+  if (!IsTreeMaterial(name)) return;
   device* const dev = cmd_list->get_device();
   auto* const state = cmd_list->get_private_data<state_tracking>();
-  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
-  if (state == nullptr || descriptors == nullptr || state->render_targets.size() != 5) return;
+  if (state == nullptr || state->render_targets.size() != 5) return;
   const resource rt0 = dev->get_resource_from_view(state->render_targets[0]);
   if (rt0 == 0 || dev->get_resource_desc(rt0).texture.width != g_render_width.load()) return;
   const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
   if (it == state->descriptor_tables.end() || it->second.first == 0) return;
-  const pipeline_layout layout = it->second.first;
-  const std::vector<descriptor_table>& tables = it->second.second;
-
-  // cbSpeedTreeWind (vertex b13), cbInstanceData (pixel b4), cbInstanceIdxParam (vertex b10) and
-  // g_InstanceIndexBuffer (vertex t25).
-  struct Source {
-    shader_stage stage;
-    RegisterKind kind;
-    uint32_t reg;
-  };
-  static const Source kSources[4] = {{shader_stage::vertex, RegisterKind::kConstantBuffer, 13},
-                                     {shader_stage::pixel, RegisterKind::kConstantBuffer, 4},
-                                     {shader_stage::vertex, RegisterKind::kConstantBuffer, 10},
-                                     {shader_stage::vertex, RegisterKind::kShaderResource, 25}};
-  D3D12_GPU_VIRTUAL_ADDRESS va[4] = {};
-  for (int i = 0; i < 4; ++i) {
-    descriptor_heap heap = {0};
-    uint32_t offset = 0;
-    if (!descriptors->Find(dev, layout, tables, kSources[i].stage, kSources[i].kind, kSources[i].reg, 0, &heap,
-                           &offset))
-      return;
-    if (kSources[i].kind == RegisterKind::kConstantBuffer) {
-      const buffer_range range = descriptors->Buffer(heap, offset);
-      if (range.buffer == 0) return;
-      va[i] = reinterpret_cast<ID3D12Resource*>(range.buffer.handle)->GetGPUVirtualAddress() + range.offset;
-    } else {
-      const resource_view view = descriptors->View(heap, offset);
-      const resource buffer = view != 0 ? dev->get_resource_from_view(view) : resource{0};
-      if (buffer == 0) return;
-      va[i] = reinterpret_cast<ID3D12Resource*>(buffer.handle)->GetGPUVirtualAddress() +
-              dev->get_resource_view_desc(view).buffer.offset;
-    }
-  }
+  TreeInputs tree;
+  if (!FindTreeInputs(dev, it->second.first, it->second.second, &tree)) return;
   auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
-  if (!g_tree_dump.Record(native, frame, name, va[0], va[1], va[2], va[3], instance_count)) return;
-  // The gather replaced the compute root signature and the pipeline; put back the game's.
-  for (const auto& [stages, entry] : state->descriptor_tables) {
-    if ((stages & shader_stage::all_compute) == 0 || entry.first == 0) continue;
-    native->SetComputeRootSignature(reinterpret_cast<ID3D12RootSignature*>(entry.first.handle));
-    for (uint32_t i = 0; i < entry.second.size(); ++i)
-      if (entry.second[i] != 0) cmd_list->bind_descriptor_tables(stages, entry.first, i, 1, &entry.second[i]);
-  }
+  if (!g_tree_dump.Record(native, frame, name, tree.wind, tree.instances, tree.idx_param, tree.index_buffer,
+                          instance_count))
+    return;
+  RestoreCompute(cmd_list);  // the gather replaced the compute root signature and the pipeline
   cmd_list->bind_pipeline(pipeline_stage::all, data.current);
 }
 
@@ -1830,7 +1936,8 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   if (g_tree_end.load() != 0) TreeDumpDraw(cmd_list, *data, instance_count);
-  if (g_config.wind_motion && g_wind_ready.load() && g_wind.IsWindPipeline(data->current.handle) &&
+  if (g_config.wind_motion && g_wind_ready.load() && (g_config.wind_mode == 0 || g_config.wind_trees) &&
+      g_wind.IsWindPipeline(data->current.handle) &&
       StreamWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance))
     return true;  // drawn by the stream-output copy of the game's pipeline
   if (g_config.wind_motion && g_config.wind_prepass && g_port_ready.load() &&
@@ -2111,6 +2218,8 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "winddepth") {
     g_wind.set_depth_tolerance(std::strtof(arg.c_str(), nullptr));
     g_wind_port.set_depth_tolerance(std::strtof(arg.c_str(), nullptr));
+  } else if (command == "windtrees") {
+    g_config.wind_trees = arg != "off";
   } else if (command == "windprepass") {
     g_config.wind_prepass = arg != "off";
   } else if (command == "windcost") {

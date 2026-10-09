@@ -41,8 +41,8 @@ class WindMotion {
 
   // Builds the stream-output copies of an animated material's G-buffer pipeline. `desc` is the game's pipeline
   // (without root signature and stream output); `layout` is its root layout, identified by `layout_key`. The copies
-  // use the same layout with the vertex stage's cbSceneParam (b8) and cbPerFrame (b9) moved to root CBVs, and allow
-  // stream output. Without a pixel shader in `desc` (or if the full copy fails) the current positions come from a
+  // use the same layout with the vertex stage's cbSceneParam (b8), cbPerFrame (b9) and, where the table has it,
+  // cbSpeedTreeWind (b13) moved to root CBVs, and allow stream output. Without a pixel shader in `desc` (or if the full copy fails) the current positions come from a
   // vertex-only pass instead of the game's draw.
   bool AddPipeline(uint64_t pipeline, const std::string& name, uint64_t layout_key,
                    const std::vector<RootParam>& layout, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc);
@@ -59,17 +59,33 @@ class WindMotion {
   D3D12_GPU_VIRTUAL_ADDRESS RecordPrevious(ID3D12GraphicsCommandList* cmd, D3D12_GPU_VIRTUAL_ADDRESS scene,
                                            D3D12_GPU_VIRTUAL_ADDRESS frame);
 
+  // SpeedTree: records a compute pass (tree_wind.hlsl) that writes a copy of a tree draw's cbSpeedTreeWind in which
+  // every tree has its wind from the previous frame, found in a table keyed by the tree's position. `wind` and
+  // `wind_size` are the draw's cbSpeedTreeWind, `instances` its cbInstanceData (pixel stage), `idx_param` its
+  // cbInstanceIdxParam, `index_buffer` its g_InstanceIndexBuffer; `model` identifies the drawing shader.
+  // `first_in_list`: the first tree patch of this command list. Returns the copy's address (0 if `wind_size` is too
+  // large). Leaves its compute root signature and pipeline bound; the caller restores the game's.
+  D3D12_GPU_VIRTUAL_ADDRESS RecordTreeWind(ID3D12GraphicsCommandList* cmd, D3D12_GPU_VIRTUAL_ADDRESS wind,
+                                           uint32_t wind_size, D3D12_GPU_VIRTUAL_ADDRESS instances,
+                                           D3D12_GPU_VIRTUAL_ADDRESS idx_param, D3D12_GPU_VIRTUAL_ADDRESS index_buffer,
+                                           uint32_t instance_count, uint32_t model, bool first_in_list);
+  // Counts a frame for the tree wind table; once per frame after its last tree draw (at the TAA). Leaves its compute
+  // root signature and pipeline bound.
+  void RecordFrameEnd(ID3D12GraphicsCommandList* cmd);
+
   // Binds both stream buffers (previous to slot 0, current to slot 1) for the rest of a command list. Call once per
   // command list before its first RecordStreams: re-binding between draws reloads the fill counters from memory
   // before earlier draws have written them back, and appends get lost.
   void BindStreams(ID3D12GraphicsCommandList* cmd);
 
-  // Records the previous-position pass and the current-position pass for an indexed draw. Returns true when the
+  // Records the previous-position pass and the current-position pass for an indexed draw. `wind` and `prev_wind`
+  // are cbSpeedTreeWind for the two passes (0: none; only bound if the copies' layout has b13). Returns true when the
   // current pass was the game's own draw (the caller skips the original), false when it only streamed positions.
   // Leaves a stream-output pipeline bound; the caller restores the game's root signature, tables and pipeline.
   bool RecordStreams(ID3D12GraphicsCommandList* cmd, uint64_t pipeline, D3D12_GPU_VIRTUAL_ADDRESS scene,
                      D3D12_GPU_VIRTUAL_ADDRESS frame, D3D12_GPU_VIRTUAL_ADDRESS prev_scene,
-                     D3D12_GPU_VIRTUAL_ADDRESS prev_frame, uint32_t index_count, uint32_t instance_count,
+                     D3D12_GPU_VIRTUAL_ADDRESS prev_frame, D3D12_GPU_VIRTUAL_ADDRESS wind,
+                     D3D12_GPU_VIRTUAL_ADDRESS prev_wind, uint32_t index_count, uint32_t instance_count,
                      uint32_t first_index, int32_t vertex_offset, uint32_t first_instance);
 
   // Rasterizes the frame's streamed vegetation into `motion` (R16G16_FLOAT, in the all-shader-resource state) where its
@@ -93,6 +109,7 @@ class WindMotion {
   uint64_t streamed_draws() const { return streamed_draws_.load(); }
   uint64_t replaced_draws() const { return replaced_draws_.load(); }
   uint64_t patches() const { return patches_.load(); }
+  uint64_t tree_patches() const { return tree_patches_.load(); }
   uint64_t streamed_vertices() const { return streamed_vertices_.load(); }
   size_t pipeline_count() const;
   size_t full_pipeline_count() const;
@@ -101,6 +118,7 @@ class WindMotion {
   struct Root {
     ID3D12RootSignature* signature = nullptr;
     UINT scene_param = 0, frame_param = 0;  // root CBVs for the vertex stage's b8 / b9
+    UINT wind_param = UINT32_MAX;           // root CBV for its b13 (cbSpeedTreeWind), if its table covers it
   };
   struct StreamPipelines {
     ID3D12PipelineState* prev = nullptr;  // vertex only, writes slot 0
@@ -129,6 +147,15 @@ class WindMotion {
   ID3D12Resource* ring_ = nullptr;     // previous-frame constants, written by RecordPrevious; at rest as CBV
   std::atomic<uint64_t> ring_next_{0};
   std::atomic<uint64_t> last_slot_{0};
+  // Tree wind (tree_wind.hlsl): the frame counter and two tables (this frame's and last frame's tree wind entries,
+  // UAV), and a ring of patched cbSpeedTreeWind copies (written as UAV, read as CBV).
+  ID3D12RootSignature* tree_rs_ = nullptr;
+  ID3D12PipelineState* tree_patch_pso_ = nullptr;
+  ID3D12PipelineState* tree_clear_pso_ = nullptr;
+  ID3D12PipelineState* tree_advance_pso_ = nullptr;
+  ID3D12Resource* tree_table_ = nullptr;
+  ID3D12Resource* tree_ring_ = nullptr;
+  std::atomic<uint64_t> tree_ring_next_{0};  // bytes
   ID3D12Resource* debug_ = nullptr;    // readback: fill counters, first streamed vertices, last patched slot
   std::atomic<bool> debug_request_{false};
   std::atomic<bool> debug_captured_{false};
@@ -151,6 +178,7 @@ class WindMotion {
   std::atomic<uint64_t> replaced_draws_{0};
   std::atomic<uint64_t> streamed_vertices_{0};
   std::atomic<uint64_t> patches_{0};
+  std::atomic<uint64_t> tree_patches_{0};
 };
 
 }  // namespace erdlss

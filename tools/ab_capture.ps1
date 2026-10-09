@@ -24,7 +24,7 @@
 # step and with wind off, frame times with everything on, without the merge, and with wind off.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
-               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump')][string]$Round = 'sharpen',
+               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -169,6 +169,28 @@ if ($Round -eq 'sharpen') {
   Send 'vmask 0'
 } elseif ($Round -eq 'mv') {
   Send 'mv 8 still_a' 1.0; Send 'mv 8 still_b'
+} elseif ($Round -eq 'trees') {
+  # Tree motion: what still moves without motion vectors with trees off and on (two 8-frame dumps a second apart
+  # each, mv_check.py --compare), screenshots, then frame times (wind off, grass only, grass and trees).
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
+  $trees = if ($ini -match '^WindTrees=0') { 'off' } else { 'on' }
+  Send 'dlss on'; Send 'wind on' 3.0
+  foreach ($mode in 'off', 'on') {
+    Send "windtrees $mode" 2.0; Send 'windstats' 1.0; Send 'windstats'
+    Send "mv 8 tree_${mode}_a" 1.0; Send "mv 8 tree_${mode}_b"; Send "capture tree_shot_$mode"
+  }
+  Send 'wind off' 1.0; LogFrames 'tree_wind_off'
+  Send 'wind on'; Send 'windtrees off' 3.0; LogFrames 'tree_grass_only'
+  Send 'windtrees on' 2.0; LogFrames 'tree_grass_trees'
+  Send 'wind off' 1.0; LogFrames 'tree_wind_off2'
+  Send "windtrees $trees"; Send "wind $restore"
+} elseif ($Round -eq 'treecost') {
+  # Where the trees' cost goes: grass and trees with and without the resolve draw, grass only.
+  Send 'dlss on'; Send 'wind on'; Send 'windtrees on' 3.0; LogFrames 'tc_trees'
+  Send 'windresolve off' 1.0; LogFrames 'tc_noresolve'; Send 'windresolve on'
+  Send 'windtrees off' 1.0; LogFrames 'tc_grass'
+  Send 'windtrees on' 2.0; LogFrames 'tc_trees2'
 } elseif ($Round -eq 'treedump') {
   # SpeedTree wind of 8 consecutive frames (tools/tree_check.py).
   Send 'treedump 8'

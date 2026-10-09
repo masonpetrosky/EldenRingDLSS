@@ -437,3 +437,30 @@ API, so commands recorded natively into it are silently dropped. The dump's read
 `copy_buffer_region`. `StartWind`'s native setup recordings (`WindPort::RecordSetup`, `WindMotion::RecordSetup`) have
 the same problem; they appear harmless because committed resources start zeroed and buffers promote from the common
 state implicitly.
+
+## Tree motion vectors: working (2026-10-09)
+
+With the ported grass path (`WindMode=1`), `WindTrees=1` (dev remote `windtrees on|off`) also starts the stream-output
+path for SpeedTree only (not billboards). Its root signature copy now also takes the vertex stage's `b13`
+(`cbSpeedTreeWind`) out of the table into a root CBV. Before each tree draw, `tree_wind.hlsl` looks every tree up by
+position and shader in two GPU hash tables (this frame's and last frame's wind entries, swapped and cleared at the
+TAA, where a GPU frame counter advances) and writes a copy of the draw's `cbSpeedTreeWind` with last frame's entry per
+tree; the previous-pose pass replays the game's vertex shader with it. Trees not drawn last frame keep the current
+entry (no wind motion). `WindTreeCapacity` (millions of streamed vertices, default 4).
+
+Same forest edge as the survey (`ab_capture.ps1 -Round trees`): 44 tree draws, 0.6 M vertices per frame.
+
+| | trees off | trees on |
+| --- | --- | --- |
+| changed pixels without motion vectors, whole frame | 42.7% | 4.4% |
+| tree canopy: changed without motion vectors | 100% | 4.6% |
+| tree canopy: pixels with motion | 0% | 80% (median 0.36 px) |
+| bushes: changed without motion vectors | 66% | 5.7% |
+
+What stays uncovered is mostly sky (clouds), the character's outlines and the golden `WorldTree_Leaves` tree. The user
+saw nothing wrong on the trees.
+
+Cost (4K DLAA, `-Round trees` and `-Round treecost`): wind off 9.26 ms, grass only 10.07-10.20 ms, grass and trees
+11.23-11.38 ms, so trees add about 1.2 ms. The resolve draw is 0.23 ms of it (it runs over the whole 4 M vertex
+capacity); the rest is the stream-output passes (the previous-pose replay and the game's draw, both without vertex
+reuse) and the per-draw wind patches.

@@ -67,6 +67,9 @@ shader(kWindPatchCs wind_patch.hlsl cs_5_0 main)
 shader(kWindMergeVs wind_merge.hlsl vs_5_0 VSMain)
 shader(kWindMergePs wind_merge.hlsl ps_5_0 PSMain)
 shader(kTreeDumpCs tree_dump.hlsl cs_5_0 main)
+shader(kTreeWindPatchCs tree_wind.hlsl cs_5_0 Patch)
+shader(kTreeWindClearCs tree_wind.hlsl cs_5_0 Clear)
+shader(kTreeWindAdvanceCs tree_wind.hlsl cs_5_0 Advance)
 # Ported grass shaders: per material a fused (default), an unfused and a static vertex shader (the latter two for cost
 # measurements), and the alpha-tested pixel shaders.
 foreach(variant FUSED UNFUSED STATIC)

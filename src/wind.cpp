@@ -13,6 +13,9 @@
 #include "kWindPatchCs.h"
 #include "kWindResolvePs.h"
 #include "kWindResolveVs.h"
+#include "kTreeWindAdvanceCs.h"
+#include "kTreeWindClearCs.h"
+#include "kTreeWindPatchCs.h"
 
 namespace erdlss {
 namespace {
@@ -24,6 +27,9 @@ constexpr uint32_t kRingSlots = 1024;
 constexpr uint32_t kResolveSlots = 8;
 constexpr D3D12_RESOURCE_STATES kShaderResource =
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+constexpr uint32_t kTreeSlots = 8192;  // trees per wind table (a power of two); one table per frame parity
+constexpr uint64_t kTreeTableSize = 256 + 2ull * kTreeSlots * (32 + 272);
+constexpr uint64_t kTreeRingSize = 8ull << 20;  // patched cbSpeedTreeWind copies
 constexpr uint32_t kDebugVertices = 64;
 constexpr uint32_t kDebugFilled = 0, kDebugPrev = 256, kDebugCur = kDebugPrev + kDebugVertices * 16,
                    kDebugSlot = kDebugCur + kDebugVertices * 16, kDebugSize = kDebugSlot + 4096;
@@ -71,6 +77,49 @@ bool WindMotion::Init(ID3D12Device* device, uint32_t capacity) {
     status_ = "patch pipeline creation failed";
     return false;
   }
+
+  // Tree wind: wind, instance data and index offset as root CBVs, the index buffer as a root SRV, the table and the
+  // output copy as root UAVs, then the instance count, shader and table mask as root constants.
+  D3D12_ROOT_PARAMETER tree_params[7] = {};
+  for (UINT i = 0; i < 3; ++i) {
+    tree_params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    tree_params[i].Descriptor = {i, 0};
+  }
+  tree_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+  tree_params[3].Descriptor = {0, 0};
+  tree_params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  tree_params[4].Descriptor = {0, 0};
+  tree_params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  tree_params[5].Descriptor = {1, 0};
+  tree_params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  tree_params[6].Constants = {3, 0, 3};
+  const D3D12_ROOT_SIGNATURE_DESC tree_desc = {7, tree_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  tree_rs_ = CreateRootSignature(device, tree_desc);
+  compute.pRootSignature = tree_rs_;
+  compute.CS = {kTreeWindPatchCs, sizeof(kTreeWindPatchCs)};
+  if (tree_rs_ == nullptr || FAILED(device->CreateComputePipelineState(&compute, IID_PPV_ARGS(&tree_patch_pso_)))) {
+    status_ = "tree wind pipeline creation failed";
+    return false;
+  }
+  compute.CS = {kTreeWindClearCs, sizeof(kTreeWindClearCs)};
+  if (FAILED(device->CreateComputePipelineState(&compute, IID_PPV_ARGS(&tree_clear_pso_)))) {
+    status_ = "tree wind pipeline creation failed";
+    return false;
+  }
+  compute.CS = {kTreeWindAdvanceCs, sizeof(kTreeWindAdvanceCs)};
+  if (FAILED(device->CreateComputePipelineState(&compute, IID_PPV_ARGS(&tree_advance_pso_)))) {
+    status_ = "tree wind pipeline creation failed";
+    return false;
+  }
+  tree_table_ = CreateBuffer(device, kTreeTableSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  tree_ring_ = CreateBuffer(device, kTreeRingSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  if (tree_table_ == nullptr || tree_ring_ == nullptr) {
+    status_ = "tree wind buffer creation failed";
+    return false;
+  }
+  tree_table_->SetName(L"EldenRingDLSS tree wind table");
 
   prev_ = CreateBuffer(device, static_cast<uint64_t>(capacity_) * kStride, D3D12_HEAP_TYPE_DEFAULT,
                        D3D12_RESOURCE_STATE_COMMON);
@@ -136,6 +185,12 @@ void WindMotion::Shutdown() {
   Release(debug_);
   Release(patch_pso_);
   Release(patch_rs_);
+  Release(tree_patch_pso_);
+  Release(tree_advance_pso_);
+  Release(tree_clear_pso_);
+  Release(tree_rs_);
+  Release(tree_table_);
+  Release(tree_ring_);
   Release(srv_heap_);
   Release(rtv_heap_);
   Release(dsv_heap_);
@@ -158,7 +213,7 @@ void WindMotion::RecordSetup(ID3D12GraphicsCommandList* cmd) {
   cmd->ResourceBarrier(1, &back);
 }
 
-// The game's layout with the vertex stage's b8 and b9 (space 0) taken out of their descriptor tables (the other
+// The game's layout with the vertex stage's b8, b9 and b13 (space 0) taken out of their descriptor tables (the other
 // descriptors keep their offsets) and given root CBVs at the end, plus permission for stream output.
 bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layout, Root* root) {
   {
@@ -171,7 +226,8 @@ bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layo
   }
   std::vector<std::vector<D3D12_DESCRIPTOR_RANGE>> ranges(layout.size());
   std::vector<D3D12_ROOT_PARAMETER> params(layout.size());
-  bool moved[2] = {false, false};
+  static const uint32_t kMoved[3] = {8, 9, 13};
+  bool moved[3] = {false, false, false};
   for (size_t i = 0; i < layout.size(); ++i) {
     const RootParam& p = layout[i];
     D3D12_ROOT_PARAMETER& out = params[i];
@@ -188,24 +244,28 @@ bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layo
     for (const D3D12_DESCRIPTOR_RANGE& r : p.ranges) {
       const bool vertex_cbv = r.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV && r.RegisterSpace == 0 &&
                               p.visibility == D3D12_SHADER_VISIBILITY_VERTEX;
-      const bool covers = vertex_cbv && r.BaseShaderRegister <= 9 &&
-                          (r.NumDescriptors == UINT_MAX || r.BaseShaderRegister + r.NumDescriptors > 8);
+      bool covers = false;
+      for (const uint32_t reg : kMoved)
+        covers |= vertex_cbv && r.BaseShaderRegister <= reg &&
+                  (r.NumDescriptors == UINT_MAX || r.BaseShaderRegister + r.NumDescriptors > reg);
       if (!covers) {
         ranges[i].push_back(r);
         continue;
       }
       if (r.NumDescriptors == UINT_MAX || r.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
         return false;
-      // Split around b8/b9, keeping each register at its descriptor offset.
+      // Split around the moved registers, keeping each other register at its descriptor offset.
       uint32_t start = r.BaseShaderRegister;
       const uint32_t end = r.BaseShaderRegister + r.NumDescriptors;
       for (uint32_t reg = r.BaseShaderRegister; reg <= end; ++reg) {
-        const bool cut = reg == end || reg == 8 || reg == 9;
-        if (!cut) continue;
+        int which = -1;
+        for (int k = 0; k < 3; ++k)
+          if (reg != end && reg == kMoved[k]) which = k;
+        if (reg != end && which < 0) continue;
         if (reg > start)
           ranges[i].push_back({r.RangeType, reg - start, start, 0,
                                r.OffsetInDescriptorsFromTableStart + (start - r.BaseShaderRegister)});
-        if (reg == 8 || reg == 9) moved[reg - 8] = true;
+        if (which >= 0) moved[which] = true;
         start = reg + 1;
       }
     }
@@ -215,10 +275,12 @@ bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layo
   Root made;
   made.scene_param = static_cast<UINT>(params.size());
   made.frame_param = made.scene_param + 1;
-  for (UINT reg = 8; reg <= 9; ++reg) {
+  for (int k = 0; k < 3; ++k) {
+    if (!moved[k]) continue;
+    if (k == 2) made.wind_param = static_cast<UINT>(params.size());
     D3D12_ROOT_PARAMETER cbv = {};
     cbv.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    cbv.Descriptor = {reg, 0};
+    cbv.Descriptor = {kMoved[k], 0};
     cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     params.push_back(cbv);
   }
@@ -343,6 +405,61 @@ D3D12_GPU_VIRTUAL_ADDRESS WindMotion::RecordPrevious(ID3D12GraphicsCommandList* 
   return slot;
 }
 
+D3D12_GPU_VIRTUAL_ADDRESS WindMotion::RecordTreeWind(ID3D12GraphicsCommandList* cmd, D3D12_GPU_VIRTUAL_ADDRESS wind,
+                                                     uint32_t wind_size, D3D12_GPU_VIRTUAL_ADDRESS instances,
+                                                     D3D12_GPU_VIRTUAL_ADDRESS idx_param,
+                                                     D3D12_GPU_VIRTUAL_ADDRESS index_buffer, uint32_t instance_count,
+                                                     uint32_t model, bool first_in_list) {
+  const uint64_t size = (static_cast<uint64_t>(wind_size) + 255) & ~255ull;
+  if (size == 0 || size > 65536) return 0;
+  uint64_t offset = tree_ring_next_.fetch_add(size);
+  if (offset % kTreeRingSize + size > kTreeRingSize) offset = tree_ring_next_.fetch_add(size);  // skip the wrap
+  const D3D12_GPU_VIRTUAL_ADDRESS copy = tree_ring_->GetGPUVirtualAddress() + offset % kTreeRingSize;
+  // Buffers start every command list in the common state and are promoted implicitly on their first use, so the ring
+  // only needs to be taken out of the constant-buffer state after an earlier patch of the same list.
+  if (!first_in_list) {
+    const D3D12_RESOURCE_BARRIER to =
+        Transition(tree_ring_, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cmd->ResourceBarrier(1, &to);
+  }
+  cmd->SetComputeRootSignature(tree_rs_);
+  cmd->SetPipelineState(tree_patch_pso_);
+  cmd->SetComputeRootConstantBufferView(0, wind);
+  cmd->SetComputeRootConstantBufferView(1, instances);
+  cmd->SetComputeRootConstantBufferView(2, idx_param);
+  cmd->SetComputeRootShaderResourceView(3, index_buffer);
+  cmd->SetComputeRootUnorderedAccessView(4, tree_table_->GetGPUVirtualAddress());
+  cmd->SetComputeRootUnorderedAccessView(5, copy);
+  const uint32_t args[3] = {instance_count, model, kTreeSlots - 1};
+  cmd->SetComputeRoot32BitConstants(6, 3, args, 0);
+  cmd->Dispatch((instance_count + 63) / 64, 1, 1);
+  D3D12_RESOURCE_BARRIER after[2] = {};
+  after[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;  // the next patch may see the same trees
+  after[0].UAV.pResource = tree_table_;
+  after[1] =
+      Transition(tree_ring_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+  cmd->ResourceBarrier(2, after);
+  ++tree_patches_;
+  return copy;
+}
+
+void WindMotion::RecordFrameEnd(ID3D12GraphicsCommandList* cmd) {
+  D3D12_RESOURCE_BARRIER uav = {};
+  uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  uav.UAV.pResource = tree_table_;
+  cmd->ResourceBarrier(1, &uav);
+  cmd->SetComputeRootSignature(tree_rs_);
+  cmd->SetComputeRootUnorderedAccessView(4, tree_table_->GetGPUVirtualAddress());
+  const uint32_t args[3] = {0, 0, kTreeSlots - 1};
+  cmd->SetComputeRoot32BitConstants(6, 3, args, 0);
+  cmd->SetPipelineState(tree_clear_pso_);  // empty the next frame's table ...
+  cmd->Dispatch(kTreeSlots / 64, 1, 1);
+  cmd->ResourceBarrier(1, &uav);
+  cmd->SetPipelineState(tree_advance_pso_);  // ... and move on to it
+  cmd->Dispatch(1, 1, 1);
+  cmd->ResourceBarrier(1, &uav);
+}
+
 void WindMotion::BindStreams(ID3D12GraphicsCommandList* cmd) {
   // Wait for earlier command lists' stream output to write its fill counters back before this list loads them.
   const D3D12_RESOURCE_BARRIER flush[] = {
@@ -360,7 +477,8 @@ void WindMotion::BindStreams(ID3D12GraphicsCommandList* cmd) {
 
 bool WindMotion::RecordStreams(ID3D12GraphicsCommandList* cmd, uint64_t pipeline, D3D12_GPU_VIRTUAL_ADDRESS scene,
                                D3D12_GPU_VIRTUAL_ADDRESS frame, D3D12_GPU_VIRTUAL_ADDRESS prev_scene,
-                               D3D12_GPU_VIRTUAL_ADDRESS prev_frame, uint32_t index_count, uint32_t instance_count,
+                               D3D12_GPU_VIRTUAL_ADDRESS prev_frame, D3D12_GPU_VIRTUAL_ADDRESS wind,
+                               D3D12_GPU_VIRTUAL_ADDRESS prev_wind, uint32_t index_count, uint32_t instance_count,
                                uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
   StreamPipelines psos;
   {
@@ -372,11 +490,14 @@ bool WindMotion::RecordStreams(ID3D12GraphicsCommandList* cmd, uint64_t pipeline
   cmd->SetPipelineState(psos.prev);
   cmd->SetGraphicsRootConstantBufferView(psos.root.scene_param, prev_scene);
   cmd->SetGraphicsRootConstantBufferView(psos.root.frame_param, prev_frame);
+  const bool wind_bound = psos.root.wind_param != UINT32_MAX && wind != 0;
+  if (wind_bound) cmd->SetGraphicsRootConstantBufferView(psos.root.wind_param, prev_wind != 0 ? prev_wind : wind);
   cmd->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
   const bool full = psos.full != nullptr && full_draw_.load();
   cmd->SetPipelineState(full ? psos.full : psos.cur);
   cmd->SetGraphicsRootConstantBufferView(psos.root.scene_param, scene);
   cmd->SetGraphicsRootConstantBufferView(psos.root.frame_param, frame);
+  if (wind_bound) cmd->SetGraphicsRootConstantBufferView(psos.root.wind_param, wind);
   cmd->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
   ++streamed_draws_;
   if (full) ++replaced_draws_;
