@@ -76,6 +76,9 @@ struct Config {
   int toggle_key = VK_F9;
   bool game_sharpening = false;  // run the game's TAA sharpening filter on the DLSS output
   bool game_exposure = true;     // give DLSS the tonemapper's exposure instead of letting it estimate one
+  // Texture LOD bias for material samplers. NVIDIA's guidance is native bias + log2(render / display) - 1, i.e.
+  // -1 for DLAA; the game's own samplers use 0. Samplers are created at startup, so changes need a restart.
+  float mip_bias = -1.0f;
   bool flip_jitter_x = false;
   bool flip_jitter_y = false;
   bool flip_motion = false;
@@ -123,6 +126,9 @@ resource g_exposure = {0};
 resource g_exposure_upload = {0};
 uint8_t* g_exposure_mapped = nullptr;
 
+float g_applied_mip_bias = 0.0f;  // bias in effect for this session (fixed at startup)
+std::atomic<uint64_t> g_biased_samplers{0};
+
 std::atomic<uint64_t> g_taa_draws{0};
 std::atomic<uint64_t> g_dlss_frames{0};
 std::atomic<uint64_t> g_failures{0};
@@ -144,12 +150,27 @@ void WriteInt(const wchar_t* key, int value) {
   WritePrivateProfileStringW(L"EldenRingDLSS", key, std::to_wstring(value).c_str(), g_ini_path.c_str());
 }
 
+float ReadFloat(const wchar_t* key, float fallback) {
+  wchar_t text[32] = {};
+  GetPrivateProfileStringW(L"EldenRingDLSS", key, L"", text, 32, g_ini_path.c_str());
+  wchar_t* end = nullptr;
+  const float value = std::wcstof(text, &end);
+  return end != text ? value : fallback;
+}
+
+void WriteFloat(const wchar_t* key, float value) {
+  wchar_t text[32];
+  std::swprintf(text, 32, L"%.2f", value);
+  WritePrivateProfileStringW(L"EldenRingDLSS", key, text, g_ini_path.c_str());
+}
+
 void LoadConfig() {
   g_config.enabled = ReadInt(L"Enabled", 0) != 0;
   g_config.preset = ReadInt(L"Preset", 0);
   g_config.toggle_key = ReadInt(L"ToggleKey", VK_F9);
   g_config.game_sharpening = ReadInt(L"GameSharpening", 0) != 0;
   g_config.game_exposure = ReadInt(L"GameExposure", 1) != 0;
+  g_config.mip_bias = ReadFloat(L"MipBias", -1.0f);
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
   g_config.flip_motion = ReadInt(L"FlipMotion", 0) != 0;
@@ -162,6 +183,7 @@ void SaveConfig() {
   WriteInt(L"ToggleKey", g_config.toggle_key);
   WriteInt(L"GameSharpening", g_config.game_sharpening);
   WriteInt(L"GameExposure", g_config.game_exposure);
+  WriteFloat(L"MipBias", g_config.mip_bias);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
   WriteInt(L"FlipJitterY", g_config.flip_jitter_y);
   WriteInt(L"FlipMotion", g_config.flip_motion);
@@ -485,12 +507,14 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   data.dlss_applied = true;
   const uint64_t frames = ++g_dlss_frames;
   if (frames == 1 || frames % 3000 == 0) {
-    char text[256];
+    char text[320];
     std::snprintf(text, sizeof(text),
-                  "DLSS frame %llu: jitter %+.3f %+.3f px, exposure %.3g (%s), failures %llu, game sharpening %s",
+                  "DLSS frame %llu: jitter %+.3f %+.3f px, exposure %.3g (%s), failures %llu, game sharpening %s, "
+                  "mip bias %+.2f on %llu samplers",
                   static_cast<unsigned long long>(frames), in.jitter_x, in.jitter_y, scene.exposure,
                   game_exposure ? "game" : "auto", static_cast<unsigned long long>(g_failures.load()),
-                  g_config.game_sharpening ? "on" : "off");
+                  g_config.game_sharpening ? "on" : "off", g_applied_mip_bias,
+                  static_cast<unsigned long long>(g_biased_samplers.load()));
     Log(reshade::log::level::info, text);
   }
   return true;
@@ -547,6 +571,21 @@ void OnDestroyDevice(device* dev) {
   g_exposure_mapped = nullptr;
   g_dlss.Shutdown();
   g_device = nullptr;
+}
+
+// Material textures use anisotropic or wrapping samplers with a mip chain; post-processing, UI and shadow
+// lookups use clamped or comparison samplers, which keep the game's bias.
+bool OnCreateSampler(device*, sampler_desc& desc) {
+  if (g_applied_mip_bias == 0.0f || desc.max_lod <= 0.0f) return false;
+  const auto filter = static_cast<uint32_t>(desc.filter);
+  if ((filter & 0x80) != 0) return false;  // comparison filter
+  const bool anisotropic = desc.filter == filter_mode::anisotropic ||
+                           desc.filter == filter_mode::min_mag_anisotropic_mip_point;
+  const bool wraps = desc.address_u == texture_address_mode::wrap || desc.address_v == texture_address_mode::wrap;
+  if (!anisotropic && !wraps) return false;
+  desc.mip_lod_bias += g_applied_mip_bias;
+  ++g_biased_samplers;
+  return true;
 }
 
 void OnInitCommandList(command_list* cmd_list) { cmd_list->create_private_data<CmdData>(); }
@@ -725,6 +764,8 @@ void OnOverlay(effect_runtime*) {
     SaveConfig();
   }
   ImGui::SetItemTooltip("Gives DLSS the tonemapper's exposure. Off lets DLSS estimate exposure itself.");
+  ImGui::Text("Texture mip bias: %+.2f on %llu samplers (MipBias in EldenRingDLSS.ini, needs a restart)",
+              g_applied_mip_bias, static_cast<unsigned long long>(g_biased_samplers.load()));
 
   {
     std::unique_lock lock(g_dlss_mutex, std::try_to_lock);
@@ -762,8 +803,12 @@ void Initialize(HMODULE module) {
   g_addon_dir = fs::path(path).parent_path();
   g_ini_path = g_addon_dir / L"EldenRingDLSS.ini";
   LoadConfig();
-  Log(reshade::log::level::info, std::string("Loaded. DLSS ") + (g_config.enabled ? "on" : "off") +
-                                     "; toggle key " + std::to_string(g_config.toggle_key) + ".");
+  // The bias is baked into samplers as the game creates them, so it follows the DLSS setting at startup.
+  g_applied_mip_bias = g_config.enabled ? g_config.mip_bias : 0.0f;
+  char text[160];
+  std::snprintf(text, sizeof(text), "Loaded. DLSS %s; toggle key %d; texture mip bias %+.2f.",
+                g_config.enabled ? "on" : "off", g_config.toggle_key, g_applied_mip_bias);
+  Log(reshade::log::level::info, text);
 }
 
 }  // namespace
@@ -780,6 +825,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::register_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
+      reshade::register_event<reshade::addon_event::create_sampler>(OnCreateSampler);
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
