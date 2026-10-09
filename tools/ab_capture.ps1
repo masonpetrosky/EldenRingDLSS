@@ -24,7 +24,7 @@
 # step and with wind off, frame times with everything on, without the merge, and with wind off.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
-               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey')][string]$Round = 'sharpen',
+               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -169,6 +169,9 @@ if ($Round -eq 'sharpen') {
   Send 'vmask 0'
 } elseif ($Round -eq 'mv') {
   Send 'mv 8 still_a' 1.0; Send 'mv 8 still_b'
+} elseif ($Round -eq 'treedump') {
+  # SpeedTree wind of 8 consecutive frames (tools/tree_check.py).
+  Send 'treedump 8'
 } elseif ($Round -eq 'survey') {
   # What still moves without motion vectors with the grass wind motion on: two 8-frame dumps a second apart
   # (mv_check.py --compare), the grass pass's coverage marks and a screenshot.

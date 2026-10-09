@@ -414,3 +414,26 @@ Which materials those are, from a RenderDoc capture of the same view (`er117_tre
 So the bushes here are SpeedTree shrubs too, and SpeedTree is nearly all the motion left uncovered. Each tree's eight
 wind clocks share one per-tree offset, so every tree of a model advances by the same amounts per frame: matching
 one tree per model between frames gives last frame's clocks for all of them.
+
+### Last frame's tree wind can be rebuilt (2026-10-09)
+
+Dev remote `treedump <frames>` (`ab_capture.ps1 -Round treedump`, `src/tree_dump.*`, `tools/tree_check.py`): for every
+SpeedTree G-buffer draw of 8 consecutive frames, a compute shader gathers each tree's position (`cbInstanceData`,
+pixel b4, translation in `.w` of the first three float4s) and its 17-float4 wind entry, indexed like the game's vertex
+shader. Forest edge, 43 SpeedTree draws and about 233 trees per frame:
+
+- Tree positions are identical from frame to frame, so trees match by shader and position.
+- Wind parameters other than the clocks (sway distance, strength, the leaf twitch sharpness) drift slightly every
+  frame with the gusts; the anchor stays. A tree model is therefore a shader plus its wind anchor (21 here).
+- Per frame every tree of a model advances each clock by exactly the same amount (differences of 6e-8). Typical
+  advances: global 0.0022, branch 0.0044 and 0.0059, leaf ripple 0.015 and 0.025, tumble 0.012 and 0.005, twitch
+  0.008; the second leaf twitch clock stands still. Different models advance differently (by up to 0.008), so the
+  advance is per model.
+- Rebuilding last frame's clocks of every tree from one matched tree per model reproduces them for all 1484 matched
+  trees with a largest error of 6e-8; every tree's model had a matched tree.
+
+Found on the way: ReShade only submits its immediate command list when something was recorded into it through its
+API, so commands recorded natively into it are silently dropped. The dump's readback copy now goes through ReShade's
+`copy_buffer_region`. `StartWind`'s native setup recordings (`WindPort::RecordSetup`, `WindMotion::RecordSetup`) have
+the same problem; they appear harmless because committed resources start zeroed and buffers promote from the common
+state implicitly.

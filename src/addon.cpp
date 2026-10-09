@@ -33,6 +33,7 @@
 #include "dlss.hpp"
 #include "state_tracking.hpp"
 #include "kVegetationMaskCs.h"
+#include "tree_dump.hpp"
 #include "wind.hpp"
 #include "wind_port.hpp"
 
@@ -225,6 +226,10 @@ struct MaterialVs {
 };
 std::shared_mutex g_material_mutex;
 std::unordered_map<uint64_t, MaterialVs> g_material_vs;  // pipeline -> its material vertex shader
+
+// Development dump of SpeedTree wind (remote "treedump <frames>"): the frames [first, end) are recorded.
+erdlss::TreeDump g_tree_dump;
+std::atomic<uint64_t> g_tree_first{0}, g_tree_end{0};
 struct MaterialStat {
   uint64_t draws = 0, vertices = 0;
   bool reads_time = false, reads_forces = false;
@@ -957,6 +962,8 @@ void OnDestroyDevice(device* dev) {
     g_port_ready = false;
     g_wind_port.Shutdown();
   }
+  g_tree_end = 0;
+  g_tree_dump.Shutdown();
   g_dlss.Shutdown();
   g_device = nullptr;
 }
@@ -1753,10 +1760,76 @@ std::string WindStats() {
   return text;
 }
 
+// Dev remote "treedump": gathers the trees and their wind entries of a SpeedTree G-buffer draw of the main camera.
+void TreeDumpDraw(command_list* cmd_list, const CmdData& data, uint32_t instance_count) {
+  const uint64_t frame = g_frame.load();
+  if (frame < g_tree_first.load() || frame >= g_tree_end.load()) return;
+  std::string name;
+  {
+    std::shared_lock lock(g_material_mutex);
+    const auto it = g_material_vs.find(data.current.handle);
+    if (it == g_material_vs.end()) return;
+    name = it->second.name;
+  }
+  if (name.rfind("SpeedTree_", 0) != 0 || name.find("_Gbuf@") == std::string::npos) return;
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr || state->render_targets.size() != 5) return;
+  const resource rt0 = dev->get_resource_from_view(state->render_targets[0]);
+  if (rt0 == 0 || dev->get_resource_desc(rt0).texture.width != g_render_width.load()) return;
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it == state->descriptor_tables.end() || it->second.first == 0) return;
+  const pipeline_layout layout = it->second.first;
+  const std::vector<descriptor_table>& tables = it->second.second;
+
+  // cbSpeedTreeWind (vertex b13), cbInstanceData (pixel b4), cbInstanceIdxParam (vertex b10) and
+  // g_InstanceIndexBuffer (vertex t25).
+  struct Source {
+    shader_stage stage;
+    RegisterKind kind;
+    uint32_t reg;
+  };
+  static const Source kSources[4] = {{shader_stage::vertex, RegisterKind::kConstantBuffer, 13},
+                                     {shader_stage::pixel, RegisterKind::kConstantBuffer, 4},
+                                     {shader_stage::vertex, RegisterKind::kConstantBuffer, 10},
+                                     {shader_stage::vertex, RegisterKind::kShaderResource, 25}};
+  D3D12_GPU_VIRTUAL_ADDRESS va[4] = {};
+  for (int i = 0; i < 4; ++i) {
+    descriptor_heap heap = {0};
+    uint32_t offset = 0;
+    if (!descriptors->Find(dev, layout, tables, kSources[i].stage, kSources[i].kind, kSources[i].reg, 0, &heap,
+                           &offset))
+      return;
+    if (kSources[i].kind == RegisterKind::kConstantBuffer) {
+      const buffer_range range = descriptors->Buffer(heap, offset);
+      if (range.buffer == 0) return;
+      va[i] = reinterpret_cast<ID3D12Resource*>(range.buffer.handle)->GetGPUVirtualAddress() + range.offset;
+    } else {
+      const resource_view view = descriptors->View(heap, offset);
+      const resource buffer = view != 0 ? dev->get_resource_from_view(view) : resource{0};
+      if (buffer == 0) return;
+      va[i] = reinterpret_cast<ID3D12Resource*>(buffer.handle)->GetGPUVirtualAddress() +
+              dev->get_resource_view_desc(view).buffer.offset;
+    }
+  }
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  if (!g_tree_dump.Record(native, frame, name, va[0], va[1], va[2], va[3], instance_count)) return;
+  // The gather replaced the compute root signature and the pipeline; put back the game's.
+  for (const auto& [stages, entry] : state->descriptor_tables) {
+    if ((stages & shader_stage::all_compute) == 0 || entry.first == 0) continue;
+    native->SetComputeRootSignature(reinterpret_cast<ID3D12RootSignature*>(entry.first.handle));
+    for (uint32_t i = 0; i < entry.second.size(); ++i)
+      if (entry.second[i] != 0) cmd_list->bind_descriptor_tables(stages, entry.first, i, 1, &entry.second[i]);
+  }
+  cmd_list->bind_pipeline(pipeline_stage::all, data.current);
+}
+
 bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index,
                    int32_t vertex_offset, uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
+  if (g_tree_end.load() != 0) TreeDumpDraw(cmd_list, *data, instance_count);
   if (g_config.wind_motion && g_wind_ready.load() && g_wind.IsWindPipeline(data->current.handle) &&
       StreamWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance))
     return true;  // drawn by the stream-output copy of the game's pipeline
@@ -1919,6 +1992,23 @@ void OnReshadePresent(effect_runtime* runtime) {
   static int stats_frames = 0;
   static std::string wind_debug_request;  // the pending "winddebug" command
   static uint64_t wind_debug_frame = 0;
+  static std::string tree_request;  // the pending "treedump" command
+  if (!tree_request.empty()) {
+    if (g_frame.load() > g_tree_end.load() + 3) {
+      command_queue* const queue = runtime->get_command_queue();
+      queue->wait_idle();
+      // Through ReShade's API: the immediate list is only submitted when ReShade recorded something into it.
+      queue->get_immediate_command_list()->copy_buffer_region(
+          {reinterpret_cast<uint64_t>(g_tree_dump.output())}, 0, {reinterpret_cast<uint64_t>(g_tree_dump.readback())}, 0,
+          erdlss::TreeDump::size());
+      queue->flush_immediate_command_list();
+      queue->wait_idle();
+      FinishRemote(tree_request, g_tree_dump.Write(g_addon_dir / L"shots"));
+      tree_request.clear();
+      g_tree_end = 0;
+    }
+    return;
+  }
   if (!wind_debug_request.empty()) {
     if (g_wind.debug_captured() || g_frame.load() > wind_debug_frame + 300) {
       runtime->get_command_queue()->wait_idle();
@@ -1984,6 +2074,18 @@ void OnReshadePresent(effect_runtime* runtime) {
     g_dump_last = 0;
     g_dump_remaining = std::max(1, std::min(std::atoi(arg.c_str()), 16));
     dump_request = command + " " + arg + " " + arg2;
+    return;
+  }
+  if (command == "treedump") {
+    if (!g_tree_dump.ready() &&
+        (g_device == nullptr || !g_tree_dump.Init(reinterpret_cast<ID3D12Device*>(g_device->get_native())))) {
+      FinishRemote(command + " " + arg, "could not create the tree dump pipeline");
+      return;
+    }
+    const uint64_t first = g_frame.load() + 1;
+    g_tree_first = first;
+    g_tree_end = first + std::max(1, std::min(std::atoi(arg.c_str()), 16));
+    tree_request = command + " " + arg;
     return;
   }
   if (command == "capture") {
