@@ -222,3 +222,23 @@ Two unmasked captures differ by 6.8, so that is just capture noise. Fine noise o
 mask DLSS honored would have handed the wall the raw, aliased current frame. So this DLSS version ignores the input
 for DLAA, even on the CNN preset F. Option 1 for the wind problem is out; the mask pipeline can be reused for a
 vegetation-only post effect.
+
+### Where the wind comes from (2026-10-09, capture `er117_drs67_f12837`)
+
+`captures/inspect_veg` has the vertex shaders of one draw per vegetation material (`rdc_inspect.py`).
+
+- Grass (`M[AMSN_V]_Grass2_Gbuf`, `_Grass2_LOD1_Gbuf`) and generic vegetation (`M[AMSN_V]_Vesitation_Gbuf`,
+  `_Vesitation_Emissive_Glow_Gbuf`) share one vertex shader family. Wind time is
+  `cbPerFrame.FC_GlobalTime` (b9, byte 432) plus a per-vertex phase (`TEXCOORD1.x` times a material float). Each
+  instance lists up to 8 force sources (`cbInstanceData`, entry 7) in `StructuredBuffer<ForceParamStruct>
+  g_forceParam` (t26, 24 KB; flags, position, direction, period, amplitude, gust pulse parameters). The vertex is
+  displaced with sine waves and gust pulses, then weighted by a vertex attribute (`TEXCOORD2.z`).
+- `M[AMSN][Sway]_Gbuf` and `M[WorldTree_Leaves]_Gbuf` also read `FC_GlobalTime` (no force buffer).
+- All of them end the same way: `clip = (world - cbSceneParam.SC_CameraPos) * VC_MatrixViewProj` (b8). cbSceneParam
+  also has `SC_PrevCameraPos` (byte 448) and `VC_PrevMatrixViewProj` (byte 464); cbPerFrame has `FC_GlobalDt`
+  (byte 440).
+- So the previous-frame position of any wind-animated vertex is the game's own vertex shader run with
+  `FC_GlobalTime - FC_GlobalDt`, `SC_PrevCameraPos` and `VC_PrevMatrixViewProj` (ideally with last frame's
+  `g_forceParam` as well). No velocity variant of these shaders is drawn.
+- G-buffer vertex counts in that capture (index count x instances): Grass2 4.66 M, Vesitation 2.12 M, Grass2_LOD1
+  1.07 M, WorldTree leaves 0.94 M, Sway 0.32 M. That's about 9 M per frame for the animated materials.
