@@ -72,3 +72,23 @@ From NVIDIA's DLSS-RR Integration Guide (github.com/NVIDIA/DLSS, doc/):
 2. If ray tracing passes do not follow the render scale, make them (same tools as the post-processing corrections).
 3. Then decide on RR with numbers: its cost on this GPU (above) against the game's denoising cost, and whether the
    game's sampling suits it.
+
+## Adding ray-traced reflections or GI (feasibility, 2026-10-10)
+
+The user asked whether the add-on could add ray-traced reflections or global illumination.
+- ReShade's add-on API reports acceleration-structure builds (`build_acceleration_structure`, with geometry and
+  instance inputs) and `dispatch_rays`, so with the game's ray tracing on, the add-on can see the scene structure the
+  game builds for its shadow and AO rays and trace its own rays against it (own DXR or inline-ray-query shaders on
+  the game's device).
+- Denoising: DLSS-RR is designed for exactly these signals.
+- Insertion: reflections would replace or augment the game's screen-space reflections (`GXSsr*` passes); GI would
+  add indirect light in the lighting pass.
+- The hard part is shading at hit points (material and lighting): each hit triangle's textures and UVs, plus sun,
+  local lights and sky. If the game's shadow rays already look up materials (alpha-tested foliage), a per-instance
+  material table exists to reuse. Otherwise start with the hybrid: on-screen hits take the lit screen color,
+  off-screen hits fall back to sky/ambient.
+- Order: reflections first (about one ray per pixel on glossy surfaces, replaces SSR, changes the look least), GI
+  second (many diffuse rays, full lighting at hits, bigger change to the art direction).
+- Deciding questions for the RT-on capture: DXR pipelines with hit shaders or inline ray queries; what the
+  acceleration structure contains (terrain, buildings, foliage, characters); whether instances carry material or
+  texture indices.
