@@ -99,11 +99,17 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
 
 ### Next steps
 
-1. Hear how the everyday install at 67% plays over longer sessions and other areas.
-2. Performance: the stretch passes and the full-size post-processing cost about 1 ms; check what is worth saving.
-3. Robustness: scale changes at runtime (barrier listener), resolution changes (filter and target recreation), the
+1. Test the preset M fix in game (commit 3c76c9d, in the dev install, not yet run): 50% with M should cost about
+   0.6 ms more than K, not 4 ms. The everyday install (67%, preset K) is not affected: K's cost does not depend
+   on the creation size.
+2. The user's bigger goal: make ray tracing affordable. Plan and DLSS Ray Reconstruction findings in
+   `docs/raytracing.md`; first step is measuring ray tracing with upscaling (PresentMon, a RenderDoc capture with
+   RT on).
+3. Hear how the everyday install at 67% plays over longer sessions and other areas.
+4. Performance: the stretch passes and the full-size post-processing cost about 1 ms; check what is worth saving.
+5. Robustness: scale changes at runtime (barrier listener), resolution changes (filter and target recreation), the
    first frame of a new command-list kind (not yet corrected), and other scale values (0.5, 0.58, 0.77).
-4. Cleanup before a release: remove the dead experiments, overlay text for the render scale and jitter.
+6. Cleanup before a release: remove the dead experiments, overlay text for the render scale and jitter.
 
 ## Recent commits
 
