@@ -38,6 +38,7 @@
 #include "render_scale.hpp"
 #include "state_tracking.hpp"
 #include "stretch.hpp"
+#include "taa_jitter.hpp"
 #include "kVegetationMaskCs.h"
 #include "tree_dump.hpp"
 #include "wind.hpp"
@@ -199,8 +200,10 @@ std::atomic<uint32_t> g_render_height{0};
 std::atomic<uint32_t> g_input_width{0};    // the scene's top-left share of it at the last TAA
 std::atomic<uint32_t> g_input_height{0};
 
-// The engine's dynamic-resolution scale, held at the render scale while DLSS is on.
+// The engine's dynamic-resolution scale, held at the render scale while DLSS is on, and the TAA's jitter cycle,
+// lengthened while upscaling.
 erdlss::RenderScale g_render_scale;
+erdlss::TaaJitter g_taa_jitter;
 bool g_render_scale_missing = false;  // the pattern was not found
 bool g_render_scale_set = false;      // a scale below 1 was written
 bool g_mv_full_basis = false;         // development: motion vectors in output instead of render heights
@@ -2729,6 +2732,8 @@ void ApplyRenderScale() {
         g_dlss.feature_scale() == g_config.render_scale)
       scale = std::clamp(g_config.render_scale, g_dlss.min_scale(), g_dlss.max_scale());
   }
+  // DLSS needs about 8 x (output / render)^2 jitter positions when it upscales (NVIDIA); the game cycles through 8.
+  g_taa_jitter.Apply(scale < 1.0f ? std::clamp(static_cast<uint32_t>(std::ceil(8.0f / (scale * scale))), 9u, 64u) : 0u);
   if (scale == 1.0f && !g_render_scale_set) return;  // never touch the engine without a reason
   if (!g_render_scale.found()) {
     if (g_render_scale_missing) return;
@@ -3111,7 +3116,7 @@ void OnReshadePresent(effect_runtime* runtime) {
                   g_stretch_failed ? "failed" : g_stretch.ready() ? "ready" : "not started",
                   static_cast<unsigned long long>(g_stretch.runs()), g_motion_src.load() ? "known" : "unknown",
                   g_emissive.load() ? "known" : "unknown", g_half_depth.load() ? "known" : "unknown");
-    result = text;
+    result = std::string(text) + "; " + g_taa_jitter.status();
   } else if (command == "upscaleat") {
     g_upscale_at_composite = arg == "composite";
     g_recreate = true;
