@@ -10,7 +10,7 @@ with DLSS. Full history and measurements are in `docs/recon.md`; this file is th
 | 1. Recon | Done (2026-10-08) |
 | 2. DLAA (DLSS at native resolution) | Done, in the everyday install |
 | Wind motion vectors (grass, bushes, trees) | Done, in the everyday install |
-| 3. Upscaling (render below native, DLSS upscales) | Works in the dev install (67%); not yet in the everyday install |
+| 3. Upscaling (render below native, DLSS upscales) | Works; in the everyday install at 67% since 2026-10-10 |
 | 4. Release | Not started. Publish to GitHub only when the user says so |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
@@ -21,9 +21,11 @@ the tonemapped image at the final composite.
 Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
-  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit 6e672fa, installed 2026-10-09. Its ini: preset 0 (K),
-  game sharpening off, game exposure on, chromatic aberration off, `WindMotion=1`, `WindMode=1`, `WindTrees=1`.
-  Only update it with the user's explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
+  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit 5ccb6f2 (upscaling), installed 2026-10-10 with the
+  user's OK. Its ini: preset 0 (K), game sharpening off, game exposure on, chromatic aberration off, `WindMotion=1`,
+  `WindMode=1`, `WindTrees=1`, `RenderScale=0.67`. The previous build (6e672fa, DLAA) and its ini are in
+  `build\everyday-backup\`. Only update it with the user's explicit OK and with the game closed
+  (`tools/deploy.ps1 -Target main`).
 - **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLL): test builds only. It has the
   full-size post-processing build (2026-10-10, see "Stage 3" below), with `RenderScale=0.67` and `GameExposure=1`.
 
@@ -97,7 +99,7 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
 
 ### Next steps
 
-1. Decide with the user what goes into the everyday install (render scale, the release DLSS DLL has no watermark).
+1. Hear how the everyday install at 67% plays over longer sessions and other areas.
 2. Performance: the stretch passes and the full-size post-processing cost about 1 ms; check what is worth saving.
 3. Robustness: scale changes at runtime (barrier listener), resolution changes (filter and target recreation), the
    first frame of a new command-list kind (not yet corrected), and other scale values (0.5, 0.58, 0.77).
