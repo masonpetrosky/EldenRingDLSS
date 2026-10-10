@@ -583,3 +583,21 @@ upsampling of G-buffer data for post-processing that needs it. So the upscale st
 
 Not yet run in game. Test: `tools/ab_capture.ps1 -Round upscale` (pass logs `shots/passlog_*.txt`, captures, frame
 times); remote commands `ctx`, `passlog`, `postfull <mask>|off`, `upscaleat taa|composite`, `scale <x>`.
+
+### The switch at the TAA cannot work (2026-10-10, in game)
+
+The stack search never found a render context. A stack dump at the TAA draw (remote `stackdump`) shows why: the TAA
+runs on a worker thread, called from a command executor (`0x141E881ED`, `0x141B3D9C2`..`0x141B3E311`) with
+`FUN_141AD79A0` and the full-screen draw helper `FUN_141A5D9E0` on the stack, but not the post chain
+(`FUN_141C7A580`). The chain runs on the render thread and queues each filter as a job with its own copy of the
+render context (`FUN_141B2EBA0` builds contexts, `FUN_141AD35B0` queues callbacks with them), all before any of them
+runs. So nothing changed at the TAA reaches the later filters.
+
+`tools/rdc_cbbinds.py` (constant buffers per draw) on the 67% capture: every pass after the TAA has its own
+allocation of `cbPostProcessCommon`, `PSCommonBuffer` and so on; shared ones (`cbToneMap`, `cbGlowParam`) are shared
+only among passes after the TAA. `CB_AA` is shared by the motion prep, the TAA and the sharpen pass. So the passes
+after the TAA can be corrected one by one at the D3D12 level instead: full-size viewports and their percentage
+constants patched in the upload heap before each draw (as `SetSharpenStrength` already does).
+
+The add-on's barrier listener (states for the stretch) may slow the loading screens (reported by the user);
+measure, and limit it to upscaled frames.

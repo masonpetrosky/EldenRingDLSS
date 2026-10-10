@@ -218,6 +218,11 @@ erdlss::PostResolution g_post;
 erdlss::Stretch g_stretch;
 bool g_stretch_failed = false;
 std::atomic<uintptr_t> g_context{0};         // render context found at the last TAA
+std::atomic<uint32_t> g_context_misses{0};   // TAAs in a row without a context; the search stops at 30
+std::atomic<bool> g_stackdump{false};        // development (remote "stackdump")
+std::mutex g_effective_mutex;
+float g_saved_effective[4] = {};             // the engine's effective percentages before the TAA set them to 1
+bool g_effective_written = false;
 uint32_t g_post_mask = erdlss::PostResolution::kAll;  // development (remote "postfull"): what the switch changes
 std::atomic<uint64_t> g_motion_src{0};       // the scene's motion: the motion prep pass's g_MoveTex
 std::atomic<uint64_t> g_emissive{0};         // the emissive buffer: EmissiveToGlowPS's source
@@ -869,16 +874,15 @@ bool PrepareFullSizePost(command_list* cmd_list, CmdData& data, uint32_t width, 
   device* const dev = cmd_list->get_device();
   auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
   // A miss searches the whole stack window with memory queries; after a few, stop trying.
-  static uint32_t misses = 0;
-  if (misses >= 30) return false;
+  if (g_context_misses.load() >= 30) return false;
   const uintptr_t context = g_post.FindOnStack(g_context.load());
   if (context == 0) {
-    if (++misses == 30)
+    if (++g_context_misses == 30)
       Log(reshade::log::level::warning, "Render context not found at the TAA; post-processing stays at the render "
                                         "size, so the render scale is not applied.");
     return false;
   }
-  misses = 0;
+  g_context_misses = 0;
   g_context = context;
   if (!g_stretch.ready() && !g_stretch_failed &&
       !g_stretch.Init(reinterpret_cast<ID3D12Device*>(dev->get_native()))) {
@@ -905,6 +909,15 @@ bool PrepareFullSizePost(command_list* cmd_list, CmdData& data, uint32_t width, 
       ++stretched;
   }
   const bool switched = g_post_mask != 0 && g_post.SwitchToFull(context, g_post_mask);
+  if (switched && (g_post_mask & erdlss::PostResolution::kGlobal)) {
+    // Jobs that start later build their contexts from these; the engine recomputes them every frame, and they are
+    // put back at present in case it does so late.
+    std::lock_guard lock(g_effective_mutex);
+    const float one[4] = {1, 1, 1, 1};
+    if (!g_effective_written && g_render_scale.ReadEffective(g_saved_effective) &&
+        g_render_scale.WriteEffective(one))
+      g_effective_written = true;
+  }
   RestoreTaaState(cmd_list, data);
   static uint32_t last_stretched = ~0u;
   if (stretched != last_stretched) {
@@ -2470,6 +2483,13 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   }
   if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) {
     if (g_passlog_frame.load() != 0) LogPass(cmd_list, *data);
+    if (g_stackdump.exchange(false)) {
+      std::ofstream(g_addon_dir / L"shots" / L"stack.txt") << erdlss::PostResolution::DumpStack(64 * 1024);
+      char text[96];
+      std::snprintf(text, sizeof(text), "Stack dump in shots/stack.txt; the context search finds 0x%llx.",
+                    static_cast<unsigned long long>(g_post.FindOnStack(0)));
+      Log(reshade::log::level::info, text);
+    }
     float screen[2] = {1, 1};
     ObserveTaaResolution(cmd_list, screen);
     if (g_config.wind_motion && g_wind_ready.load()) ResolveWind(cmd_list, *data);
@@ -2530,7 +2550,9 @@ void LogOutputMode(swapchain* sc) {
 // next frame.
 void ApplyRenderScale() {
   float scale = 1.0f;
-  if (g_config.enabled && g_config.render_scale < 1.0f && g_frame.load() <= g_last_upscale.load() + 4) {
+  // Without the render context the passes after the TAA cannot follow to full size.
+  const bool post_ok = g_upscale_at_composite || g_context_misses.load() < 30;
+  if (g_config.enabled && g_config.render_scale < 1.0f && post_ok && g_frame.load() <= g_last_upscale.load() + 4) {
     std::lock_guard lock(g_dlss_mutex);
     if (g_dlss.has_feature() && g_dlss.feature_hdr() != g_upscale_at_composite &&
         g_dlss.feature_scale() == g_config.render_scale)
@@ -2572,12 +2594,11 @@ void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, ui
     std::lock_guard lock(g_dlss_mutex);
     g_dlss.ReleaseFeature();
   }
-  if (g_post.switched()) {
-    // The frame ended without the composite (menus, loading screens): put the render context back here.
-    g_post.Restore();
-    static bool logged = false;
-    if (!logged) Log(reshade::log::level::info, "Render context restored at present (no composite in that frame).");
-    logged = true;
+  g_post.Restore();
+  {
+    std::lock_guard lock(g_effective_mutex);
+    if (g_effective_written) g_render_scale.WriteEffective(g_saved_effective);
+    g_effective_written = false;
   }
   ApplyRenderScale();
   const uint64_t passlog = g_passlog_frame.load();
@@ -2924,6 +2945,12 @@ void OnReshadePresent(effect_runtime* runtime) {
                   static_cast<unsigned long long>(g_stretch.runs()), g_motion_src.load() ? "known" : "unknown",
                   g_emissive.load() ? "known" : "unknown", g_half_depth.load() ? "known" : "unknown");
     result += text;
+  } else if (command == "stackdump") {
+    g_stackdump = true;
+    result = "dumping the stack at the next TAA to shots/stack.txt (result in the log)";
+  } else if (command == "postretry") {
+    g_context_misses = 0;
+    result = "searching for the render context again";
   } else if (command == "postfull") {
     // postfull <mask>: what the switch to full size changes (1 mode, 2 percentages, 4 flag, 8 camera); off = 0
     g_post_mask = arg == "off" ? 0u : static_cast<uint32_t>(std::strtoul(arg.c_str(), nullptr, 0));

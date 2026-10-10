@@ -22,6 +22,7 @@ constexpr bool kWildcard[] = {false, false, false, true,  true,  true,  true,  f
 static_assert(sizeof(kPattern) == sizeof(kWildcard));
 
 constexpr uint32_t kScale = 0xF04;
+constexpr uint32_t kEffective = 0xEEC;
 constexpr uint32_t kDisplay = 0x128;  // pointer to the display description: width at +0x108, height at +0x10C
 
 bool GuardedCopy(void* dst, const void* src, size_t size) {
@@ -77,6 +78,16 @@ float RenderScale::Get() const {
   float scale = 0;
   if (state == 0 || !GuardedCopy(&scale, reinterpret_cast<const void*>(state + kScale), sizeof(scale))) return 0;
   return scale;
+}
+
+bool RenderScale::ReadEffective(float out[4]) const {
+  const uintptr_t state = State();
+  return state != 0 && GuardedCopy(out, reinterpret_cast<const void*>(state + kEffective), 4 * sizeof(float));
+}
+
+bool RenderScale::WriteEffective(const float in[4]) const {
+  const uintptr_t state = State();
+  return state != 0 && GuardedCopy(reinterpret_cast<void*>(state + kEffective), in, 4 * sizeof(float));
 }
 
 bool RenderScale::Set(float scale) const {

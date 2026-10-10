@@ -52,7 +52,7 @@ T Read(uintptr_t address) {
 }  // namespace
 
 bool PostResolution::IsContext(uintptr_t c) {
-  if (c < 0x10000 || c > 0x7FFFFFFE0000ull || (c & 0xF) != 0 || !Accessible(c + kCameraPointer, kEnd - kCameraPointer))
+  if (c < 0x10000 || c > 0x7FFFFFFE0000ull || (c & 0x7) != 0 || !Accessible(c + kCameraPointer, kEnd - kCameraPointer))
     return false;
   if (Read<uintptr_t>(c + kCameraPointer) != c + kCamera) return false;
   const int32_t mode = Read<int32_t>(c + 0x79C);
@@ -61,16 +61,50 @@ bool PostResolution::IsContext(uintptr_t c) {
 }
 
 uintptr_t PostResolution::FindOnStack(uintptr_t hint) const {
-  const auto* const tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+  // The engine runs its jobs on stacks of its own, so the thread's stack bounds do not apply: search the committed
+  // region the stack pointer is in.
   const uintptr_t sp = reinterpret_cast<uintptr_t>(_AddressOfReturnAddress());
-  const uintptr_t top = std::min<uintptr_t>(reinterpret_cast<uintptr_t>(tib->StackBase), sp + kScanBytes);
-  const auto* const begin = reinterpret_cast<const uintptr_t*>(sp & ~uintptr_t{7});
+  MEMORY_BASIC_INFORMATION mbi;
+  if (VirtualQuery(reinterpret_cast<const void*>(sp), &mbi, sizeof(mbi)) == 0) return 0;
+  const uintptr_t top =
+      std::min<uintptr_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize, sp + kScanBytes);
+  const auto* const begin = reinterpret_cast<const uintptr_t*>((sp + 7) & ~uintptr_t{7});
   const auto* const end = reinterpret_cast<const uintptr_t*>(top & ~uintptr_t{7});
-  // The context of the previous frame is usually this frame's too; finding it needs no memory queries.
+  // Contexts are built in the frames of the jobs that use them: one above us shows its camera pointer, a value
+  // equal to its own address + (0x7B0 - 0x448).
+  for (const uintptr_t* p = begin; p < end; ++p) {
+    const auto at = reinterpret_cast<uintptr_t>(p);
+    if (*p == at + (kCamera - kCameraPointer) && at - kCameraPointer >= sp && IsContext(at - kCameraPointer))
+      return at - kCameraPointer;
+  }
+  // Otherwise a pointer to one, e.g. a context in a frame of another stack.
   if (hint != 0 && std::find(begin, end, hint) != end && IsContext(hint)) return hint;
   for (const uintptr_t* p = begin; p < end; ++p)
     if ((*p & 0xF) == 0 && *p != hint && IsContext(*p)) return *p;
   return 0;
+}
+
+std::string PostResolution::DumpStack(size_t bytes) {
+  const uintptr_t sp = reinterpret_cast<uintptr_t>(_AddressOfReturnAddress());
+  const auto* const tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+  MEMORY_BASIC_INFORMATION mbi = {};
+  VirtualQuery(reinterpret_cast<const void*>(sp), &mbi, sizeof(mbi));
+  const uintptr_t top = std::min<uintptr_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize, sp + bytes);
+  std::string out;
+  char line[160];
+  std::snprintf(line, sizeof(line), "sp 0x%llx, region 0x%llx + 0x%llx (protect 0x%lx), TIB stack 0x%llx..0x%llx\n",
+                static_cast<unsigned long long>(sp), reinterpret_cast<unsigned long long>(mbi.BaseAddress),
+                static_cast<unsigned long long>(mbi.RegionSize), mbi.Protect,
+                reinterpret_cast<unsigned long long>(tib->StackLimit),
+                reinterpret_cast<unsigned long long>(tib->StackBase));
+  out += line;
+  for (uintptr_t at = (sp + 7) & ~uintptr_t{7}; at + 8 <= top; at += 8) {
+    const uintptr_t v = *reinterpret_cast<const uintptr_t*>(at);
+    std::snprintf(line, sizeof(line), "%llx %016llx%s\n", static_cast<unsigned long long>(at),
+                  static_cast<unsigned long long>(v), (v & 0xF) == 0 && IsContext(v) ? " context" : "");
+    out += line;
+  }
+  return out;
 }
 
 bool PostResolution::SwitchToFull(uintptr_t c, uint32_t mask) {
@@ -106,12 +140,9 @@ bool PostResolution::SwitchToFull(uintptr_t c, uint32_t mask) {
 }
 
 void PostResolution::Restore() {
+  // Nothing is written back: the context lives in a job's stack frame and is rebuilt for every job, so by now its
+  // memory may belong to another job.
   std::lock_guard lock(mutex_);
-  if (context_ == 0) return;
-  if (IsContext(context_)) {
-    GuardedCopy(reinterpret_cast<void*>(context_ + kViewOffset), view_, kViewBytes);
-    GuardedCopy(reinterpret_cast<void*>(context_ + kCameraOffset), camera_, kCameraBytes);
-  }
   context_ = 0;
 }
 
