@@ -24,7 +24,7 @@
 # step and with wind off, frame times with everything on, without the merge, and with wind off.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
-               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost')][string]$Round = 'sharpen',
+               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -185,6 +185,29 @@ if ($Round -eq 'sharpen') {
   Send 'windtrees on' 2.0; LogFrames 'tree_grass_trees'
   Send 'wind off' 1.0; LogFrames 'tree_wind_off2'
   Send "windtrees $trees"; Send "wind $restore"
+} elseif ($Round -eq 'drsprobe') {
+  # Stage 3: set every float equal to 1.0 in a few engine objects to 0.67 for a few frames and report what changes
+  # in the frame's resolution constants (src/drs_probe.hpp). Reports: shots/drsprobe_<name>.txt.
+  Send 'dlss on'; Send 'drsstatus' 1.0; Send 'drsstatus'
+  $roots = [ordered]@{
+    'gm' = @('drsptr 47f37a8 0', '14000')                    # the graphics manager
+    'gm13a60' = @('drsptr 47f37a8 13a60 0', '400')
+    'gm13a68' = @('drsptr 47f37a8 13a68 0', '400')
+    'context' = @('drsptr 3d61f98 8 0', '1000')              # the render context of the view setup
+  }
+  foreach ($name in $roots.Keys) {
+    $answer = Send $roots[$name][0]
+    if ("$answer" -notmatch 'address (0x[0-9a-f]+)') { "skipping ${name}: $answer"; continue }
+    $address = $Matches[1].Substring(2)
+    Send "drsprobe $address $($roots[$name][1])"
+    for ($i = 0; $i -lt 600; $i++) {
+      Start-Sleep -Seconds 1
+      $status = Send 'drsstatus'
+      if ("$status" -match 'probe idle') { break }
+    }
+    Copy-Item (Join-Path $Folder 'shots\drsprobe.txt') (Join-Path $Folder "shots\drsprobe_$name.txt") -Force
+    Get-Content (Join-Path $Folder "shots\drsprobe_$name.txt") | Select-Object -First 12
+  }
 } elseif ($Round -eq 'treecost') {
   # Where the trees' cost goes: grass and trees with and without the resolve draw, grass only.
   Send 'dlss on'; Send 'wind on'; Send 'windtrees on' 3.0; LogFrames 'tc_trees'

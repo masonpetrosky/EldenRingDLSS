@@ -471,3 +471,44 @@ Their vertex shader (captures/inspect_veg/eid_75818) does use `FC_GlobalTime`, b
 about a pivot: angle = 0.1 * float_0 (0.3) * smoothstep of a triangle wave with phase (float_1 (32) * a per-vertex
 value + time) * float_11 (0.12), i.e. at most 0.03 rad (1.7 degrees) over an 8.3 s cycle. That is a few hundredths
 of a pixel per frame at 4K, invisible (the user never noticed them move) and not worth motion vectors.
+
+## Stage 3, round 2: looking for the dynamic-resolution switch (2026-10-09)
+
+Corrections to the 2026-10-08 notes above:
+- `0x141A340F0` does not fill cbSceneParam. Decompiled, it builds 0x160-byte per-view blocks (`memset(.., 0x160)`)
+  from its 0x120-byte view list; view+0xF4 lands in such a block, not in `SC_DynamicResolution_ScreenPercentage`.
+  A hardware-breakpoint snapshot of that list showed +0xF4 = (0.008, 1, 1.1, 1) per view.
+- The render context `[[0x143D61F98] + 8]` (the per-frame view setup at `0x140A3A3A0`) feeds another view: its
+  +0x9AC percentages are 0 in game, and forcing them to 0.67 (`src/engine_resolution.*`, dev remotes `drs`,
+  `drsforce`) changed nothing.
+
+The renderer is dynamic-resolution aware on PC (RenderDoc, forest capture):
+- TAA (`TempAA`) reads `CB_AA` with `g_vScreenPercentage`, `_Primary`, `_Prev`, `_PrevPrimary` (bytes 240-271) and
+  `cbPostProcessCommon` (b4: `g_dynamicScreenPercentage` with `g_texSizeReciprocal`, the same four pairs, 64 bytes).
+- The tonemap and light-shaft passes run `ToneMapDynamicResolutionVS`, which scales its UVs by
+  `g_dynamicScreenPercentage`. All values are 1.0.
+- The GPU load balancer's list of features it may degrade (`0x142F29E50`, 24-byte entries: id, name, level) ends with
+  item 19 "Dynamic Resolution" at level 0 (others: light shafts 12, bloom 5, AA 15, SSAO 7, DOF 7, motion blur 12,
+  shadow cascade halving 13, ...). The table has no direct references (reached through obfuscated code).
+
+Tools:
+- Hardware breakpoints through the debug registers (`src/hw_breakpoints.*`, remotes `hwfill`, `hwexec`, `hwwatch`)
+  work, but the game crashes silently about 30 s after they are armed (anti-tamper). Not usable.
+- Ghidra 12.1.4 headless (portable in `.tools`, project in `Documents\GhidraProjects`, 70 min first analysis) with
+  `tools/ghidra/ErQuery.java` and `query.ps1`: decompile, decompileat, xrefs, calls, writes, symbols, near, ptrs,
+  bytepair. RTTI names survive (`GXBS::GXAntiAliasingFilter`, `GXBS::GXToneMapFilter`, `GXSR::GXRenderingPipeline`,
+  `CS::CSGxLoadBalancerHelperImp`, ...). The property registration for `Performance.IsEnableDynamicResolution`
+  and the code around the load balancer are obfuscated (jump chains), which stops both Ghidra and manual tracing.
+- `tools/funcs.py` (function ranges from .pdata, direct callers), `tools/find_stores.py` (store search that decodes
+  SSE stores correctly), `tools/rdc_drawnames.py`, `tools/rdc_drsusage.py`.
+
+Found on the way: the AA pass is `GXBS::GXAntiAliasingFilter` at graphics-manager offset 0xBAC0 (setup
+`0x141AD7640`, jitter `0x141AD7470` = Halton(2, 3) - 0.5); its `CB_AA` is the 0x110-byte constant buffer at
+filter+0xB8. The post-process chain runs as `GXSgBaseSceneImpl` vtable slot 4 (`0x141B668B0`) ->
+`0x141C7A580` -> `0x141C7CB90` (a `GXSR::GXRenderingPipeline`).
+
+Next: `ab_capture.ps1 -Round drsprobe` (`src/drs_probe.*`) sets every float equal to 1.0 in the graphics manager
+(`[0x1447F37A8]`, 0x14000 bytes), two of its sub-objects and the render context to 0.67 for a few frames each and
+reports what changes in `CB_AA`, `cbPostProcessCommon`, cbSceneParam's percentages and the scene viewport
+(`shots/drsprobe_<name>.txt`). The engine must keep the previous frame's percentages in a persistent object,
+which this should find if it lives in one of those objects.

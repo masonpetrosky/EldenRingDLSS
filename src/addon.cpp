@@ -24,13 +24,17 @@
 #include <fstream>
 #include <mutex>
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "descriptors.hpp"
+#include "drs_probe.hpp"
 #include "dlss.hpp"
+#include "engine_resolution.hpp"
+#include "hw_breakpoints.hpp"
 #include "state_tracking.hpp"
 #include "kVegetationMaskCs.h"
 #include "tree_dump.hpp"
@@ -66,6 +70,7 @@ struct SceneParams {
   float jitter_ndc_x = 0, jitter_ndc_y = 0;
   float exposure = 1, pre_exposure = 1;
   float screen_percentage = 1;
+  float percentages[8] = {1, 1, 1, 1, 1, 1, 1, 1};  // SC_DynamicResolution_ScreenPercentage and the secondary
   float velocity_scale = 1, velocity_bias = 0;
 };
 
@@ -232,6 +237,18 @@ struct MaterialVs {
 };
 std::shared_mutex g_material_mutex;
 std::unordered_map<uint64_t, MaterialVs> g_material_vs;  // pipeline -> its material vertex shader
+
+// Stage 3 experiments (remote "drs", "drsforce"): the engine's dynamic-resolution screen percentages.
+erdlss::EngineResolution g_engine_res;
+std::mutex g_drs_mutex;
+bool g_drs_forcing = false;
+uint32_t g_drs_offset = erdlss::EngineResolution::kPrimaryPercentage;
+float g_drs_values[4] = {1, 1, 1, 1};
+
+// Stage 3 probe (remote "drsprobe"): the frame's resolution constants as last observed.
+erdlss::DrsProbe g_drs_probe;
+std::mutex g_drs_obs_mutex;
+erdlss::DrsObservation g_drs_obs;
 
 // Development dump of SpeedTree wind (remote "treedump <frames>"): the frames [first, end) are recorded.
 erdlss::TreeDump g_tree_dump;
@@ -408,6 +425,7 @@ bool ReadSceneParams(command_list* cmd_list, SceneParams* out) {
   out->exposure = f[kSceneExposure];
   out->pre_exposure = f[kPreExposure];
   out->screen_percentage = f[kScreenPercentage];
+  std::memcpy(out->percentages, f + kScreenPercentage, sizeof(out->percentages));
   out->velocity_scale = f[kVelocityEncode];
   out->velocity_bias = f[kVelocityEncode + 1];
   return true;
@@ -1969,10 +1987,57 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   if (w != 0 && (scene.width != static_cast<float>(w) || scene.height != static_cast<float>(h))) return false;
   data->scene = scene;
   data->scene_valid = true;
+  {
+    auto* const state = cmd_list->get_private_data<state_tracking>();
+    std::lock_guard obs_lock(g_drs_obs_mutex);
+    g_drs_obs.scene = true;
+    std::memcpy(g_drs_obs.percentages, scene.percentages, sizeof(scene.percentages));
+    if (state != nullptr && !state->viewports.empty()) {
+      g_drs_obs.viewport[0] = state->viewports[0].width;
+      g_drs_obs.viewport[1] = state->viewports[0].height;
+    }
+  }
   std::lock_guard lock(g_scene_mutex);
   g_scene = scene;
   LogSceneResolution(cmd_list, scene);
   return false;
+}
+
+// Reads `size` bytes at `offset` of the constant buffer bound to `reg` of `stage` (constant buffers live in upload
+// memory the CPU can read).
+bool ReadBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg, uint32_t offset, void* out,
+                        uint32_t size) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr) return false;
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it == state->descriptor_tables.end()) return false;
+  descriptor_heap heap = {0};
+  uint32_t slot = 0;
+  if (!descriptors->Find(dev, it->second.first, it->second.second, stage, RegisterKind::kConstantBuffer, reg, 0,
+                         &heap, &slot))
+    return false;
+  const buffer_range range = descriptors->Buffer(heap, slot);
+  if (range.buffer == 0 || range.size < offset + size) return false;
+  void* mapped = nullptr;
+  if (!dev->map_buffer_region(range.buffer, range.offset + offset, size, map_access::read_only, &mapped)) return false;
+  std::memcpy(out, mapped, size);
+  dev->unmap_buffer_region(range.buffer);
+  return true;
+}
+
+// Stage 3 probe: CB_AA's screen percentages (pixel b0, byte 240) and cbPostProcessCommon's (pixel b4, byte 0).
+void ObserveTaaResolution(command_list* cmd_list) {
+  float aa[8], post[4];
+  if (!ReadBoundConstants(cmd_list, shader_stage::pixel, 0, 240, aa, sizeof(aa)) ||
+      !ReadBoundConstants(cmd_list, shader_stage::pixel, 4, 0, post, sizeof(post)))
+    return;
+  std::lock_guard lock(g_drs_obs_mutex);
+  g_drs_obs.taa = true;
+  g_drs_obs.frame = g_frame.load();
+  std::memcpy(g_drs_obs.aa, aa, sizeof(aa));
+  std::memcpy(g_drs_obs.post, post, sizeof(post));
 }
 
 bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t, uint32_t) {
@@ -1986,6 +2051,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     return false;
   }
   if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) {
+    ObserveTaaResolution(cmd_list);
     if (g_config.wind_motion && g_wind_ready.load()) ResolveWind(cmd_list, *data);
     if (g_config.wind_motion && g_port_ready.load()) MergeWind(cmd_list, *data);
     if (g_dump_remaining.load() > 0) DumpTaaInputs(cmd_list);
@@ -2099,7 +2165,39 @@ void FinishRemote(const std::string& request, const std::string& result) {
 // Development remote control: commands written to remote.txt next to the add-on, e.g. "capture taa",
 // "dlss off", "sharpen on", "strength 0.1", "preset 10", "ca off", "mv 8 grass", "vmask 1", "vmaskall on". The
 // result goes to remote.done.
+// Remote "drs": the render context and the fields around its screen percentages, as floats and hex.
+std::string DescribeEngineResolution() {
+  if (g_engine_res.global() == 0 && !g_engine_res.Find()) return "view setup pattern not found";
+  const uintptr_t context = g_engine_res.Context();
+  char text[2048];
+  int n = std::snprintf(text, sizeof(text), "global 0x%llx, context 0x%llx",
+                        static_cast<unsigned long long>(g_engine_res.global()),
+                        static_cast<unsigned long long>(context));
+  uint32_t words[28];
+  if (context != 0 && g_engine_res.Read(0x960, words, sizeof(words))) {
+    for (int i = 0; i < 28 && n < static_cast<int>(sizeof(text)) - 48; ++i) {
+      float f;
+      std::memcpy(&f, &words[i], 4);
+      n += std::snprintf(text + n, sizeof(text) - n, "%s+%03x %g (%08x)", i % 4 == 0 ? "; " : " ", 0x960 + i * 4, f,
+                         words[i]);
+    }
+  }
+  return text;
+}
+
 void OnReshadePresent(effect_runtime* runtime) {
+  if (g_drs_probe.running()) {
+    erdlss::DrsObservation obs;
+    {
+      std::lock_guard lock(g_drs_obs_mutex);
+      obs = g_drs_obs;
+    }
+    g_drs_probe.OnFrame(g_frame.load(), obs);
+  }
+  {
+    std::lock_guard lock(g_drs_mutex);
+    if (g_drs_forcing) g_engine_res.Write(g_drs_offset, g_drs_values, sizeof(g_drs_values));
+  }
   if (g_config.wind_motion && !g_wind_ready.load() && !g_port_ready.load() && !g_wind_failed.load())
     StartWind(runtime);
   if (g_config.wind_motion && g_config.wind_mode == 1 && g_config.wind_trees && g_port_ready.load() &&
@@ -2167,10 +2265,11 @@ void OnReshadePresent(effect_runtime* runtime) {
   const fs::path request = g_addon_dir / L"remote.txt";
   std::error_code ec;
   if (!fs::exists(request, ec)) return;
-  std::string command, arg, arg2;
+  std::string line, command, arg, arg2;
   {
     std::ifstream in(request);
-    in >> command >> arg >> arg2;
+    std::getline(in, line);
+    std::istringstream(line) >> command >> arg >> arg2;
   }
   fs::remove(request, ec);
   std::string result = "ok";
@@ -2229,6 +2328,93 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "winddepth") {
     g_wind.set_depth_tolerance(std::strtof(arg.c_str(), nullptr));
     g_wind_port.set_depth_tolerance(std::strtof(arg.c_str(), nullptr));
+  } else if (command == "hwfill" || command == "hwexec" || command == "hwwatch") {
+    // hwfill: execute breakpoint on the cbSceneParam fill (0x141A340F0 in 1.16) with a view-list snapshot.
+    // hwexec <static va>: execute breakpoint (slot 2). hwwatch <address> [size]: write watch (slot 1).
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    bool ok;
+    if (command == "hwfill") {
+      ok = erdlss::HwBreakpoints::Arm(0, base + 0x1A340F0, erdlss::HwBreakpoints::Kind::kExecute, 1, 4, true);
+    } else if (command == "hwexec") {
+      const uintptr_t va = std::stoull(arg, nullptr, 16);
+      ok = va > 0x140000000 &&
+           erdlss::HwBreakpoints::Arm(2, base + (va - 0x140000000), erdlss::HwBreakpoints::Kind::kExecute, 1, 8, false);
+    } else {
+      const uintptr_t address = std::stoull(arg, nullptr, 16);
+      const int size = arg2.empty() ? 4 : std::atoi(arg2.c_str());
+      ok = erdlss::HwBreakpoints::Arm(1, address, erdlss::HwBreakpoints::Kind::kWrite, size, 8, false);
+    }
+    result = ok ? "armed" : "could not arm";
+  } else if (command == "hwhits") {
+    result = arg.empty() ? erdlss::HwBreakpoints::Describe(0) + "\n" + erdlss::HwBreakpoints::Describe(1) + "\n" +
+                               erdlss::HwBreakpoints::Describe(2)
+                         : erdlss::HwBreakpoints::Describe(std::atoi(arg.c_str()));
+  } else if (command == "hwoff") {
+    erdlss::HwBreakpoints::DisarmAll();
+  } else if (command == "drsptr") {
+    // drsptr <hex rva> [hex offset ...]: p = base + rva, then p = [p] + offset per offset; prints p and [p]
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    std::istringstream words(line);
+    std::string skip, token;
+    words >> skip >> token;
+    uintptr_t p = base + std::stoull(token, nullptr, 16);
+    bool ok = true;
+    while (ok && words >> token) {
+      uintptr_t next = 0;
+      ok = erdlss::DrsProbe::Read(p, &next, 8) && next != 0;
+      p = next + std::stoull(token, nullptr, 16);
+    }
+    uintptr_t value = 0;
+    erdlss::DrsProbe::Read(p, &value, 8);
+    char text[128];
+    std::snprintf(text, sizeof(text), "%s 0x%llx, holds 0x%llx", ok ? "address" : "broken chain at",
+                  static_cast<unsigned long long>(p), static_cast<unsigned long long>(value));
+    result = text;
+  } else if (command == "drsprobe") {
+    // drsprobe <hex address> <hex size> [value]
+    const float value = line.find_first_of('.') != std::string::npos
+                            ? std::strtof(line.substr(line.find_last_of(' ') + 1).c_str(), nullptr)
+                            : 0.67f;
+    result = g_drs_probe.Start(std::stoull(arg, nullptr, 16), std::stoull(arg2, nullptr, 16), value,
+                               g_addon_dir / L"shots" / L"drsprobe.txt");
+  } else if (command == "drsstatus") {
+    erdlss::DrsObservation obs;
+    {
+      std::lock_guard lock(g_drs_obs_mutex);
+      obs = g_drs_obs;
+    }
+    char text[256];
+    std::snprintf(text, sizeof(text), "%s; aa %.3f %.3f %.3f %.3f, post %.3f %.3f, scene %.3f %.3f, viewport %.0fx%.0f",
+                  g_drs_probe.running() ? g_drs_probe.status().c_str() : "probe idle", obs.aa[0], obs.aa[1],
+                  obs.aa[4], obs.aa[5], obs.post[0], obs.post[1], obs.percentages[0], obs.percentages[1],
+                  obs.viewport[0], obs.viewport[1]);
+    result = text;
+  } else if (command == "drs") {
+    result = DescribeEngineResolution();
+  } else if (command == "drsforce") {
+    // drsforce primary|secondary v0 v1 v2 v3, or drsforce off
+    std::lock_guard lock(g_drs_mutex);
+    if (arg == "off") {
+      g_drs_forcing = false;
+    } else {
+      g_drs_offset = arg == "secondary" ? erdlss::EngineResolution::kSecondaryPercentage
+                                        : erdlss::EngineResolution::kPrimaryPercentage;
+      float v[4] = {1, 1, 1, 1};
+      std::istringstream values(line);
+      std::string skip;
+      values >> skip >> skip;  // command and which
+      int got = 0;
+      while (got < 4 && values >> v[got]) ++got;
+      if (got >= 1) {
+        for (int i = got; i < 4; ++i) v[i] = v[got - 1];
+        std::memcpy(g_drs_values, v, sizeof(v));
+        g_drs_forcing = g_engine_res.global() != 0 || g_engine_res.Find();
+      }
+      char text[128];
+      std::snprintf(text, sizeof(text), "%s %s %g %g %g %g", g_drs_forcing ? "forcing" : "not forcing", arg.c_str(),
+                    g_drs_values[0], g_drs_values[1], g_drs_values[2], g_drs_values[3]);
+      result = text;
+    }
   } else if (command == "windtrees") {
     g_config.wind_trees = arg != "off";
   } else if (command == "windprepass") {
