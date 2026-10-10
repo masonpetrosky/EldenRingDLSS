@@ -20,11 +20,13 @@
 # -Round windopt: wind on; screenshots with wind on and off (the stream-output copy must draw the grass exactly like
 # the game); motion dumps with the game's time step, a 0.5 s step and a 1% depth tolerance; frame times with
 # everything on, with vertex-only current passes, without the resolve draw, and with wind off.
+# -Round upscale: render scale 0.67 with DLSS at the TAA and full-size post-processing: status, a pass log, a
+# screenshot and frame times; the same without the switch to full size; then DLAA (scale 1) and the game TAA.
 # -Round windport: the ported-shader path (WindMode=1): screenshots wind off/on, motion dumps with the game's time
 # step and with wind off, frame times with everything on, without the merge, and with wind off.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
-               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe')][string]$Round = 'sharpen',
+               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe', 'upscale')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -208,6 +210,18 @@ if ($Round -eq 'sharpen') {
     Copy-Item (Join-Path $Folder 'shots\drsprobe.txt') (Join-Path $Folder "shots\drsprobe_$name.txt") -Force
     Get-Content (Join-Path $Folder "shots\drsprobe_$name.txt") | Select-Object -First 12
   }
+} elseif ($Round -eq 'upscale') {
+  # Stage 3: DLSS at the TAA with the passes after it switched to full size (src/post_resolution.hpp, stretch.hpp).
+  function SavePassLog([string]$Name) {
+    Send 'passlog' 1.5
+    Copy-Item (Join-Path $Folder 'shots\passlog.txt') (Join-Path $Folder "shots\passlog_$Name.txt") -Force
+  }
+  Send 'dlss on'; Send 'scale 0.67' 5.0; Send 'scale'; Send 'ctx'
+  SavePassLog 'up67'; Send 'capture up67'; LogFrames 'up67'
+  Send 'postfull off' 2.0; SavePassLog 'up67_noswitch'; Send 'capture up67_noswitch'; Send 'postfull 15' 2.0
+  Send 'scale 1' 5.0; Send 'scale'; Send 'capture dlaa'; LogFrames 'dlaa'
+  Send 'dlss off' 2.0; Send 'capture taa'; LogFrames 'taa'
+  Send 'dlss on'; Send 'scale 0.67' 5.0; Send 'scale'; Send 'ctx'
 } elseif ($Round -eq 'treecost') {
   # Where the trees' cost goes: grass and trees with and without the resolve draw, grass only.
   Send 'dlss on'; Send 'wind on'; Send 'windtrees on' 3.0; LogFrames 'tc_trees'

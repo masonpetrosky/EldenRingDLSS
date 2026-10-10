@@ -1,4 +1,4 @@
-# Handoff: Elden Ring DLSS, state on 2026-10-09
+# Handoff: Elden Ring DLSS, state on 2026-10-10
 
 A ReShade 6.8 add-on (`src/`, built as `EldenRingDLSS.addon64`) loaded through me3 that replaces Elden Ring's TAA
 with DLSS. Full history and measurements are in `docs/recon.md`; this file is the short version for picking up.
@@ -10,11 +10,11 @@ with DLSS. Full history and measurements are in `docs/recon.md`; this file is th
 | 1. Recon | Done (2026-10-08) |
 | 2. DLAA (DLSS at native resolution) | Done, in the everyday install |
 | Wind motion vectors (grass, bushes, trees) | Done, in the everyday install |
-| 3. Upscaling (render below native, DLSS upscales) | In progress: research, next step is an in-game probe |
+| 3. Upscaling (render below native, DLSS upscales) | In progress: the scale works; full-size post-processing built, not yet run in game |
 | 4. Release | Not started. Publish to GitHub only when the user says so |
 
-The user wants to continue stage 3 and does not want to give up on it ("there's no way it's impossible to change
-the resolution").
+The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
+the tonemapped image at the final composite.
 
 ## Installs
 
@@ -24,8 +24,8 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
   `natives\EldenRingDLSS` (release DLSS DLL). Build of commit 6e672fa, installed 2026-10-09. Its ini: preset 0 (K),
   game sharpening off, game exposure on, chromatic aberration off, `WindMotion=1`, `WindMode=1`, `WindTrees=1`.
   Only update it with the user's explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
-- **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLL): test builds only. It currently has
-  the build of commit 19faa1b (the stage 3 probe build).
+- **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLL): test builds only. It has the
+  full-size post-processing build (2026-10-10, see "Stage 3" below), with `RenderScale=0.67` and `GameExposure=1`.
 
 ## Working rules (from the user)
 
@@ -48,13 +48,16 @@ pwsh -NoProfile -File tools/deploy.ps1 -Target dev    # use pwsh and absolute pa
 - Dev remote control: write a command to `remote.txt` in the dev folder; the answer appears in `remote.done`.
   `tools/remote.ps1 "<command>"` sends one; `tools/ab_capture.ps1 -Round <name>` runs scripted rounds (with
   PresentMon frame-time logs). Commands include `dlss`, `preset`, `mv N name` (TAA input dumps), `capture`,
-  `wind`, `windtrees`, `windstats`, `windmerge drawn|merged`, `treedump`, `drs`, `drsptr`, `drsprobe`,
-  `drsstatus`.
+  `wind`, `windtrees`, `windstats`, `windmerge drawn|merged`, `treedump`, `drsptr`, `drsstatus`, and for
+  upscaling `scale <x>`, `ctx`, `passlog`, `postfull <mask>|off`, `upscaleat taa|composite`, `mvbasis`.
+- `tools/mem.py` reads, searches and writes the running game's memory from outside (`read [s:1447F33E0]+EE0 30`,
+  `write s:... <hex>`, `scanvt <static vtable>`); works under RenderDoc too, where the add-on is not loaded.
 - Analysis scripts in `tools/` (Python venv at `.tools\venv`): `mv_check.py` (motion dumps; `--compare` finds
   pixels that change without motion vectors), `shots.py`, `wind_check.py`, `tree_check.py`, `prepass_check.py`.
 - RenderDoc 1.46 is in `.tools\renderdoc`, launched through the `eldenring-recon` me3 profile (user presses F12).
-  Captures are in `captures/`, the newest `er117_trees_f2056.rdc` (forest edge). Scripts:
-  `qrenderdoc.exe --python tools/rdc_*.py` with `ER_*` environment variables (each script documents them).
+  Captures are in `captures/`, the newest `er117_scale67_f2898.rdc` / `er117_scale100_f4572.rdc` (same spot, engine
+  scale 0.67 and 1). Scripts: `qrenderdoc.exe --python tools/rdc_*.py` with `ER_*` environment variables (each
+  script documents them); `rdc_passes.py` lists the post-processing chain with viewports and percentage constants.
 
 ## Wind motion vectors (done)
 
@@ -70,27 +73,28 @@ pwsh -NoProfile -File tools/deploy.ps1 -Target dev    # use pwsh and absolute pa
 
 ## Stage 3: upscaling (in progress)
 
-Goal: make the engine render the scene at e.g. 67% and let DLSS upscale (DLSS input is a sub-rectangle of the
-full-size targets, as on the consoles).
+Details, addresses and measurements: `docs/recon.md`, "Stage 3" rounds 1-4 (addresses for `eldenring.exe` 2.7.1.0).
 
-What is known (details and addresses in `docs/recon.md`, "Stage 3" sections; addresses are for the current
-`eldenring.exe` 2.7.1.0):
-- The PC renderer is dynamic-resolution aware: TAA reads `CB_AA` (b0) with `g_vScreenPercentage`, `_Primary`,
-  `_Prev`, `_PrevPrimary` at bytes 240-271, and `cbPostProcessCommon` (b4, 64 bytes: `g_dynamicScreenPercentage`
-  plus `g_texSizeReciprocal`, the same four pairs). The tonemap and light-shaft passes use
-  `ToneMapDynamicResolutionVS`. cbSceneParam has `SC_DynamicResolution_ScreenPercentage` (byte 1376) and a
-  secondary one (1392). All are 1.0 on PC.
-- The GPU load balancer's degradation list (`0x142F29E50`) has item 19 "Dynamic Resolution" at level 0.
-  `LoadBalancerParam` holds console dynamic-resolution settings (`tools/param_patch.py` patches it live), and
-  the system property `Performance.IsEnableDynamicResolution` exists. Patching the params and setting the
-  properties on 2026-10-08 changed nothing, but how the properties were set is poorly documented, and "level 0"
-  may mean "never".
-- Dead ends: the render context `[[0x143D61F98]+8]` (+0x9AC percentages; forcing them did nothing) and view+0xF4 in
-  `0x141A340F0` (that function builds 0x160-byte per-view blocks, not cbSceneParam).
-- Hardware breakpoints (`src/hw_breakpoints.*`) crash the game after about 30 s (anti-tamper). Don't use them.
-  Code hooks should be fine (other mods use them).
-- The code around the dynamic-resolution property and the load balancer is obfuscated (jump chains), so
-  static tracing stalls there.
+What works (in game, 2026-10-10):
+- The engine's console dynamic resolution is live on PC. Its scale is a float at `[0x1447F33E0]+0xF04` (1.0 on PC);
+  `src/render_scale.*` finds the object through a code pattern and the add-on holds the scale at `RenderScale`
+  while DLSS upscales (ini, overlay slider "Render scale", remote `scale`). At 0.67 the scene renders at 2572x1448
+  into the top-left of the full-size targets; CB_AA's `g_vScreenPercentage` gives the exact share.
+- DLSS takes that sub-rectangle (Quality mode at 0.67; the feature is created for the mode's dynamic range).
+  Jitter arrives in render pixels. 4K frame times: 8.1 ms at 67% vs 10.9 ms DLAA vs 9.6 ms game TAA.
+
+The open problem: every pass after the TAA (particles, depth of field, glow, bloom, light shafts, tonemap) also runs
+at the render size; on PC nothing upscales the result (the final composite `GXSimple_BlendUI` reads `HDRScene` one
+to one), so the screen showed the top-left 67% of the image. The 67%/100% captures differ there only in viewports
+and percentage constants.
+
+Built but not yet run in game (the latest commit, in the dev install):
+- DLSS at the TAA as for DLAA (NVIDIA's placement), then `src/stretch.*` scales up the five render-size inputs the
+  later passes read (depth buffer, depth copy, half-size depth, emissive, the scene's motion; nearest, in place) and
+  `src/post_resolution.*` switches the render context to full size for the passes recorded after the TAA, restored
+  at the composite. The context is found on the recording thread's stack (no code hook).
+- A first approach, upscaling the tonemapped `HDRScene` at the composite, stays as a development option
+  (`upscaleat composite`); NVIDIA says DLSS must run before tonemapping, and LDR input is 8-bit.
 
 Static analysis setup:
 - Ghidra 12.1.4 + Temurin JDK 21, portable in `.tools\ghidra` and `.tools\jdk`. The analyzed project is in
@@ -99,30 +103,30 @@ Static analysis setup:
   `xrefs`, `calls`, `writes <hexdisp>`, `symbols <text>` (RTTI class names survive), `near`, `ptrs`, `bytepair`.
   Each query takes about a minute (it opens the project headless).
 - Quick helpers: `tools/xref.py` (disassemble, RIP-relative references), `tools/funcs.py` (function ranges from
-  .pdata, direct callers), `tools/find_stores.py`.
+  .pdata, direct callers), `tools/find_stores.py`, `tools/find_disp.py` (instructions using a displacement).
+- Hardware breakpoints (`src/hw_breakpoints.*`) crash the game after about 30 s (anti-tamper). Don't use them.
 
 ### Next steps, in order
 
-1. **Run the probe** (needs the user in game, any outdoor spot, a few minutes; the game may crash):
-   `pwsh tools/ab_capture.ps1 -Round drsprobe`. It sets every float equal to 1.0 in the graphics manager
-   (`[0x1447F37A8]`, 0x14000 bytes), two of its sub-objects (+0x13A60, +0x13A68) and the render context to 0.67, a
-   few frames each, and logs what changes in `CB_AA`, `cbPostProcessCommon`, cbSceneParam's percentages and the
-   scene viewport: `shots/drsprobe_<name>.txt` in the dev folder (the first line is the baseline). Code:
-   `src/drs_probe.*`, hooks in `src/addon.cpp` (`ObserveTaaResolution`, the scene observation in `OnDrawIndexed`).
-2. If a field moves the percentages: force it (try 0.67), check the scene viewport shrinks and the image is right,
-   then feed DLSS the sub-rectangle and output full size (`src/dlss.*`; the TAA replacement is `ReplaceTaa` in
-   `src/addon.cpp`). Watch that the post-TAA passes then see 100%.
-3. If nothing moves: widen the probe to all private writable memory (look for persistent runs of the four
-   percentage pairs), then try driving the GX load balancer (non-zero dynamic-resolution level, or its current
-   load level), and as a last resort control render-target sizes and viewports from ReShade.
+1. **Run the test** (user in game outdoors, HDR on): launch the dev profile, then
+   `pwsh tools/ab_capture.ps1 -Round upscale`. Check the log ("Full-size post-processing: N buffers stretched ...
+   switched context ..."), `shots/passlog_up67.txt` (every draw after the TAA should have full-size viewports; compare
+   `passlog_up67_noswitch.txt`), the screenshots (`tools/shots.py`) and frame times. Then the user looks around:
+   sharpness, smearing, particles and depth of field.
+2. If the context is not found on the stack (log warning after 30 misses): find the render contexts in the heap by
+   the same signature (+0x448 == +0x7B0, see `tools/mem.py` scans in recon round 3) or hook the AA filter's per-frame
+   function (`0x141AD79A0`, context = second argument).
+3. If some passes stay at the render size: find where they read their size (Ghidra) and add it to the switch.
+4. Then: performance (the stretch costs a few copies), image checks against DLAA, the overlay text, and the
+   everyday install with the user's OK.
 
 ## Recent commits
 
 ```
+0b84427 Stage 3: upscale at the final UI composite
+c42575c Stage 3: render scale through the engine's dynamic resolution, DLSS sub-rect input
+e643a54 Stage 3: find the dynamic-resolution scale, add an external memory tool
+a3d552f Add a handoff note for the next session
 19faa1b Stage 3 research: resolution-state probe, Ghidra queries, corrected notes
-2fb1881 Note that the golden WorldTree_Leaves trees barely move
 6e672fa Tree motion vectors: overlay checkbox, lazy start, indirect resolve   <- everyday install
-7ee306c Tree motion vectors: SpeedTree through the stream-output path
-4a8fbe4 SpeedTree wind dump: last frame's tree clocks can be rebuilt
-59deba5 Grass prepass replacement experiment (off by default)
 ```

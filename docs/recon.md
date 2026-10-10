@@ -550,3 +550,36 @@ Live tests (dev build, outdoors, 4K):
 Next: force the scale from the add-on and give DLSS the sub-rectangle (size from `CB_AA` g_vScreenPercentage,
 which is the rounded w/W), output full size, scale jitter and motion vectors to match; then check in RenderDoc
 which post-TAA passes still apply the percentages.
+
+## Stage 3, round 4: where to upscale (2026-10-10)
+
+The add-on now holds the engine's scale (`RenderScale`, `src/render_scale.*`) and DLSS takes the scene's top-left
+share (Quality mode accepts 1920x1080 to 3840x2160 at 4K). At 0.67 the scene renders at 2572x1448 (the engine
+rounds to 4/8 pixels); the jitter arrives as exact Halton values in render pixels; frame times at 4K, wind on:
+8.1 ms (67%), 10.9 ms (DLAA), 9.6 ms (game TAA). But the final image was the top-left 67% of the full DLSS output.
+
+Captures `er117_scale67_f2898` / `er117_scale100_f4572` (same spot, no add-on, scale set with `tools/mem.py`),
+listed with `tools/rdc_passes.py` (viewport, targets, inputs and every screen-percentage constant per draw after the
+TAA):
+- Every pass after the TAA runs at the render size: sharpen, the particles (`GXFfx*`, `VS_VFX_*`, with
+  `g_dynamicResolution_UVScale`), the particle simulation (`dynamicResolutionX/Y`), depth of field (`LensSimu2_*`),
+  glow, bloom, light shafts, the tonemap, down to `ToneMap_PostOETFPS` writing `HDRScene`. Only the final composite
+  `GXSimple_BlendUI_*` works at full size and reads `HDRScene` one to one (no upscale on PC).
+- Between 67% and 100%, those passes differ only in viewports and percentage constants: same textures, same targets.
+- Inputs they read that the scene rendered at the render size: the depth buffer (particles depth-test,
+  `GreaterEqual`, no depth writes, no stencil), its copy `g_DepthTex` (soft particles, light shafts), the half-size
+  depth (depth of field), the emissive buffer (R11G11B10, glow; particles also draw into it), the scene's motion
+  (R16G16, the bloom's temporal bright pass).
+
+NVIDIA's DLSS programming guide (310.6, section 3.1): DLSS "must occur during the post-processing phase ... before
+tone mapping", as early as possible; LDR (tonemapped) input is quantized to 8 bits; section 3.8 recommends nearest
+upsampling of G-buffer data for post-processing that needs it. So the upscale stays at the TAA:
+- A first try upscaled at the composite (`upscaleat composite`, tonemapped input): kept as a development option only.
+- The default now: DLSS at the TAA, then `src/stretch.*` scales the five inputs above up to full size (nearest, in
+  place from a copy; depth through `SV_Depth`, stencil untouched) and `src/post_resolution.*` switches the render
+  context to full size for the passes recorded after the TAA (percentages +0x78C..0x798 = 1, mode +0x79C = 2, flag
+  +0x7A0 = 0, camera block = full size), restored at the composite. The context is found on the recording thread's
+  stack (no code hook): its camera pointer +0x448 points at its own +0x7B0.
+
+Not yet run in game. Test: `tools/ab_capture.ps1 -Round upscale` (pass logs `shots/passlog_*.txt`, captures, frame
+times); remote commands `ctx`, `passlog`, `postfull <mask>|off`, `upscaleat taa|composite`, `scale <x>`.

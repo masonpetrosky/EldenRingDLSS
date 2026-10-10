@@ -67,6 +67,9 @@ shader(kWindResolveArgsCs wind_resolve.hlsl cs_5_0 ArgsMain)
 shader(kWindPatchCs wind_patch.hlsl cs_5_0 main)
 shader(kWindMergeVs wind_merge.hlsl vs_5_0 VSMain)
 shader(kWindMergePs wind_merge.hlsl ps_5_0 PSMain)
+shader(kStretchVs stretch.hlsl vs_5_0 VSMain)
+shader(kStretchPsColor stretch.hlsl ps_5_0 PSColor)
+shader(kStretchPsDepth stretch.hlsl ps_5_0 PSDepth)
 shader(kTreeDumpCs tree_dump.hlsl cs_5_0 main)
 shader(kTreeWindPatchCs tree_wind.hlsl cs_5_0 Patch)
 shader(kTreeWindClearCs tree_wind.hlsl cs_5_0 Clear)
@@ -98,7 +101,7 @@ dxil_shader(kWindPrepassPsGrass2 wind_prepass.hlsl ps_6_0 PSMain ALPHA_TEST=1 PH
 dxil_shader(kWindPrepassPsVesitation wind_prepass.hlsl ps_6_0 PSMain ALPHA_TEST=2 PHASE_COMP=x BEND_COMP=w)
 
 add_library(EldenRingDLSS SHARED src/addon.cpp src/descriptors.cpp src/dlss.cpp src/wind.cpp src/wind_port.cpp
-            src/tree_dump.cpp src/engine_resolution.cpp src/render_scale.cpp
+            src/tree_dump.cpp src/engine_resolution.cpp src/render_scale.cpp src/post_resolution.cpp src/stretch.cpp
             src/hw_breakpoints.cpp src/drs_probe.cpp ${SHADER_HEADERS})
 target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui ${SHADER_DIR})
 target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
