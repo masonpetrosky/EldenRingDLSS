@@ -234,7 +234,10 @@ std::atomic<uint64_t> g_post_fixes{0};        // corrected passes, for the overl
 // when they are recorded in later frames (the first frame a new kind appears is not).
 std::mutex g_kinds_mutex;
 std::unordered_map<uint64_t, uint8_t> g_list_kinds;  // signature -> 1 seen before the TAA, 2 after, 3 both
-bool g_frame_taa_submitted = false;                  // under g_kinds_mutex; reset at present
+// This frame's submitted lists (signature, after the TAA), learned at present only if the frame had a TAA: menus and
+// loading screens have none.
+std::vector<std::pair<uint64_t, bool>> g_frame_lists;  // under g_kinds_mutex
+bool g_frame_taa_submitted = false;                    // under g_kinds_mutex; reset at present
 std::atomic<float> g_last_post_scale_x{1.0f}, g_last_post_scale_y{1.0f};  // the last upscaled TAA's share
 std::atomic<uint32_t> g_last_out_width{0}, g_last_out_height{0};
 std::atomic<uint64_t> g_motion_src{0};       // the scene's motion: the motion prep pass's g_MoveTex
@@ -2452,13 +2455,25 @@ void OnExecuteCommandList(command_queue*, command_list* cmd_list) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr || !data->signed_) return;
   std::lock_guard lock(g_kinds_mutex);
-  uint8_t& kind = g_list_kinds[data->signature];
-  const uint8_t was = kind;
-  kind |= g_frame_taa_submitted ? 2 : 1;
-  if (was != 0 && was != 3 && kind == 3)
-    Log(reshade::log::level::warning, "A command list kind (" + PipelineName(data->signature) +
-                                          ") came both before and after the TAA; it is not corrected.");
+  g_frame_lists.emplace_back(data->signature, g_frame_taa_submitted);
   if (data->has_taa) g_frame_taa_submitted = true;
+}
+
+// At present: learns the frame's list kinds if it had a TAA.
+void LearnListKinds() {
+  std::lock_guard lock(g_kinds_mutex);
+  if (g_frame_taa_submitted) {
+    for (const auto& [signature, after] : g_frame_lists) {
+      uint8_t& kind = g_list_kinds[signature];
+      const uint8_t was = kind;
+      kind |= after ? 2 : 1;
+      if (was != 0 && was != 3 && kind == 3)
+        Log(reshade::log::level::warning, "A command list kind (" + PipelineName(signature) +
+                                              ") came both before and after the TAA; it is not corrected.");
+    }
+  }
+  g_frame_lists.clear();
+  g_frame_taa_submitted = false;
 }
 
 // Every named draw (no materials) of the frame, with its command list and thread, whether it follows an upscaled TAA
@@ -2750,10 +2765,7 @@ void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, ui
     std::lock_guard lock(g_dlss_mutex);
     g_dlss.ReleaseFeature();
   }
-  {
-    std::lock_guard lock(g_kinds_mutex);
-    g_frame_taa_submitted = false;
-  }
+  LearnListKinds();
   ApplyRenderScale();
   const uint64_t passlog = g_passlog_frame.load();
   if (passlog != 0 && frame > passlog) {
