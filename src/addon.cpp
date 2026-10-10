@@ -35,6 +35,7 @@
 #include "dlss.hpp"
 #include "engine_resolution.hpp"
 #include "hw_breakpoints.hpp"
+#include "render_scale.hpp"
 #include "state_tracking.hpp"
 #include "kVegetationMaskCs.h"
 #include "tree_dump.hpp"
@@ -92,6 +93,9 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
 struct Config {
   bool enabled = false;
   int preset = 0;  // 0 = NGX default, which is preset K for DLAA
+  // Share of the output size (per axis) the scene renders at while DLSS is on, through the engine's dynamic
+  // resolution (render_scale.hpp); DLSS upscales the rest. 1 = DLAA.
+  float render_scale = 1.0f;
   int toggle_key = VK_F9;
   bool game_sharpening = false;  // run the game's TAA sharpening filter on the DLSS output
   float sharpen_strength = 0.25f;  // its strength while DLSS is on (the game uses 0.25)
@@ -127,6 +131,8 @@ struct Config {
   bool flip_motion = false;
   bool use_depth_copy = false;
 };
+
+constexpr float kMinRenderScale = 0.33f;
 
 Config g_config;
 fs::path g_addon_dir;
@@ -172,8 +178,16 @@ std::mutex g_scene_mutex;
 SceneParams g_scene;  // most recent valid scene constants, for command lists without their own
 std::atomic<uint64_t> g_depth{0};
 std::atomic<uint64_t> g_depth_copy{0};
-std::atomic<uint32_t> g_render_width{0};
+std::atomic<uint32_t> g_render_width{0};   // the TAA's target size (= output size)
 std::atomic<uint32_t> g_render_height{0};
+std::atomic<uint32_t> g_input_width{0};    // the scene's top-left share of it at the last TAA
+std::atomic<uint32_t> g_input_height{0};
+
+// The engine's dynamic-resolution scale, held at the render scale while DLSS is on.
+erdlss::RenderScale g_render_scale;
+bool g_render_scale_missing = false;  // the pattern was not found
+bool g_render_scale_set = false;      // a scale below 1 was written
+bool g_mv_full_basis = false;         // development: motion vectors in output instead of render heights
 
 std::atomic<uint64_t> g_frame{0};
 std::atomic<float> g_frame_time_ms{16.7f};
@@ -305,6 +319,7 @@ void WriteFloat(const wchar_t* key, float value) {
 void LoadConfig() {
   g_config.enabled = ReadInt(L"Enabled", 0) != 0;
   g_config.preset = ReadInt(L"Preset", 0);
+  g_config.render_scale = std::clamp(ReadFloat(L"RenderScale", 1.0f), kMinRenderScale, 1.0f);
   g_config.toggle_key = ReadInt(L"ToggleKey", VK_F9);
   g_config.game_sharpening = ReadInt(L"GameSharpening", 0) != 0;
   g_config.sharpen_strength = ReadFloat(L"SharpenStrength", 0.25f);
@@ -327,6 +342,7 @@ void LoadConfig() {
 void SaveConfig() {
   WriteInt(L"Enabled", g_config.enabled);
   WriteInt(L"Preset", g_config.preset);
+  WriteFloat(L"RenderScale", g_config.render_scale);
   WriteInt(L"ToggleKey", g_config.toggle_key);
   WriteInt(L"GameSharpening", g_config.game_sharpening);
   WriteFloat(L"SharpenStrength", g_config.sharpen_strength);
@@ -729,8 +745,9 @@ bool BuildMask(command_list* cmd_list, resource stencil, uint32_t width, uint32_
   return true;
 }
 
-// Returns true when DLSS replaced the draw.
-bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
+// Returns true when DLSS replaced the draw. `screen` is CB_AA's g_vScreenPercentage: the share of the targets the
+// scene was rendered into (top-left), below 1 with the engine's dynamic resolution.
+bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   const uint64_t draw = ++g_taa_draws;
   device* const dev = cmd_list->get_device();
   auto* const state = cmd_list->get_private_data<state_tracking>();
@@ -754,8 +771,15 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
 
   const resource_desc td = target != 0 ? dev->get_resource_desc(target) : resource_desc();
   const uint32_t width = td.texture.width, height = td.texture.height;
+  const auto share = [](uint32_t size, float percentage) {
+    if (!(percentage > 0.2f && percentage < 1.0f)) return size;
+    return std::min(size, std::max(1u, static_cast<uint32_t>(std::lround(size * percentage))));
+  };
+  const uint32_t in_width = share(width, screen[0]), in_height = share(height, screen[1]);
   g_render_width = width;
   g_render_height = height;
+  g_input_width = in_width;
+  g_input_height = in_height;
   bool valid = color != 0 && motion != 0 && target != 0 && depth != 0;
   if (valid) {
     const resource_desc cd = dev->get_resource_desc(color);
@@ -765,17 +789,23 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
             md.texture.width == width && md.texture.height == height && md.texture.format == format::r16g16_float &&
             dd.texture.width == width && dd.texture.height == height;
   }
-  const bool scene_ok = have_scene && scene.width == static_cast<float>(width) &&
-                        scene.height == static_cast<float>(height);
+  // The scene constants' screen size is the full one or, with dynamic resolution, possibly the render size.
+  const bool scene_ok =
+      have_scene && ((scene.width == static_cast<float>(width) && scene.height == static_cast<float>(height)) ||
+                     (scene.width == static_cast<float>(in_width) && scene.height == static_cast<float>(in_height)));
 
-  if (draw == 1 || !valid || !scene_ok) {
+  static uint32_t last_in_width = 0, last_in_height = 0;
+  if (draw == 1 || !valid || !scene_ok || in_width != last_in_width || in_height != last_in_height) {
+    last_in_width = in_width;
+    last_in_height = in_height;
     char text[512];
     std::snprintf(text, sizeof(text),
-                  "TAA pass: color %s, motion %s, depth %s, target %s; scene constants %s (%.0fx%.0f, exposure "
-                  "%.3g, pre-exposure %.3g, screen %% %.3g)%s",
+                  "TAA pass: color %s, motion %s, depth %s, target %s, scene rendered at %ux%u; scene constants %s "
+                  "(%.0fx%.0f, exposure %.3g, pre-exposure %.3g, screen %% %.3g)%s",
                   Describe(dev, color).c_str(), Describe(dev, motion).c_str(), Describe(dev, depth).c_str(),
-                  Describe(dev, target).c_str(), have_scene ? (scene_ok ? "ok" : "size mismatch") : "missing",
-                  scene.width, scene.height, scene.exposure, scene.pre_exposure, scene.screen_percentage,
+                  Describe(dev, target).c_str(), in_width, in_height,
+                  have_scene ? (scene_ok ? "ok" : "size mismatch") : "missing", scene.width, scene.height,
+                  scene.exposure, scene.pre_exposure, scene.screen_percentage,
                   valid ? "" : " - inputs incomplete, keeping the game's TAA");
     SetInfo(text);
   }
@@ -787,24 +817,28 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   if (!EnsureOutput(dev, width, height, td.texture.format)) return false;
   const bool game_exposure = g_config.game_exposure && EnsureExposure(dev);
   if (g_dlss.has_feature() && (g_dlss.feature_width() != width || g_dlss.feature_height() != height ||
+                               g_dlss.feature_scale() != g_config.render_scale ||
                                g_dlss.feature_auto_exposure() == game_exposure)) {
     g_recreate = true;  // the old feature may still be in flight; it is released at present once the GPU is idle
     return false;
   }
   if (!g_dlss.has_feature()) {
-    const bool created = g_dlss.Create(native, width, height, g_config.preset, !game_exposure);
+    const bool created =
+        g_dlss.Create(native, width, height, g_config.render_scale, g_config.preset, !game_exposure);
     RestoreState(cmd_list, data);
     if (!created) {
       g_config.enabled = false;
       Log(reshade::log::level::error, g_dlss.status() + "; DLSS disabled.");
     } else {
-      Log(reshade::log::level::info, "Created DLSS feature at " + std::to_string(width) + "x" +
-                                         std::to_string(height) + ", preset " + std::to_string(g_config.preset) +
-                                         (game_exposure ? ", game exposure" : ", auto-exposure"));
+      Log(reshade::log::level::info, "Created DLSS feature for render scale " +
+                                         std::to_string(g_config.render_scale) + ", preset " +
+                                         std::to_string(g_config.preset) + ": " + g_dlss.status());
     }
     g_reset = true;
     return false;  // DLSS takes over from the next frame
   }
+  // E.g. the frame after the feature was created, before the engine follows the render scale.
+  if (!g_dlss.accepts(in_width, in_height)) return false;
   if (game_exposure) UploadExposure(cmd_list, scene.exposure);
   const bool masked = g_config.vegetation_mask > 0.0f &&
                       BuildMask(cmd_list, BoundResource(cmd_list, shader_stage::pixel, 5) /* g_StencilTex */, width,
@@ -817,14 +851,15 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   in.output = reinterpret_cast<ID3D12Resource*>(g_output.handle);
   in.exposure = game_exposure ? reinterpret_cast<ID3D12Resource*>(g_exposure.handle) : nullptr;
   in.bias_mask = masked ? reinterpret_cast<ID3D12Resource*>(g_mask.handle) : nullptr;
-  in.width = width;
-  in.height = height;
-  // Projection offset in pixels with x right and y down.
-  in.jitter_x = (g_config.flip_jitter_x ? -1.0f : 1.0f) * scene.jitter_ndc_x * 0.5f * width;
-  in.jitter_y = (g_config.flip_jitter_y ? -1.0f : 1.0f) * -scene.jitter_ndc_y * 0.5f * height;
+  in.width = in_width;
+  in.height = in_height;
+  // Projection offset in render pixels with x right and y down (the viewport maps NDC onto the render size).
+  in.jitter_x = (g_config.flip_jitter_x ? -1.0f : 1.0f) * scene.jitter_ndc_x * 0.5f * in_width;
+  in.jitter_y = (g_config.flip_jitter_y ? -1.0f : 1.0f) * -scene.jitter_ndc_y * 0.5f * in_height;
   // The game stores (current - previous) UV with x scaled by the aspect ratio, i.e. both axes in screen
-  // heights; DLSS wants previous - current in pixels.
-  const float mv_scale = (g_config.flip_motion ? 1.0f : -1.0f) * static_cast<float>(height);
+  // heights; DLSS wants previous - current in render pixels.
+  const float mv_scale =
+      (g_config.flip_motion ? 1.0f : -1.0f) * static_cast<float>(g_mv_full_basis ? height : in_height);
   in.mv_scale_x = mv_scale;
   in.mv_scale_y = mv_scale;
   in.reset = g_reset.exchange(false);
@@ -845,11 +880,12 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data) {
   data.dlss_applied = true;
   const uint64_t frames = ++g_dlss_frames;
   if (frames == 1 || frames % 3000 == 0) {
-    char text[320];
+    char text[384];
     std::snprintf(text, sizeof(text),
-                  "DLSS frame %llu: jitter %+.3f %+.3f px, exposure %.3g (%s), failures %llu, game sharpening %s, "
-                  "mip bias %+.2f on %llu samplers",
-                  static_cast<unsigned long long>(frames), in.jitter_x, in.jitter_y, scene.exposure,
+                  "DLSS frame %llu: render %ux%u of %ux%u, jitter %+.3f %+.3f px, exposure %.3g (%s), failures %llu, "
+                  "game sharpening %s, mip bias %+.2f on %llu samplers",
+                  static_cast<unsigned long long>(frames), in_width, in_height, width, height, in.jitter_x,
+                  in.jitter_y, scene.exposure,
                   game_exposure ? "game" : "auto", static_cast<unsigned long long>(g_failures.load()),
                   g_config.game_sharpening ? "on" : "off", g_applied_mip_bias,
                   static_cast<unsigned long long>(g_biased_samplers.load()));
@@ -1982,9 +2018,13 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   ++data->scene_attempts;
   SceneParams scene;
   if (!ReadSceneParams(cmd_list, &scene)) return false;
-  // Other cameras (shadows, probes) use other sizes; once the TAA size is known, only accept matching ones.
+  // Other cameras (shadows, probes) use other sizes; once the TAA size is known, only accept matching ones (the full
+  // size or, with dynamic resolution, possibly the render size).
   const uint32_t w = g_render_width.load(), h = g_render_height.load();
-  if (w != 0 && (scene.width != static_cast<float>(w) || scene.height != static_cast<float>(h))) return false;
+  const uint32_t iw = g_input_width.load(), ih = g_input_height.load();
+  if (w != 0 && !(scene.width == static_cast<float>(w) && scene.height == static_cast<float>(h)) &&
+      !(scene.width == static_cast<float>(iw) && scene.height == static_cast<float>(ih)))
+    return false;
   data->scene = scene;
   data->scene_valid = true;
   {
@@ -2027,12 +2067,15 @@ bool ReadBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg
   return true;
 }
 
-// Stage 3 probe: CB_AA's screen percentages (pixel b0, byte 240) and cbPostProcessCommon's (pixel b4, byte 0).
-void ObserveTaaResolution(command_list* cmd_list) {
+// CB_AA's screen percentages (pixel b0, byte 240) and cbPostProcessCommon's (pixel b4, byte 0). `screen` receives
+// g_vScreenPercentage, the share of the targets the scene was rendered into; it stays 1 when unreadable.
+void ObserveTaaResolution(command_list* cmd_list, float screen[2]) {
   float aa[8], post[4];
   if (!ReadBoundConstants(cmd_list, shader_stage::pixel, 0, 240, aa, sizeof(aa)) ||
       !ReadBoundConstants(cmd_list, shader_stage::pixel, 4, 0, post, sizeof(post)))
     return;
+  screen[0] = aa[0];
+  screen[1] = aa[1];
   std::lock_guard lock(g_drs_obs_mutex);
   g_drs_obs.taa = true;
   g_drs_obs.frame = g_frame.load();
@@ -2051,11 +2094,12 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     return false;
   }
   if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) {
-    ObserveTaaResolution(cmd_list);
+    float screen[2] = {1, 1};
+    ObserveTaaResolution(cmd_list, screen);
     if (g_config.wind_motion && g_wind_ready.load()) ResolveWind(cmd_list, *data);
     if (g_config.wind_motion && g_port_ready.load()) MergeWind(cmd_list, *data);
     if (g_dump_remaining.load() > 0) DumpTaaInputs(cmd_list);
-    return ReplaceTaa(cmd_list, *data);
+    return ReplaceTaa(cmd_list, *data, screen);
   }
   if (data->pass == Pass::kSharpen && data->dlss_applied && vertex_count == 3 && instance_count == 1) {
     if (!g_config.game_sharpening) return SkipSharpen(cmd_list);
@@ -2102,6 +2146,28 @@ void LogOutputMode(swapchain* sc) {
                                      ColorSpaceName(space) + ".");
 }
 
+// Holds the engine's dynamic-resolution scale at the render scale while DLSS can take the result, and at 1 otherwise:
+// nothing else upscales the scene. Applies from the next frame.
+void ApplyRenderScale() {
+  float scale = 1.0f;
+  if (g_config.enabled && g_config.render_scale < 1.0f) {
+    std::lock_guard lock(g_dlss_mutex);
+    if (g_dlss.has_feature() && g_dlss.feature_scale() == g_config.render_scale)
+      scale = std::clamp(g_config.render_scale, g_dlss.min_scale(), g_dlss.max_scale());
+  }
+  if (scale == 1.0f && !g_render_scale_set) return;  // never touch the engine without a reason
+  if (!g_render_scale.found()) {
+    if (g_render_scale_missing) return;
+    if (!g_render_scale.Find()) {
+      g_render_scale_missing = true;
+      Log(reshade::log::level::warning, "The engine's dynamic-resolution scale was not found (game version?); the "
+                                        "scene keeps rendering at full size.");
+      return;
+    }
+  }
+  if (g_render_scale.Set(scale)) g_render_scale_set = scale < 1.0f;
+}
+
 void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
   const uint64_t frame = ++g_frame;
   if (sc != nullptr) LogOutputMode(sc);
@@ -2125,6 +2191,7 @@ void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, ui
     std::lock_guard lock(g_dlss_mutex);
     g_dlss.ReleaseFeature();
   }
+  ApplyRenderScale();
   if (!g_retired.empty() && g_device != nullptr) {
     std::lock_guard lock(g_dlss_mutex);
     for (auto it = g_retired.begin(); it != g_retired.end();) {
@@ -2437,6 +2504,18 @@ void OnReshadePresent(effect_runtime* runtime) {
     g_config.mask_everything = arg == "on";
   } else if (command == "ca") {
     g_config.chromatic_aberration = arg == "on";
+  } else if (command == "scale") {
+    // scale <render scale>: not saved
+    if (!arg.empty()) g_config.render_scale = std::clamp(std::strtof(arg.c_str(), nullptr), kMinRenderScale, 1.0f);
+    char text[160];
+    std::snprintf(text, sizeof(text), "render scale %.3f, engine %.3f, rendering %ux%u of %ux%u",
+                  g_config.render_scale, g_render_scale.Get(), g_input_width.load(), g_input_height.load(),
+                  g_render_width.load(), g_render_height.load());
+    result = text;
+  } else if (command == "mvbasis") {
+    g_mv_full_basis = arg == "full";
+    g_reset = true;
+    result = g_mv_full_basis ? "motion vectors in output heights" : "motion vectors in render heights";
   } else {
     result = "unknown command";
   }
@@ -2462,6 +2541,21 @@ void OnOverlay(effect_runtime*) {
     g_recreate = true;
     SaveConfig();
   }
+  // Applied on release: every change recreates the DLSS feature.
+  static int scale_percent = 0;
+  if (!ImGui::IsAnyItemActive()) scale_percent = static_cast<int>(std::lround(g_config.render_scale * 100.0f));
+  ImGui::SliderInt("Render scale", &scale_percent, static_cast<int>(kMinRenderScale * 100.0f), 100, "%d%%");
+  if (ImGui::IsItemDeactivatedAfterEdit()) {
+    g_config.render_scale = std::clamp(scale_percent / 100.0f, kMinRenderScale, 1.0f);
+    SaveConfig();
+  }
+  ImGui::SetItemTooltip("The scene renders at this share of the screen size (per axis) and DLSS upscales it: 100%% "
+                        "is DLAA, 67%% matches DLSS Quality, 58%% Balanced, 50%% Performance. The texture mip bias "
+                        "follows at the next start.");
+  if (g_config.enabled && g_input_width.load() != 0)
+    ImGui::Text("  rendering %ux%u of %ux%u", g_input_width.load(), g_input_height.load(), g_render_width.load(),
+                g_render_height.load());
+  if (g_render_scale_missing) ImGui::Text("  the engine's scale control was not found; rendering at full size");
   if (ImGui::Checkbox("Game sharpening on top of DLSS", &g_config.game_sharpening)) SaveConfig();
   ImGui::SetItemTooltip("The game's TAA sharpening filter. Off shows DLSS's output as is.");
   if (g_config.game_sharpening) {
@@ -2505,7 +2599,8 @@ void OnOverlay(effect_runtime*) {
                     g_wind_error.empty() ? "" : ": ", g_wind_error.c_str());
     }
   }
-  ImGui::Text("Texture mip bias: %+.2f on %llu samplers (MipBias in EldenRingDLSS.ini, needs a restart)",
+  ImGui::Text("Texture mip bias: %+.2f on %llu samplers (MipBias in EldenRingDLSS.ini plus log2 of the render "
+              "scale, set at startup)",
               g_applied_mip_bias, static_cast<unsigned long long>(g_biased_samplers.load()));
 
   {
@@ -2544,11 +2639,12 @@ void Initialize(HMODULE module) {
   g_addon_dir = fs::path(path).parent_path();
   g_ini_path = g_addon_dir / L"EldenRingDLSS.ini";
   LoadConfig();
-  // The bias is baked into samplers as the game creates them, so it follows the DLSS setting at startup.
-  g_applied_mip_bias = g_config.enabled ? g_config.mip_bias : 0.0f;
+  // The bias is baked into samplers as the game creates them, so it follows the DLSS settings at startup. Below full
+  // size, textures need log2(render / output) more (NVIDIA's guidance).
+  g_applied_mip_bias = g_config.enabled ? g_config.mip_bias + std::log2(g_config.render_scale) : 0.0f;
   char text[160];
-  std::snprintf(text, sizeof(text), "Loaded. DLSS %s; toggle key %d; texture mip bias %+.2f.",
-                g_config.enabled ? "on" : "off", g_config.toggle_key, g_applied_mip_bias);
+  std::snprintf(text, sizeof(text), "Loaded. DLSS %s; render scale %.2f; toggle key %d; texture mip bias %+.2f.",
+                g_config.enabled ? "on" : "off", g_config.render_scale, g_config.toggle_key, g_applied_mip_bias);
   Log(reshade::log::level::info, text);
 }
 

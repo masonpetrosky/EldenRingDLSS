@@ -7,6 +7,7 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
+#include <cmath>
 #include <cstdio>
 
 namespace erdlss {
@@ -19,6 +20,35 @@ std::string Hex(NVSDK_NGX_Result result) {
   char text[16];
   std::snprintf(text, sizeof(text), "0x%08X", static_cast<unsigned>(result));
   return text;
+}
+
+// DLSS's quality modes with their nominal render / output ratios and preset hints.
+struct Mode {
+  NVSDK_NGX_PerfQuality_Value value;
+  float scale;
+  const char* name;
+  const char* preset_hint;
+};
+constexpr Mode kModes[] = {
+    {NVSDK_NGX_PerfQuality_Value_DLAA, 1.0f, "DLAA", NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA},
+    {NVSDK_NGX_PerfQuality_Value_UltraQuality, 0.77f, "Ultra Quality",
+     NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality},
+    {NVSDK_NGX_PerfQuality_Value_MaxQuality, 0.667f, "Quality", NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality},
+    {NVSDK_NGX_PerfQuality_Value_Balanced, 0.58f, "Balanced", NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced},
+    {NVSDK_NGX_PerfQuality_Value_MaxPerf, 0.5f, "Performance", NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance},
+    {NVSDK_NGX_PerfQuality_Value_UltraPerformance, 0.333f, "Ultra Performance",
+     NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance},
+};
+
+// DLAA at full size, otherwise the mode whose ratio is closest.
+const Mode& PickMode(float scale) {
+  if (scale >= 0.999f) return kModes[0];
+  const Mode* best = &kModes[1];
+  for (const Mode& mode : kModes)
+    if (mode.value != NVSDK_NGX_PerfQuality_Value_DLAA &&
+        std::fabs(mode.scale - scale) < std::fabs(best->scale - scale))
+      best = &mode;
+  return *best;
 }
 
 void NVSDK_CONV OnNgxLog(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
@@ -89,17 +119,36 @@ void Dlss::Shutdown() {
   status_ = "shut down";
 }
 
-bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, int preset, bool auto_exposure) {
+bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, float scale, int preset,
+                  bool auto_exposure) {
   if (!available_) return false;
   ReleaseFeature();
-  NVSDK_NGX_Parameter_SetUI(params_, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned>(preset));
+  for (const Mode& m : kModes) NVSDK_NGX_Parameter_SetUI(params_, m.preset_hint, static_cast<unsigned>(preset));
+
+  // The render sizes the mode accepts (dynamic resolution); the feature is created for the largest.
+  const Mode& mode = PickMode(scale);
+  uint32_t optimal_w = 0, optimal_h = 0, max_w = 0, max_h = 0, min_w = 0, min_h = 0;
+  float sharpness = 0;
+  NVSDK_NGX_Parameter* caps = nullptr;
+  if (NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_GetCapabilityParameters(&caps)) && caps != nullptr) {
+    if (NVSDK_NGX_FAILED(NGX_DLSS_GET_OPTIMAL_SETTINGS(caps, width, height, mode.value, &optimal_w, &optimal_h,
+                                                       &max_w, &max_h, &min_w, &min_h, &sharpness)))
+      max_w = 0;
+    NVSDK_NGX_D3D12_DestroyParameters(caps);
+  }
+  if (max_w == 0 || max_h == 0 || max_w > width || max_h > height || min_w > max_w || min_h > max_h) {
+    // No usable answer: allow everything up to the output size.
+    min_w = min_h = 1;
+    max_w = width;
+    max_h = height;
+  }
 
   NVSDK_NGX_DLSS_Create_Params create = {};
-  create.Feature.InWidth = width;
-  create.Feature.InHeight = height;
+  create.Feature.InWidth = max_w;
+  create.Feature.InHeight = max_h;
   create.Feature.InTargetWidth = width;
   create.Feature.InTargetHeight = height;
-  create.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+  create.Feature.InPerfQualityValue = mode.value;
   // HDR linear color, motion vectors at render resolution without jitter, reverse-Z depth.
   create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
                                 NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
@@ -112,8 +161,16 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
   }
   width_ = width;
   height_ = height;
+  scale_ = scale;
+  min_width_ = min_w;
+  min_height_ = min_h;
+  max_width_ = max_w;
+  max_height_ = max_h;
   auto_exposure_ = auto_exposure;
-  status_ = auto_exposure ? "running (auto-exposure)" : "running (game exposure)";
+  char text[160];
+  std::snprintf(text, sizeof(text), "running %s, render %ux%u to %ux%u, output %ux%u (%s)", mode.name, min_w, min_h,
+                max_w, max_h, width, height, auto_exposure ? "auto-exposure" : "game exposure");
+  status_ = text;
   return true;
 }
 
@@ -121,6 +178,7 @@ void Dlss::ReleaseFeature() {
   if (feature_ != nullptr) NVSDK_NGX_D3D12_ReleaseFeature(feature_);
   feature_ = nullptr;
   width_ = height_ = 0;
+  min_width_ = min_height_ = max_width_ = max_height_ = 0;
 }
 
 bool Dlss::Evaluate(ID3D12GraphicsCommandList* cmd, const DlssInputs& in) {
