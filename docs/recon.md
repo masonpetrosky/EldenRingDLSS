@@ -623,3 +623,23 @@ measure, and limit it to upscaled frames.
   is unsafe. Only write to verified persistent objects (vtable checked).
 - User check at 67%: static detail, motion, effects, menus and the map all fine. The developer DLSS DLL in the dev
   profile shows a "DLSS SDK - DO NOT DISTRIBUTE" watermark; the release DLL does not.
+
+## Stage 3: the fire's heat distortion and sparks (2026-10-10)
+
+At 50% the smoke above a brazier showed flat rectangles, and later, after list-kind changes, the sparks drifted toward
+the top-left. Causes and fixes (`src/addon.cpp`):
+- The squares are the heat distortion (`GXFfxdistortionSoftBump`): each particle copies its rectangle of the screen
+  (`PointSampleColor1`, full-size viewport, scissor = the rectangle) and samples the copy inside `g_resolveRectUV`
+  (PSCommonBuffer byte 16). The engine gives both in the scene's share. Fixed: `g_resolveRectUV` divided by the share
+  while `g_dynamicResolution_UVScale` still shows it, and the copy's scissor scaled up (log "Distortion copy scissor
+  1067,545-1186,664 -> 2134,1090-2372,1328"). Captures `er117_fire_scale100_f3330.rdc` / `er117_fire_scale50_4894.rdc`
+  (no add-on; rdc_cbdump diff).
+- The distortion and the sparks (`GXFfxtessellateQuadLineColorOnlyGlowD`) share one command list that comes after
+  the TAA almost always but before it every 10-20 s; the title screen orders some lists differently too. Without
+  upscaling the order does not matter (everything after the TAA is render size), so the game does not keep it.
+  A kind marked "both" for good left the list uncorrected (sparks displaced). List kinds are now decided by the
+  majority of their last 64 frames with a TAA, and a kind's signature includes the first draw's target (particle
+  lists start with the same pipelines before and after the TAA). Ending the frame at the UI composite instead of at
+  present was tried and changed nothing (no next-frame lists come before present).
+- The pass log now shows per draw the list signature, its kind, the target (`*` = the TAA's input) and the
+  submission order of the lists.

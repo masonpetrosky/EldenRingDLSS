@@ -15,6 +15,7 @@
 #include <reshade.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -103,6 +104,8 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   uint64_t signature = 0;
   bool signed_ = false;
   bool has_taa = false;  // the TAA was recorded here
+  uint64_t first_target = 0;  // the texture the first draw drew into (part of the signature)
+  bool has_ui = false;        // the final UI composite was recorded here: the frame's last list
   // Wind: the game's cbSceneParam/cbPerFrame addresses last patched in this command list and the patched slot.
   uint64_t wind_scene = 0, wind_frame = 0, wind_prev = 0;
   bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
@@ -239,6 +242,12 @@ erdlss::Stretch g_stretch;
 bool g_stretch_failed = false;
 bool g_post_fix = true;                       // development (remote "postfix on|off")
 bool g_stretch_inputs = true;                 // development (remote "stretch on|off")
+// The scene color the TAA reads (its SourceTex), for the pass log. (Not a rule for corrections: the game draws into it
+// again after the TAA.)
+std::atomic<uint64_t> g_taa_source{0};
+// Command list kinds: the pipeline name of each signature, for logs.
+std::mutex g_kind_names_mutex;
+std::unordered_map<uint64_t, std::string> g_kind_names;
 // The main camera's position (SC_CameraPos) from the last accepted scene constants, for the ray tracing refit schedule.
 std::mutex g_camera_mutex;
 float g_camera_pos[3] = {0, 0, 0};
@@ -249,11 +258,23 @@ std::atomic<uint64_t> g_post_fixes{0};        // corrected passes, for the overl
 // frame is post-processing. Lists are recognized by their first pipeline; kinds seen only after the TAA are corrected
 // when they are recorded in later frames (the first frame a new kind appears is not).
 std::mutex g_kinds_mutex;
-std::unordered_map<uint64_t, uint8_t> g_list_kinds;  // signature -> 1 seen before the TAA, 2 after, 3 both
+// Signature -> where it was submitted in its last 64 frames with a TAA (bit set = after the TAA). The game does not
+// keep every list on one side: the list with the fire's heat distortion and sparks comes after the TAA almost always
+// but before it every 10-20 seconds (without upscaling both orders give the same image), and the title screen orders
+// some lists differently. The majority decides; a kind marked as both for good stayed uncorrected in the world.
+struct ListKind {
+  uint64_t history = 0;
+  uint32_t count = 0;
+  uint64_t last_log = 0;
+};
+std::unordered_map<uint64_t, ListKind> g_list_kinds;  // under g_kinds_mutex
+
 // This frame's submitted lists (signature, after the TAA), learned at present only if the frame had a TAA: menus and
 // loading screens have none.
 std::vector<std::pair<uint64_t, bool>> g_frame_lists;  // under g_kinds_mutex
-bool g_frame_taa_submitted = false;                    // under g_kinds_mutex; reset at present
+bool g_frame_taa_submitted = false;  // under g_kinds_mutex; reset at the frame's end
+bool g_frame_closed_by_ui = false;   // the frame's UI composite list was submitted (under g_kinds_mutex)
+uint64_t g_early_list_frames = 0;    // frames whose next-frame lists came before present
 std::atomic<float> g_last_post_scale_x{1.0f}, g_last_post_scale_y{1.0f};  // the last upscaled TAA's share
 std::atomic<uint32_t> g_last_out_width{0}, g_last_out_height{0};
 std::atomic<uint64_t> g_motion_src{0};       // the scene's motion: the motion prep pass's g_MoveTex
@@ -304,6 +325,19 @@ D3D12_RESOURCE_STATES ToD3D12(resource_usage usage) {
 }
 
 std::atomic<uint64_t> g_frame{0};
+
+// 0 unknown, 1 only before the TAA, 2 only after it, 3 both but mostly before, 4 both but mostly after. Kinds 2 and 4
+// are corrected. Caller holds g_kinds_mutex.
+int KindState(uint64_t signature) {
+  const auto it = g_list_kinds.find(signature);
+  if (it == g_list_kinds.end() || it->second.count == 0) return 0;
+  const uint32_t n = it->second.count;
+  const uint64_t mask = n >= 64 ? ~0ull : (1ull << n) - 1;
+  const uint32_t after = static_cast<uint32_t>(std::popcount(it->second.history & mask));
+  if (after == 0) return 1;
+  if (after == n) return 2;
+  return after * 2 > n ? 4 : 3;
+}
 std::atomic<float> g_frame_time_ms{16.7f};
 std::atomic<bool> g_reset{true};
 std::atomic<bool> g_recreate{false};
@@ -715,6 +749,7 @@ void DumpTaaInputs(command_list* cmd_list) {
   if (g_dump_remaining.load() <= 0 || frame == g_dump_last) return;
   device* const dev = cmd_list->get_device();
   const resource color = BoundResource(cmd_list, shader_stage::pixel, 0);   // SourceTex
+  if (color != 0) g_taa_source = color.handle;
   const resource motion = BoundResource(cmd_list, shader_stage::pixel, 3);  // g_MoveTex
   const resource stencil = BoundResource(cmd_list, shader_stage::pixel, 5);  // g_StencilTex
   if (color == 0 || motion == 0) return;
@@ -962,8 +997,13 @@ bool EditBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg
   auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
   at = 1;
   if (state == nullptr || descriptors == nullptr || count > 16) return false;
-  const auto it = state->descriptor_tables.find(stage == shader_stage::compute ? shader_stage::all_compute
-                                                                                : shader_stage::all_graphics);
+  auto it = state->descriptor_tables.find(stage == shader_stage::compute ? shader_stage::all_compute
+                                                                          : shader_stage::all_graphics);
+  // Compute tables are not always tracked under all_compute (the ray tracing denoiser's were not): take any key with
+  // the compute stage.
+  if (it == state->descriptor_tables.end() && stage == shader_stage::compute)
+    it = std::find_if(state->descriptor_tables.begin(), state->descriptor_tables.end(),
+                      [](const auto& entry) { return (entry.first & shader_stage::compute) != 0; });
   at = 2;
   if (it == state->descriptor_tables.end()) return false;
   descriptor_heap heap = {0};
@@ -1052,6 +1092,21 @@ void CorrectPostPass(command_list* cmd_list, CmdData& data, bool compute) {
         return true;
       });
   if (particles) {
+    // The heat distortion (GXFfxdistortion*) samples a copy of the screen inside g_resolveRectUV (PSCommonBuffer byte
+    // 16: min u, v, max u, v), which the engine gives in the scene's share; the copy is full size after DLSS. Scaled
+    // while g_dynamicResolution_UVScale still shows the share (it is set to 1 just below).
+    if (name.find("distortion") != std::string::npos) {
+      bool share = false;
+      EditBoundConstants(cmd_list, shader_stage::pixel, 0, 816, 2, [&share](float* v) {
+        share = IsShare(v[0]) && IsShare(v[1]);
+        return false;
+      });
+      if (share)
+        fixed |= EditBoundConstants(cmd_list, shader_stage::pixel, 0, 16, 4, [sx, sy](float* v) {
+          v[0] /= sx, v[1] /= sy, v[2] /= sx, v[3] /= sy;
+          return true;
+        });
+    }
     // PSCommonBuffer (pixel b0): g_dynamicResolution_UVScale (byte 816) = (share x, share y, 1, 1).
     fixed |= EditBoundConstants(cmd_list, shader_stage::pixel, 0, 816, 4, [](float* v) {
       if (!IsShare(v[0]) || !IsShare(v[1]) || v[2] != 1.0f || v[3] != 1.0f) return false;
@@ -1063,13 +1118,48 @@ void CorrectPostPass(command_list* cmd_list, CmdData& data, bool compute) {
     const auto render_size = [&](const float* v) {
       return std::fabs(v[0] - std::round(out_w * sx)) <= 1.0f && std::fabs(v[1] - std::round(out_h * sy)) <= 1.0f;
     };
-    if (name.find("PointSprite") != std::string::npos)
-      for (const uint32_t offset : {208u, 608u})
+    // (The distortion's vertex constants have the same tile lighting screenSize at 608.)
+    if (name.find("PointSprite") != std::string::npos || name.find("distortion") != std::string::npos)
+      for (const uint32_t offset : name.find("PointSprite") != std::string::npos ? std::vector<uint32_t>{208u, 608u}
+                                                                                    : std::vector<uint32_t>{608u})
         fixed |= EditBoundConstants(cmd_list, shader_stage::vertex, 0, offset, 4, [&](float* v) {
           if (!render_size(v)) return false;
           v[0] = out_w, v[1] = out_h, v[2] = 1.0f / out_w, v[3] = 1.0f / out_h;
           return true;
         });
+  }
+  // The heat distortion's screen copy (PointSampleColor1 before each GXFfxdistortion* draw) copies one particle's
+  // rectangle: a full-size viewport with a scissor in the scene's share. Scaled with g_resolveRectUV.
+  if (name == "PointSampleColor1" && new_vp[0] == 0 && !state->scissor_rects.empty() && !state->viewports.empty() &&
+      !state->render_targets.empty() && state->render_targets[0] != 0) {
+    const rect r = state->scissor_rects[0];
+    const resource_desc td = dev->get_resource_desc(dev->get_resource_from_view(state->render_targets[0]));
+    const auto tw = static_cast<int32_t>(td.texture.width), th = static_cast<int32_t>(td.texture.height);
+    const auto share_w = static_cast<int32_t>(std::lround(tw * sx)), share_h = static_cast<int32_t>(std::lround(th * sy));
+    if (state->viewports[0].width >= static_cast<float>(tw) && r.right <= share_w + 1 && r.bottom <= share_h + 1 &&
+        (r.right - r.left < tw || r.bottom - r.top < th)) {
+      const rect scaled = {static_cast<int32_t>(std::floor(r.left / sx)), static_cast<int32_t>(std::floor(r.top / sy)),
+                           (std::min)(tw, static_cast<int32_t>(std::ceil(r.right / sx))),
+                           (std::min)(th, static_cast<int32_t>(std::ceil(r.bottom / sy)))};
+      cmd_list->bind_scissor_rects(0, 1, &scaled);
+      fixed = true;
+      static std::atomic<uint32_t> logged{0};
+      if (logged++ < 2)
+        Log(reshade::log::level::info, "Distortion copy scissor " + std::to_string(r.left) + "," +
+                                           std::to_string(r.top) + "-" + std::to_string(r.right) + "," +
+                                           std::to_string(r.bottom) + " -> " + std::to_string(scaled.left) + "," +
+                                           std::to_string(scaled.top) + "-" + std::to_string(scaled.right) + "," +
+                                           std::to_string(scaled.bottom) + " (target " + std::to_string(tw) + "x" +
+                                           std::to_string(th) + ")");
+    } else {
+      static std::atomic<uint32_t> logged{0};
+      if (logged++ < 2)
+        Log(reshade::log::level::info, "PointSampleColor1 in a corrected list left as it is: scissor " +
+                                           std::to_string(r.left) + "," + std::to_string(r.top) + "-" +
+                                           std::to_string(r.right) + "," + std::to_string(r.bottom) + ", viewport " +
+                                           std::to_string(static_cast<int>(state->viewports[0].width)) + ", target " +
+                                           std::to_string(tw) + "x" + std::to_string(th));
+    }
   }
   if (name == "Sample13Weight" && new_vp[0] != 0) {
     // cbFilterParam (pixel b0): g_vRandomRatationTexScale (byte 0) is the viewport over the 64-texel noise texture,
@@ -1092,6 +1182,7 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   if (state == nullptr || state->render_targets.empty()) return false;
 
   const resource color = BoundResource(cmd_list, shader_stage::pixel, 0);   // SourceTex
+  if (color != 0) g_taa_source = color.handle;
   const resource motion = BoundResource(cmd_list, shader_stage::pixel, 3);  // g_MoveTex
   const resource target = dev->get_resource_from_view(state->render_targets[0]);
   resource depth = g_config.use_depth_copy ? data.depth_copy : data.depth;
@@ -1885,6 +1976,7 @@ void OnBindPipeline(command_list* cmd_list, pipeline_stage, pipeline p) {
   std::shared_lock lock(g_pipeline_mutex);
   const auto it = g_pipelines.find(p.handle);
   data->pass = it == g_pipelines.end() ? Pass::kOther : it->second;
+  if (data->pass == Pass::kBlendUi) data->has_ui = true;
 }
 
 // Logs the scene's render size whenever it changes (dynamic resolution experiments).
@@ -2474,17 +2566,35 @@ void TreeDumpDraw(command_list* cmd_list, const CmdData& data, uint32_t instance
   cmd_list->bind_pipeline(pipeline_stage::all, data.current);
 }
 
-// The first draw or dispatch names the command list's kind; a kind only ever submitted after the TAA (learned in
-// OnExecuteCommandList) is corrected throughout.
-void SignList(CmdData& data) {
+// The first draw or dispatch names the command list's kind: its pipeline and, for a draw, the texture it draws into.
+// A kind only ever submitted after the TAA (learned in OnExecuteCommandList) is corrected throughout. The target is
+// part of the kind because the particle lists start with the same few pipelines before and after the TAA, depending
+// on which effects are on screen (scene particles before the TAA drew as flat squares when their list was mistaken
+// for a post-processing one).
+void SignList(command_list* cmd_list, CmdData& data, bool draw) {
   if (data.signed_) return;
   data.signed_ = true;
-  data.signature = data.current.handle;
+  uint64_t target = 0;
+  if (draw) {
+    if (auto* const state = cmd_list->get_private_data<state_tracking>()) {
+      device* const dev = cmd_list->get_device();
+      if (!state->render_targets.empty() && state->render_targets[0] != 0)
+        target = dev->get_resource_from_view(state->render_targets[0]).handle;
+      else if (state->depth_stencil != 0)
+        target = dev->get_resource_from_view(state->depth_stencil).handle;
+    }
+  }
+  data.signature = data.current.handle ^ (target * 0x9E3779B97F4A7C15ull);
+  data.first_target = target;
+  {
+    std::lock_guard names_lock(g_kind_names_mutex);
+    if (g_kind_names.size() < 4096) g_kind_names.try_emplace(data.signature, PipelineName(data.current.handle));
+  }
   if (!g_post_fix || !g_config.enabled || g_config.render_scale >= 1.0f || g_last_out_width.load() == 0) return;
   {
     std::lock_guard lock(g_kinds_mutex);
-    const auto it = g_list_kinds.find(data.signature);
-    if (it == g_list_kinds.end() || it->second != 2) return;
+    const int state = KindState(data.signature);
+    if (state != 2 && state != 4) return;
   }
   data.post_fix = true;
   data.post_scale[0] = g_last_post_scale_x.load();
@@ -2493,31 +2603,77 @@ void SignList(CmdData& data) {
   data.out_height = g_last_out_height.load();
 }
 
-// Command lists in GPU order: every list submitted after the one holding the TAA, until present, is post-processing.
+void LearnListKindsLocked();
+
+// Command lists in GPU order: every list submitted after the one holding the TAA, until the UI composite, is
+// post-processing.
 void OnExecuteCommandList(command_queue*, command_list* cmd_list) {
   if (g_config.render_scale >= 1.0f) return;
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr || !data->signed_) return;
   std::lock_guard lock(g_kinds_mutex);
   g_frame_lists.emplace_back(data->signature, g_frame_taa_submitted);
+  if (g_passlog_frame.load() != 0 && g_passlog_frame.load() == g_frame.load()) {
+    const int state = KindState(data->signature);
+    char text[160];
+    std::snprintf(text, sizeof(text), "submit list %04llx sig %04llx kind %d %s%s first target %04llx",
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(cmd_list) & 0xFFFF),
+                  static_cast<unsigned long long>(data->signature & 0xFFFF), state,
+                  g_frame_taa_submitted ? "after the TAA" : "before the TAA", data->has_taa ? " (has the TAA)" : "",
+                  static_cast<unsigned long long>((data->first_target >> 4) & 0xFFFF));
+    std::lock_guard passlog_lock(g_passlog_mutex);
+    g_passlog.push_back(text);
+  }
   if (data->has_taa) g_frame_taa_submitted = true;
+  // The UI composite ends the frame. The game submits some of the next frame's lists (scene particles among them)
+  // before it presents, so ending the frame at present counted those as post-processing.
+  if (data->has_ui) {
+    LearnListKindsLocked();
+    g_frame_closed_by_ui = true;
+  }
 }
 
-// At present: learns the frame's list kinds if it had a TAA.
-void LearnListKinds() {
-  std::lock_guard lock(g_kinds_mutex);
+std::string KindName(uint64_t signature) {
+  std::lock_guard lock(g_kind_names_mutex);
+  const auto it = g_kind_names.find(signature);
+  char id[24];
+  std::snprintf(id, sizeof(id), " %04llx", static_cast<unsigned long long>(signature & 0xFFFF));
+  return (it == g_kind_names.end() ? std::string("?") : it->second) + id;
+}
+
+// Learns the list kinds collected since the last frame end if they had a TAA; the caller holds g_kinds_mutex.
+void LearnListKindsLocked() {
   if (g_frame_taa_submitted) {
     for (const auto& [signature, after] : g_frame_lists) {
-      uint8_t& kind = g_list_kinds[signature];
-      const uint8_t was = kind;
-      kind |= after ? 2 : 1;
-      if (was != 0 && was != 3 && kind == 3)
-        Log(reshade::log::level::warning, "A command list kind (" + PipelineName(signature) +
-                                              ") came both before and after the TAA; it is not corrected.");
+      ListKind& kind = g_list_kinds[signature];
+      kind.history = (kind.history << 1) | (after ? 1u : 0u);
+      kind.count = (std::min)(kind.count + 1, 64u);
+      const int state = KindState(signature);
+      if ((state == 3 || state == 4) && g_frame.load() - kind.last_log > 3600) {
+        kind.last_log = g_frame.load();
+        Log(reshade::log::level::info, "A command list kind (" + KindName(signature) + ") came both before and after "
+                                       "the TAA; " + (state == 4 ? "mostly after: corrected." : "mostly before: not "
+                                       "corrected."));
+      }
     }
   }
   g_frame_lists.clear();
   g_frame_taa_submitted = false;
+}
+
+// At present: frames that ended at their UI composite were learned there, and the lists collected since belong to the
+// next frame; other frames (menus, no UI composite) are learned here.
+void LearnListKinds() {
+  std::lock_guard lock(g_kinds_mutex);
+  if (!g_frame_closed_by_ui) {
+    LearnListKindsLocked();
+    return;
+  }
+  g_frame_closed_by_ui = false;
+  if (!g_frame_lists.empty() && g_early_list_frames++ == 0)
+    Log(reshade::log::level::info, std::to_string(g_frame_lists.size()) +
+                                       " command lists of the next frame came before present; they count as before "
+                                       "the TAA.");
 }
 
 // Every named draw (no materials) of the frame, with its command list and thread, whether it follows an upscaled TAA
@@ -2529,7 +2685,7 @@ void LogPass(command_list* cmd_list, const CmdData& data) {
   std::lock_guard lock(g_passlog_mutex);
   device* const dev = cmd_list->get_device();
   auto* const state = cmd_list->get_private_data<state_tracking>();
-  char text[320];
+  char text[448];
   float vw = 0, vh = 0;
   uint32_t rw = 0, rh = 0, dw = 0, dh = 0;
   if (state != nullptr) {
@@ -2543,9 +2699,25 @@ void LogPass(command_list* cmd_list, const CmdData& data) {
       dw = d.texture.width, dh = d.texture.height;
     }
   }
-  std::snprintf(text, sizeof(text), "list %04llx thread %5lu %s %-44s viewport %.0fx%.0f  target %ux%u  depth %ux%u",
+  uint64_t target = 0, depth = 0;
+  if (state != nullptr) {
+    if (!state->render_targets.empty() && state->render_targets[0] != 0)
+      target = dev->get_resource_from_view(state->render_targets[0]).handle;
+    if (state->depth_stencil != 0) depth = dev->get_resource_from_view(state->depth_stencil).handle;
+  }
+  int kind = 0;
+  {
+    std::lock_guard kinds_lock(g_kinds_mutex);
+    kind = KindState(data.signature);
+  }
+  char ids[96];
+  std::snprintf(ids, sizeof(ids), "  sig %04llx kind %d tgt %04llx%s dsv %04llx",
+                static_cast<unsigned long long>(data.signature & 0xFFFF), kind,
+                static_cast<unsigned long long>((target >> 4) & 0xFFFF), target == g_taa_source.load() ? "*" : " ",
+                static_cast<unsigned long long>((depth >> 4) & 0xFFFF));
+  std::snprintf(text, sizeof(text), "list %04llx thread %5lu %s %-44s viewport %.0fx%.0f  target %ux%u  depth %ux%u%s",
                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(cmd_list) & 0xFFFF), GetCurrentThreadId(),
-                data.post_fix ? "fix" : "   ", name.c_str(), vw, vh, rw, rh, dw, dh);
+                data.post_fix ? "fix" : "   ", name.c_str(), vw, vh, rw, rh, dw, dh, ids);
   g_passlog.push_back(text);
 }
 
@@ -2580,7 +2752,7 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
                    int32_t vertex_offset, uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
-  SignList(*data);
+  SignList(cmd_list, *data, true);
   if (data->post_fix) CorrectPostPass(cmd_list, *data, false);
   OnPostPass(cmd_list, *data);
   if (data->pass == Pass::kBlendUi) return false;
@@ -2678,7 +2850,7 @@ void ObserveTaaResolution(command_list* cmd_list, float screen[2]) {
 bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t, uint32_t) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
-  SignList(*data);
+  SignList(cmd_list, *data, true);
   if (data->pass == Pass::kMotionPrep) {
     data->depth = BoundResource(cmd_list, shader_stage::pixel, 0);       // g_StencilTexForCopy
     data->depth_copy = BoundResource(cmd_list, shader_stage::pixel, 2);  // g_DepthTex
@@ -2732,6 +2904,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
 std::atomic<uint32_t> g_rt_skip{0};         // remote "rtskip <mask>": 1 animation dispatches, 2 refits, 4 DispatchRays
 std::atomic<uint32_t> g_rt_refit_every{2};  // remote "rtrefit <N>": refit vegetation every Nth frame
 std::atomic<float> g_rt_feedback{0.0f};     // remote "rtfeedback <weight>": the denoiser's history weight, 0 = game's
+std::atomic<int> g_rt_constrain{-1};        // remote "rtconstrain 0|1|-1": its neighborhood clamp, -1 = game's (1)
 std::atomic<uint64_t> g_rt_anim{0}, g_rt_refits{0}, g_rt_skipped{0}, g_rt_rays{0}, g_rt_tlas{0}, g_rt_edits{0};
 std::atomic<uint64_t> g_rt_denoise{0};    // denoiser dispatches seen
 std::atomic<uint64_t> g_rt_edit_fail[7];  // where the denoiser edit stopped (EditBoundConstants `step`)
@@ -2780,6 +2953,44 @@ bool SkipThisFrame(uint32_t interval, uint32_t group) {
   return interval > 1 && (group + g_frame.load()) % interval != 0;
 }
 
+// The game's large upload buffers (its per-frame constant and instance ring) by GPU address, for build inputs whose
+// address ReShade does not resolve to a resource (it then passes resource 0 and the address as the offset).
+struct UploadBuffer {
+  uint64_t address = 0, size = 0;
+  resource buffer = {0};
+};
+std::mutex g_upload_mutex;
+std::vector<UploadBuffer> g_upload_buffers;
+
+void OnInitResource(device*, const resource_desc& desc, const subresource_data*, resource_usage, resource res) {
+  if (desc.type != resource_type::buffer || desc.heap != memory_heap::upload || desc.buffer.size < (16u << 20))
+    return;
+  auto* const native = reinterpret_cast<ID3D12Resource*>(res.handle);
+  if (native == nullptr) return;
+  std::lock_guard lock(g_upload_mutex);
+  g_upload_buffers.push_back({native->GetGPUVirtualAddress(), desc.buffer.size, res});
+}
+
+void OnDestroyResource(device*, resource res) {
+  std::lock_guard lock(g_upload_mutex);
+  std::erase_if(g_upload_buffers, [res](const UploadBuffer& b) { return b.buffer == res; });
+}
+
+// The buffer and offset of `size` bytes at `buffer`/`offset` as ReShade passed them, or false.
+bool ResolveUpload(resource* buffer, uint64_t* offset, uint64_t size) {
+  if (*buffer != 0) return true;
+  std::lock_guard lock(g_upload_mutex);
+  for (const UploadBuffer& b : g_upload_buffers)
+    if (*offset >= b.address && *offset + size <= b.address + b.size) {
+      *buffer = b.buffer;
+      *offset -= b.address;
+      return true;
+    }
+  return false;
+}
+
+std::atomic<uint64_t> g_rt_instance_reads{0}, g_rt_instance_fails{0};
+
 void UpdateBlasDistances(device* dev, const acceleration_structure_build_input& in) {
   if (in.type != acceleration_structure_build_input_type::instances || in.instances.array_of_pointers ||
       in.instances.count == 0 || in.instances.count > 65536)
@@ -2791,12 +3002,18 @@ void UpdateBlasDistances(device* dev, const acceleration_structure_build_input& 
     std::memcpy(camera, g_camera_pos, sizeof(camera));
   }
   const size_t bytes = size_t{in.instances.count} * 64;
-  std::vector<uint8_t> copy(bytes);
+  resource buffer = in.instances.buffer;
+  uint64_t offset = in.instances.offset;
   void* mapped = nullptr;
-  if (!dev->map_buffer_region(in.instances.buffer, in.instances.offset, bytes, map_access::read_only, &mapped))
+  if (!ResolveUpload(&buffer, &offset, bytes) ||
+      !dev->map_buffer_region(buffer, offset, bytes, map_access::read_only, &mapped) || mapped == nullptr) {
+    ++g_rt_instance_fails;
     return;
+  }
+  std::vector<uint8_t> copy(bytes);
   std::memcpy(copy.data(), mapped, bytes);
-  dev->unmap_buffer_region(in.instances.buffer);
+  dev->unmap_buffer_region(buffer);
+  ++g_rt_instance_reads;
   std::unordered_map<uint64_t, float> next;
   next.reserve(in.instances.count);
   uint32_t buckets[3] = {};
@@ -2822,7 +3039,7 @@ void UpdateBlasDistances(device* dev, const acceleration_structure_build_input& 
 bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
-  SignList(*data);
+  SignList(cmd_list, *data, false);
   if (data->post_fix) CorrectPostPass(cmd_list, *data, true);
   const std::string name = PipelineName(data->current.handle);
   if (name.find("_Animation") != std::string::npos) {
@@ -2836,17 +3053,27 @@ bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
   } else if (name == "GXRtPost_VarianceGuidedShadow") {
     ++g_rt_denoise;
     const float weight = g_rt_feedback.load();
-    // g_denoiseParam (b0): feedbackWeight at byte 24
-    if (weight > 0.0f) {
+    const int constrain = g_rt_constrain.load();
+    // g_denoiseParam (b0): int enableConstrain at byte 16, int denoiseWidth at 20, float feedbackWeight at 24
+    if (weight > 0.0f || constrain >= 0) {
       int step = 0;
-      if (EditBoundConstants(cmd_list, shader_stage::compute, 0, 24, 1, [weight](float* v) {
-            if (v[0] <= 0.0f || v[0] >= 1.0f) return false;
-            v[0] = weight;
+      if (EditBoundConstants(cmd_list, shader_stage::compute, 0, 16, 3, [weight, constrain](float* v) {
+            if (v[2] <= 0.0f || v[2] >= 1.0f) return false;  // not the layout this expects
+            if (weight > 0.0f) v[2] = weight;
+            if (constrain >= 0) {
+              const int32_t value = constrain;
+              std::memcpy(&v[0], &value, sizeof(value));
+            }
             return true;
           }, &step))
         ++g_rt_edits;
-      else
-        ++g_rt_edit_fail[std::clamp(step, 0, 6)];
+      else if (++g_rt_edit_fail[std::clamp(step, 0, 6)] == 1) {
+        std::string keys;
+        if (auto* const state = cmd_list->get_private_data<state_tracking>())
+          for (const auto& entry : state->descriptor_tables) keys += " " + std::to_string(uint32_t(entry.first));
+        Log(reshade::log::level::warning, "Denoiser edit stopped at step " + std::to_string(step) +
+                                              "; descriptor table stages tracked:" + keys);
+      }
     }
   }
   return false;
@@ -2868,7 +3095,8 @@ bool OnBuildAccelerationStructure(command_list* cmd_list, acceleration_structure
   data->rt_group_keep = false;
   if (mode != acceleration_structure_build_mode::update) return false;  // only refits can wait
   ++g_rt_refits;
-  const uint32_t interval = keep ? 1u : RefitInterval(cmd_list->get_device()->get_resource_view_gpu_address(dest));
+  // D3D12: an acceleration structure's view is its GPU address (reshade_api_resource.hpp).
+  const uint32_t interval = keep ? 1u : RefitInterval(dest.handle);
   {
     std::unique_lock lock(g_blas_mutex);
     g_group_interval[GroupKey(data->signature, group)] = interval;
@@ -3319,15 +3547,15 @@ void OnReshadePresent(effect_runtime* runtime) {
     if (!arg.empty()) g_jitter_phases = static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 0, 64));
     result = g_taa_jitter.status();
   } else if (command == "rtskip" || command == "rtrefit" || command == "rtfeedback" || command == "rtinfo" ||
-             command == "rtdist") {
+             command == "rtdist" || command == "rtconstrain") {
+    if (command == "rtconstrain" && !arg.empty()) g_rt_constrain = std::clamp(std::atoi(arg.c_str()), -1, 1);
     // ray tracing development switches (see OnDispatch); rtinfo: per-frame counts since the last rtinfo
     if (command == "rtskip" && !arg.empty()) g_rt_skip = static_cast<uint32_t>(std::atoi(arg.c_str()));
     if (command == "rtrefit" && !arg.empty()) g_rt_refit_every = static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 1, 16));
     if (command == "rtfeedback" && !arg.empty()) g_rt_feedback = std::clamp(std::strtof(arg.c_str(), nullptr), 0.0f, 0.995f);
     if (command == "rtdist" && !arg.empty()) {
-      char* end = nullptr;
-      g_rt_near = (std::max)(0.0f, std::strtof(arg.c_str(), &end));
-      if (end != nullptr && *end != 0) g_rt_far = (std::max)(g_rt_near.load(), std::strtof(end, nullptr));
+      g_rt_near = (std::max)(0.0f, std::strtof(arg.c_str(), nullptr));
+      if (!arg2.empty()) g_rt_far = (std::max)(g_rt_near.load(), std::strtof(arg2.c_str(), nullptr));
     }
     static uint64_t last_frame = 0, last[6] = {};
     const uint64_t now[6] = {g_rt_anim.load(), g_rt_refits.load(), g_rt_skipped.load(), g_rt_tlas.load(),
@@ -3339,14 +3567,17 @@ void OnReshadePresent(effect_runtime* runtime) {
     char text[512];
     const uint64_t hits = g_rt_dist_hits.exchange(0), misses = g_rt_dist_misses.exchange(0);
     std::snprintf(text, sizeof(text),
-                  "distance schedule near %.0f m far %.0f m: structures %u / %u / %u, lookups %llu hit %llu missed; "
-                  "skip %u, refit every %u, feedback %.3f; per frame over %llu: %.1f animation dispatches, %.1f refits "
+                  "distance schedule near %.0f m far %.0f m: structures %u / %u / %u, lookups %llu hit %llu missed, "
+                  "instance reads %llu ok %llu failed; "
+                  "skip %u, refit every %u, feedback %.3f, constrain %d; per frame over %llu: %.1f animation dispatches, %.1f refits "
                   "(%.1f skipped), %.2f top-level builds, %.2f DispatchRays, %.2f denoiser edits; totals: %llu denoiser "
                   "dispatches, edit failures at steps 1-6: %llu %llu %llu %llu %llu %llu",
                   g_rt_near.load(), g_rt_far.load(), g_rt_buckets[0].load(), g_rt_buckets[1].load(),
                   g_rt_buckets[2].load(), static_cast<unsigned long long>(hits),
                   static_cast<unsigned long long>(misses),
-                  g_rt_skip.load(), g_rt_refit_every.load(), g_rt_feedback.load(),
+                  static_cast<unsigned long long>(g_rt_instance_reads.load()),
+                  static_cast<unsigned long long>(g_rt_instance_fails.load()),
+                  g_rt_skip.load(), g_rt_refit_every.load(), g_rt_feedback.load(), g_rt_constrain.load(),
                   static_cast<unsigned long long>(frames), per[0], per[1], per[2], per[3], per[4], per[5],
                   static_cast<unsigned long long>(g_rt_denoise.load()),
                   static_cast<unsigned long long>(g_rt_edit_fail[1].load()),
@@ -3533,6 +3764,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
       reshade::register_event<reshade::addon_event::dispatch_rays>(OnDispatchRays);
       reshade::register_event<reshade::addon_event::build_acceleration_structure>(OnBuildAccelerationStructure);
+      reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
+      reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       // The barrier listener costs on every barrier the game records (loading screens record many), so it is only
       // registered when upscaling is set at startup (the stretch passes need the textures' states).
