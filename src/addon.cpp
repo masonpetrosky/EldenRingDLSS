@@ -54,7 +54,7 @@ namespace {
 namespace fs = std::filesystem;
 
 // Passes recognized by the shader debug names the game ships in its bytecode.
-enum class Pass : uint8_t { kOther, kScene, kMotionPrep, kTaa, kSharpen, kToneMap };
+enum class Pass : uint8_t { kOther, kScene, kMotionPrep, kTaa, kSharpen, kToneMap, kBlendUi };
 
 // cbSceneParam, bound at vertex shader register b8 by the scene shaders. Offsets are in floats.
 constexpr uint32_t kSceneParamRegister = 8;
@@ -84,6 +84,7 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   resource depth = {0};       // main depth, bound to the motion-vector prep pass as its stencil source
   resource depth_copy = {0};  // the depth copy the same pass samples
   bool dlss_applied = false;  // DLSS replaced the TAA in this command list
+  bool taa_passthrough = false;  // the TAA only passed the image on (upscaling: DLSS runs at the UI composite)
   // Wind: the game's cbSceneParam/cbPerFrame addresses last patched in this command list and the patched slot.
   uint64_t wind_scene = 0, wind_frame = 0, wind_prev = 0;
   bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
@@ -188,6 +189,22 @@ erdlss::RenderScale g_render_scale;
 bool g_render_scale_missing = false;  // the pattern was not found
 bool g_render_scale_set = false;      // a scale below 1 was written
 bool g_mv_full_basis = false;         // development: motion vectors in output instead of render heights
+
+// Upscaling (render scale below 1). Everything after the TAA runs at the render size, as the engine intends, and on
+// PC nothing scales the finished scene up: the final composite (GXSimple_BlendUI) reads HDRScene one to one. So the
+// TAA only passes the jittered image on and records the frame's DLSS inputs, and DLSS upscales HDRScene (tonemapped,
+// display-encoded) at the composite, before the UI goes on top at full size.
+struct UpscaleInputs {
+  resource depth = {0}, motion = {0};
+  uint32_t width = 0, height = 0;  // render size: the scene's top-left share of the targets
+  float jitter_x = 0, jitter_y = 0, mv_scale = 0;
+  bool reset = false;
+  uint64_t frame = 0;  // g_frame when recorded; used in that frame only
+};
+UpscaleInputs g_upscale;                     // under g_dlss_mutex
+std::atomic<uint64_t> g_last_upscale{0};     // g_frame of the last upscaled composite
+std::atomic<uint64_t> g_hdr_scene{0};        // the composite's scene texture
+std::atomic<uint32_t> g_hdr_scene_usage{0};  // its resource_usage after the game's last barrier, 0 = not seen
 
 std::atomic<uint64_t> g_frame{0};
 std::atomic<float> g_frame_time_ms{16.7f};
@@ -383,6 +400,7 @@ Pass Classify(uint32_t count, const pipeline_subobject* subobjects) {
   if (Contains(ps, "\\PostProcess\\StencilAndMotionVectorPreprocess")) return Pass::kMotionPrep;
   if (Contains(ps, "\\PostProcess\\SharpenFilter")) return Pass::kSharpen;
   if (Contains(ps, "\\PostProcess\\ToneMap_")) return Pass::kToneMap;
+  if (Contains(ps, "GXSimple_BlendUI")) return Pass::kBlendUi;  // final composite: the UI over the finished scene
   if (Contains(vs, "_Velo")) return Pass::kScene;
   return Pass::kOther;
 }
@@ -745,6 +763,37 @@ bool BuildMask(command_list* cmd_list, resource stencil, uint32_t width, uint32_
   return true;
 }
 
+// Upscaling: replaces the TAA draw by a copy of its input into its target (the next frame's history, and whatever
+// else reads it, gets the current image) and records the DLSS inputs for FinishUpscale. Under g_dlss_mutex.
+bool PassThroughTaa(command_list* cmd_list, CmdData& data, resource color, resource target, resource motion,
+                    const SceneParams& scene, uint32_t width, uint32_t height, uint32_t in_width, uint32_t in_height) {
+  device* const dev = cmd_list->get_device();
+  // The depth copy the post-processing samples; the depth buffer itself is bound again while the UI is drawn.
+  const resource depth = data.depth_copy != 0 ? data.depth_copy : resource{g_depth_copy.load()};
+  if (depth == 0) return false;
+  const resource_desc dd = dev->get_resource_desc(depth);
+  if (dd.texture.width != width || dd.texture.height != height) return false;
+
+  cmd_list->barrier(color, resource_usage::shader_resource, resource_usage::copy_source);
+  cmd_list->barrier(target, resource_usage::render_target, resource_usage::copy_dest);
+  cmd_list->copy_resource(color, target);
+  cmd_list->barrier(target, resource_usage::copy_dest, resource_usage::render_target);
+  cmd_list->barrier(color, resource_usage::copy_source, resource_usage::shader_resource);
+
+  g_upscale.depth = depth;
+  g_upscale.motion = motion;
+  g_upscale.width = in_width;
+  g_upscale.height = in_height;
+  g_upscale.jitter_x = (g_config.flip_jitter_x ? -1.0f : 1.0f) * scene.jitter_ndc_x * 0.5f * in_width;
+  g_upscale.jitter_y = (g_config.flip_jitter_y ? -1.0f : 1.0f) * -scene.jitter_ndc_y * 0.5f * in_height;
+  g_upscale.mv_scale =
+      (g_config.flip_motion ? 1.0f : -1.0f) * static_cast<float>(g_mv_full_basis ? height : in_height);
+  g_upscale.reset = g_reset.exchange(false);
+  g_upscale.frame = g_frame.load();
+  data.taa_passthrough = true;
+  return true;
+}
+
 // Returns true when DLSS replaced the draw. `screen` is CB_AA's g_vScreenPercentage: the share of the targets the
 // scene was rendered into (top-left), below 1 with the engine's dynamic resolution.
 bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
@@ -813,18 +862,20 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
 
   std::lock_guard lock(g_dlss_mutex);
   if (!g_dlss.available()) return false;
+  if (g_config.render_scale < 1.0f)
+    return PassThroughTaa(cmd_list, data, color, target, motion, scene, width, height, in_width, in_height);
   auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
   if (!EnsureOutput(dev, width, height, td.texture.format)) return false;
   const bool game_exposure = g_config.game_exposure && EnsureExposure(dev);
   if (g_dlss.has_feature() && (g_dlss.feature_width() != width || g_dlss.feature_height() != height ||
-                               g_dlss.feature_scale() != g_config.render_scale ||
+                               g_dlss.feature_scale() != g_config.render_scale || !g_dlss.feature_hdr() ||
                                g_dlss.feature_auto_exposure() == game_exposure)) {
     g_recreate = true;  // the old feature may still be in flight; it is released at present once the GPU is idle
     return false;
   }
   if (!g_dlss.has_feature()) {
     const bool created =
-        g_dlss.Create(native, width, height, g_config.render_scale, g_config.preset, !game_exposure);
+        g_dlss.Create(native, width, height, g_config.render_scale, g_config.preset, true, !game_exposure);
     RestoreState(cmd_list, data);
     if (!created) {
       g_config.enabled = false;
@@ -892,6 +943,95 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
     Log(reshade::log::level::info, text);
   }
   return true;
+}
+
+// Upscaling, at the final composite: DLSS turns HDRScene's top-left share into the full image (written back into
+// HDRScene), with the inputs PassThroughTaa recorded in this frame. The composite then adds the UI as usual.
+void FinishUpscale(command_list* cmd_list, CmdData& data) {
+  device* const dev = cmd_list->get_device();
+  const resource scene = BoundResource(cmd_list, shader_stage::pixel, 0);  // HDRScene
+  if (scene == 0) return;
+  if (g_hdr_scene.exchange(scene.handle) != scene.handle) {
+    g_hdr_scene_usage = 0;  // a new texture: its state is known once the game transitions it again
+    return;
+  }
+  const auto scene_usage = static_cast<resource_usage>(g_hdr_scene_usage.load());
+  std::lock_guard lock(g_dlss_mutex);
+  if (g_upscale.frame != g_frame.load() || scene_usage == resource_usage::undefined || !g_dlss.available()) return;
+  const UpscaleInputs in = g_upscale;
+  g_upscale.frame = 0;
+  const resource_desc sd = dev->get_resource_desc(scene);
+  const uint32_t width = sd.texture.width, height = sd.texture.height;
+  if (width != g_render_width.load() || height != g_render_height.load()) return;
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  if (!EnsureOutput(dev, width, height, sd.texture.format)) return;
+  if (g_dlss.has_feature() && (g_dlss.feature_width() != width || g_dlss.feature_height() != height ||
+                               g_dlss.feature_scale() != g_config.render_scale || g_dlss.feature_hdr())) {
+    g_recreate = true;
+    return;
+  }
+  if (!g_dlss.has_feature()) {
+    const bool created =
+        g_dlss.Create(native, width, height, g_config.render_scale, g_config.preset, false, false);
+    RestoreState(cmd_list, data);
+    if (!created) {
+      g_config.enabled = false;
+      Log(reshade::log::level::error, g_dlss.status() + "; DLSS disabled.");
+    } else {
+      Log(reshade::log::level::info, "Created DLSS feature for render scale " +
+                                         std::to_string(g_config.render_scale) + ", preset " +
+                                         std::to_string(g_config.preset) + ": " + g_dlss.status());
+    }
+    g_reset = true;
+    return;
+  }
+  if (!g_dlss.accepts(in.width, in.height)) return;
+
+  erdlss::DlssInputs dl;
+  dl.color = reinterpret_cast<ID3D12Resource*>(scene.handle);
+  dl.depth = reinterpret_cast<ID3D12Resource*>(in.depth.handle);
+  dl.motion = reinterpret_cast<ID3D12Resource*>(in.motion.handle);
+  dl.output = reinterpret_cast<ID3D12Resource*>(g_output.handle);
+  dl.width = in.width;
+  dl.height = in.height;
+  dl.jitter_x = in.jitter_x;
+  dl.jitter_y = in.jitter_y;
+  dl.mv_scale_x = in.mv_scale;
+  dl.mv_scale_y = in.mv_scale;
+  dl.reset = in.reset;
+  dl.frame_time_ms = g_frame_time_ms.load();
+  const bool ok = g_dlss.Evaluate(native, dl);
+  RestoreState(cmd_list, data);
+  if (!ok) {
+    if (++g_failures == 1) Log(reshade::log::level::error, g_dlss.status());
+    return;
+  }
+  cmd_list->barrier(g_output, resource_usage::unordered_access, resource_usage::copy_source);
+  cmd_list->barrier(scene, scene_usage, resource_usage::copy_dest);
+  cmd_list->copy_resource(g_output, scene);
+  cmd_list->barrier(scene, resource_usage::copy_dest, scene_usage);
+  cmd_list->barrier(g_output, resource_usage::copy_source, resource_usage::unordered_access);
+  g_last_upscale = g_frame.load();
+  const uint64_t frames = ++g_dlss_frames;
+  if (frames == 1 || frames % 3000 == 0) {
+    char text[256];
+    std::snprintf(text, sizeof(text),
+                  "DLSS frame %llu (upscaling at the composite): render %ux%u of %ux%u %s, jitter %+.3f %+.3f px, "
+                  "failures %llu, mip bias %+.2f",
+                  static_cast<unsigned long long>(frames), in.width, in.height, width, height,
+                  FormatName(sd.texture.format), in.jitter_x, in.jitter_y,
+                  static_cast<unsigned long long>(g_failures.load()), g_applied_mip_bias);
+    Log(reshade::log::level::info, text);
+  }
+}
+
+// Remembers the state the game leaves the composite's scene texture in (FinishUpscale copies into it).
+void OnBarrier(command_list*, uint32_t count, const resource* resources, const resource_usage*,
+               const resource_usage* new_states) {
+  const uint64_t scene = g_hdr_scene.load(std::memory_order_relaxed);
+  if (scene == 0) return;
+  for (uint32_t i = 0; i < count; ++i)
+    if (resources[i].handle == scene) g_hdr_scene_usage = static_cast<uint32_t>(new_states[i]);
 }
 
 // The sharpen pass reads g_SharpenIntensity from CB_AA (pixel shader b0, byte 152; the game uses 0.25). The
@@ -1997,6 +2137,10 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
                    int32_t vertex_offset, uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
+  if (data->pass == Pass::kBlendUi) {
+    if (g_config.enabled && g_config.render_scale < 1.0f) FinishUpscale(cmd_list, *data);
+    return false;
+  }
   if (g_tree_end.load() != 0) TreeDumpDraw(cmd_list, *data, instance_count);
   if (g_config.wind_motion && g_wind_ready.load() && (g_config.wind_mode == 0 || g_config.wind_trees) &&
       g_wind.IsWindPipeline(data->current.handle) &&
@@ -2101,10 +2245,14 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     if (g_dump_remaining.load() > 0) DumpTaaInputs(cmd_list);
     return ReplaceTaa(cmd_list, *data, screen);
   }
+  // Its target is the TAA's input, which already holds the image after a pass-through.
+  if (data->pass == Pass::kSharpen && data->taa_passthrough) return true;
   if (data->pass == Pass::kSharpen && data->dlss_applied && vertex_count == 3 && instance_count == 1) {
     if (!g_config.game_sharpening) return SkipSharpen(cmd_list);
     SetSharpenStrength(cmd_list, g_config.sharpen_strength);
   }
+  if (data->pass == Pass::kBlendUi && g_config.enabled && g_config.render_scale < 1.0f)
+    FinishUpscale(cmd_list, *data);
   if (data->pass == Pass::kToneMap && !g_config.chromatic_aberration) RemoveChromaticAberration(cmd_list);
   return false;
 }
@@ -2146,13 +2294,14 @@ void LogOutputMode(swapchain* sc) {
                                      ColorSpaceName(space) + ".");
 }
 
-// Holds the engine's dynamic-resolution scale at the render scale while DLSS can take the result, and at 1 otherwise:
-// nothing else upscales the scene. Applies from the next frame.
+// Holds the engine's dynamic-resolution scale at the render scale while DLSS upscales the frames, and at 1 otherwise
+// (menus and loading screens without the composite included): nothing else upscales the scene. Applies from the
+// next frame.
 void ApplyRenderScale() {
   float scale = 1.0f;
-  if (g_config.enabled && g_config.render_scale < 1.0f) {
+  if (g_config.enabled && g_config.render_scale < 1.0f && g_frame.load() <= g_last_upscale.load() + 4) {
     std::lock_guard lock(g_dlss_mutex);
-    if (g_dlss.has_feature() && g_dlss.feature_scale() == g_config.render_scale)
+    if (g_dlss.has_feature() && !g_dlss.feature_hdr() && g_dlss.feature_scale() == g_config.render_scale)
       scale = std::clamp(g_config.render_scale, g_dlss.min_scale(), g_dlss.max_scale());
   }
   if (scale == 1.0f && !g_render_scale_set) return;  // never touch the engine without a reason
@@ -2668,6 +2817,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
+      reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
       reshade::register_overlay(nullptr, OnOverlay);

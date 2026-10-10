@@ -119,7 +119,7 @@ void Dlss::Shutdown() {
   status_ = "shut down";
 }
 
-bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, float scale, int preset,
+bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, float scale, int preset, bool hdr,
                   bool auto_exposure) {
   if (!available_) return false;
   ReleaseFeature();
@@ -149,10 +149,10 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
   create.Feature.InTargetWidth = width;
   create.Feature.InTargetHeight = height;
   create.Feature.InPerfQualityValue = mode.value;
-  // HDR linear color, motion vectors at render resolution without jitter, reverse-Z depth.
-  create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-                                NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
-  if (auto_exposure) create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+  // Motion vectors at render resolution without jitter, reverse-Z depth; HDR: linear color.
+  create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+  if (hdr) create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+  if (hdr && auto_exposure) create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
   const NVSDK_NGX_Result result = NGX_D3D12_CREATE_DLSS_EXT(cmd, 1, 1, &feature_, params_, &create);
   if (NVSDK_NGX_FAILED(result)) {
     feature_ = nullptr;
@@ -166,10 +166,12 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
   min_height_ = min_h;
   max_width_ = max_w;
   max_height_ = max_h;
+  hdr_ = hdr;
   auto_exposure_ = auto_exposure;
   char text[160];
   std::snprintf(text, sizeof(text), "running %s, render %ux%u to %ux%u, output %ux%u (%s)", mode.name, min_w, min_h,
-                max_w, max_h, width, height, auto_exposure ? "auto-exposure" : "game exposure");
+                max_w, max_h, width, height,
+                !hdr ? "after tonemapping" : auto_exposure ? "auto-exposure" : "game exposure");
   status_ = text;
   return true;
 }

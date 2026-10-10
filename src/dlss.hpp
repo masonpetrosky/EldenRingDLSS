@@ -40,8 +40,9 @@ class Dlss {
 
   // Records feature creation on the command list for an output of `width` x `height`. `scale` (render / output
   // size) picks DLSS's quality mode, 1 for DLAA; evaluations may then pass any render size accepts() allows.
-  // Without `auto_exposure`, every evaluation must pass an exposure texture.
-  bool Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, float scale, int preset,
+  // `hdr`: linear HDR color (before tonemapping); otherwise display-encoded color in [0, 1]. For HDR without
+  // `auto_exposure`, every evaluation must pass an exposure texture.
+  bool Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, float scale, int preset, bool hdr,
               bool auto_exposure);
   // Releases the feature. The GPU must no longer use it.
   void ReleaseFeature();
@@ -63,6 +64,7 @@ class Dlss {
   float max_scale() const {
     return width_ == 0 ? 1.0f : (std::min)(float(max_width_) / float(width_), float(max_height_) / float(height_));
   }
+  bool feature_hdr() const { return hdr_; }
   bool feature_auto_exposure() const { return auto_exposure_; }
   const std::string& status() const { return status_; }
 
@@ -76,6 +78,7 @@ class Dlss {
   uint32_t height_ = 0;
   float scale_ = 1.0f;
   uint32_t min_width_ = 0, min_height_ = 0, max_width_ = 0, max_height_ = 0;
+  bool hdr_ = true;
   bool auto_exposure_ = true;
   std::string status_ = "not initialized";
 };
