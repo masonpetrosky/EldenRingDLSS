@@ -10,7 +10,7 @@ with DLSS. Full history and measurements are in `docs/recon.md`; this file is th
 | 1. Recon | Done (2026-10-08) |
 | 2. DLAA (DLSS at native resolution) | Done, in the everyday install |
 | Wind motion vectors (grass, bushes, trees) | Done, in the everyday install |
-| 3. Upscaling (render below native, DLSS upscales) | In progress: the scale works; full-size post-processing built, not yet run in game |
+| 3. Upscaling (render below native, DLSS upscales) | Works in the dev install (67%); not yet in the everyday install |
 | 4. Release | Not started. Publish to GitHub only when the user says so |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
@@ -71,58 +71,46 @@ pwsh -NoProfile -File tools/deploy.ps1 -Target dev    # use pwsh and absolute pa
 - Experiments kept off by default: `WindPrepass=1` (replacing the grass prepass pixel shader, correct but slower),
   `WindMode=0` (stream output for everything).
 
-## Stage 3: upscaling (in progress)
+## Stage 3: upscaling (works in the dev install)
 
-Details, addresses and measurements: `docs/recon.md`, "Stage 3" rounds 1-4 (addresses for `eldenring.exe` 2.7.1.0).
+Details and measurements: `docs/recon.md`, "Stage 3" rounds 1-4 (addresses for `eldenring.exe` 2.7.1.0).
 
-What works (in game, 2026-10-10):
-- The engine's console dynamic resolution is live on PC. Its scale is a float at `[0x1447F33E0]+0xF04` (1.0 on PC);
-  `src/render_scale.*` finds the object through a code pattern and the add-on holds the scale at `RenderScale`
-  while DLSS upscales (ini, overlay slider "Render scale", remote `scale`). At 0.67 the scene renders at 2572x1448
-  into the top-left of the full-size targets; CB_AA's `g_vScreenPercentage` gives the exact share.
-- DLSS takes that sub-rectangle (Quality mode at 0.67; the feature is created for the mode's dynamic range).
-  Jitter arrives in render pixels. 4K frame times: 8.1 ms at 67% vs 10.9 ms DLAA vs 9.6 ms game TAA.
+How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev install at 0.67):
+- The engine's console dynamic resolution is live on PC. `src/render_scale.*` holds its scale
+  (`[0x1447F33E0]+0xF04`, found by a code pattern) while DLSS upscales; the scene renders into the top-left of the
+  full-size targets (2572x1448 at 0.67) and CB_AA's `g_vScreenPercentage` gives the share.
+- DLSS runs at the TAA (NVIDIA's placement: before tonemapping, HDR input, game exposure) on that sub-rectangle.
+- The passes after the TAA were queued by the engine at the render size. `StretchPostInputs` scales the five
+  render-size inputs they read to full size (`src/stretch.*`: depth buffer and copy, half-size depth, emissive,
+  scene motion; nearest, in place). `CorrectPostPass` fixes each draw as it is recorded: full-size viewport and
+  scissor, and its resolution constants in the upload heap (list from the 67%/100% capture diff). Which command
+  lists to correct is learned from submission order (lists after the TAA's, in frames with a TAA).
+- `src/taa_jitter.*` lengthens the TAA's jitter cycle while upscaling (8 -> 8 x (1/scale)^2 = 18 at 0.67);
+  without it static detail shows a dot pattern.
+- 4K, 67%: 9.0 ms vs 11.0 ms DLAA vs 9.4 ms game TAA. User check: static detail, motion, effects, menus, map fine.
+- The barrier listener (states for the stretch) is only registered when the game starts with a scale below 1;
+  changing the scale from 100% to lower at runtime therefore needs a restart for the stretch (to do: handle).
+- Development options: `upscaleat composite` (DLSS on the tonemapped image at the final composite, an earlier
+  approach), `postfix off`, `passlog`, `postinfo`, `mvbasis`. Dead experiments still in the code: `drs_probe.*`,
+  `engine_resolution.*`, `hw_breakpoints.*` (the last one found the jitter setting's writer).
+- Version-specific: the jitter filter's vtable address (`0x142F242B8`) is hard-coded; the scale uses a pattern.
 
-The open problem: every pass after the TAA (particles, depth of field, glow, bloom, light shafts, tonemap) also runs
-at the render size; on PC nothing upscales the result (the final composite `GXSimple_BlendUI` reads `HDRScene` one
-to one), so the screen showed the top-left 67% of the image. The 67%/100% captures differ there only in viewports
-and percentage constants.
+### Next steps
 
-Built but not yet run in game (the latest commit, in the dev install):
-- DLSS at the TAA as for DLAA (NVIDIA's placement), then `src/stretch.*` scales up the five render-size inputs the
-  later passes read (depth buffer, depth copy, half-size depth, emissive, the scene's motion; nearest, in place) and
-  `src/post_resolution.*` switches the render context to full size for the passes recorded after the TAA, restored
-  at the composite. The context is found on the recording thread's stack (no code hook).
-- A first approach, upscaling the tonemapped `HDRScene` at the composite, stays as a development option
-  (`upscaleat composite`); NVIDIA says DLSS must run before tonemapping, and LDR input is 8-bit.
-
-Static analysis setup:
-- Ghidra 12.1.4 + Temurin JDK 21, portable in `.tools\ghidra` and `.tools\jdk`. The analyzed project is in
-  `Documents\GhidraProjects\EldenRing` (from `.tools\ghidra_input\eldenring.exe`). Queries:
-  `pwsh tools/ghidra/query.ps1 <command> <args>` with `decompile`, `decompileat` (creates a missing function),
-  `xrefs`, `calls`, `writes <hexdisp>`, `symbols <text>` (RTTI class names survive), `near`, `ptrs`, `bytepair`.
-  Each query takes about a minute (it opens the project headless).
-- Quick helpers: `tools/xref.py` (disassemble, RIP-relative references), `tools/funcs.py` (function ranges from
-  .pdata, direct callers), `tools/find_stores.py`, `tools/find_disp.py` (instructions using a displacement).
-- Hardware breakpoints (`src/hw_breakpoints.*`) crash the game after about 30 s (anti-tamper). Don't use them.
-
-### Next steps, in order
-
-1. **Run the test** (user in game outdoors, HDR on): launch the dev profile, then
-   `pwsh tools/ab_capture.ps1 -Round upscale`. Check the log ("Full-size post-processing: N buffers stretched ...
-   switched context ..."), `shots/passlog_up67.txt` (every draw after the TAA should have full-size viewports; compare
-   `passlog_up67_noswitch.txt`), the screenshots (`tools/shots.py`) and frame times. Then the user looks around:
-   sharpness, smearing, particles and depth of field.
-2. If the context is not found on the stack (log warning after 30 misses): find the render contexts in the heap by
-   the same signature (+0x448 == +0x7B0, see `tools/mem.py` scans in recon round 3) or hook the AA filter's per-frame
-   function (`0x141AD79A0`, context = second argument).
-3. If some passes stay at the render size: find where they read their size (Ghidra) and add it to the switch.
-4. Then: performance (the stretch costs a few copies), image checks against DLAA, the overlay text, and the
-   everyday install with the user's OK.
+1. Decide with the user what goes into the everyday install (render scale, the release DLSS DLL has no watermark).
+2. Performance: the stretch passes and the full-size post-processing cost about 1 ms; check what is worth saving.
+3. Robustness: scale changes at runtime (barrier listener), resolution changes (filter and target recreation), the
+   first frame of a new command-list kind (not yet corrected), and other scale values (0.5, 0.58, 0.77).
+4. Cleanup before a release: remove the dead experiments, overlay text for the render scale and jitter.
 
 ## Recent commits
 
 ```
+6ec5b24 Notes: upscaling works in game, jitter cycle fix
+5ccb6f2 Stage 3: lengthen the TAA jitter cycle while upscaling
+ce9f770 Stage 3: learn list order only from frames that have a TAA
+5bb4ca7 Stage 3: learn which command lists follow the TAA from submission order
+d4e7cf7 Stage 3: correct the passes after the TAA per draw (untested)
 0b84427 Stage 3: upscale at the final UI composite
 c42575c Stage 3: render scale through the engine's dynamic resolution, DLSS sub-rect input
 e643a54 Stage 3: find the dynamic-resolution scale, add an external memory tool
