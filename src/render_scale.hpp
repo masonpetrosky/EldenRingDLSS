@@ -20,10 +20,6 @@ class RenderScale {
   float Get() const;
   // Sets the scale (clamped to [0.25, 1]) unless it already has that value. False while the object is unavailable.
   bool Set(float scale) const;
-  // The effective percentages (+0xEEC, 4 floats: scale x requested), which the engine recomputes every frame and
-  // copies into every render context it builds.
-  bool ReadEffective(float out[4]) const;
-  bool WriteEffective(const float in[4]) const;
 
  private:
   uintptr_t State() const;

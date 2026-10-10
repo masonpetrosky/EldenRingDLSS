@@ -35,7 +35,6 @@
 #include "dlss.hpp"
 #include "engine_resolution.hpp"
 #include "hw_breakpoints.hpp"
-#include "post_resolution.hpp"
 #include "render_scale.hpp"
 #include "state_tracking.hpp"
 #include "stretch.hpp"
@@ -91,6 +90,11 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   resource depth_copy = {0};  // the depth copy the same pass samples
   bool dlss_applied = false;  // DLSS replaced the TAA in this command list
   bool taa_passthrough = false;  // the TAA only passed the image on (upscaling: DLSS runs at the UI composite)
+  // Upscaling at the TAA: DLSS made the frame full size in this command list; the passes recorded after it here were
+  // sized for the scene's share `post_scale` of the `out_width` x `out_height` targets.
+  bool post_fix = false;
+  float post_scale[2] = {1, 1};
+  uint32_t out_width = 0, out_height = 0;
   // Wind: the game's cbSceneParam/cbPerFrame addresses last patched in this command list and the patched slot.
   uint64_t wind_scene = 0, wind_frame = 0, wind_prev = 0;
   bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
@@ -211,19 +215,14 @@ UpscaleInputs g_upscale;                     // under g_dlss_mutex
 std::atomic<uint64_t> g_last_upscale{0};     // g_frame of the last upscaled frame (either path)
 bool g_upscale_at_composite = false;         // development (remote "upscaleat"): the composite path above
 
-// Upscaling at the TAA (the default, NVIDIA's placement): DLSS runs where DLAA does, then the passes after the TAA
-// are switched to the output size (post_resolution.hpp) and the buffers they read that the scene rendered at the
-// render size are stretched to full size (stretch.hpp).
-erdlss::PostResolution g_post;
+// Upscaling at the TAA (the default, NVIDIA's placement): DLSS runs where DLAA does. The engine queues the passes
+// after the TAA with render-size viewports and constants before the TAA even runs (docs/recon.md, round 4), so each
+// one recorded after the TAA in its command list is corrected as it is recorded (CorrectPostPass), and the buffers
+// they read that the scene rendered at the render size are stretched to full size first (stretch.hpp).
 erdlss::Stretch g_stretch;
 bool g_stretch_failed = false;
-std::atomic<uintptr_t> g_context{0};         // render context found at the last TAA
-std::atomic<uint32_t> g_context_misses{0};   // TAAs in a row without a context; the search stops at 30
-std::atomic<bool> g_stackdump{false};        // development (remote "stackdump")
-std::mutex g_effective_mutex;
-float g_saved_effective[4] = {};             // the engine's effective percentages before the TAA set them to 1
-bool g_effective_written = false;
-uint32_t g_post_mask = erdlss::PostResolution::kAll;  // development (remote "postfull"): what the switch changes
+bool g_post_fix = true;                       // development (remote "postfix on|off")
+std::atomic<uint64_t> g_post_fixes{0};        // corrected passes, for the overlay and logs
 std::atomic<uint64_t> g_motion_src{0};       // the scene's motion: the motion prep pass's g_MoveTex
 std::atomic<uint64_t> g_emissive{0};         // the emissive buffer: EmissiveToGlowPS's source
 std::atomic<uint64_t> g_half_depth{0};       // the half-size depth: LensSimu2_ComputeCoCF's
@@ -231,7 +230,6 @@ std::atomic<uint64_t> g_half_depth{0};       // the half-size depth: LensSimu2_C
 // Development pass log (remote "passlog"): every draw after the TAA in one frame, with its viewport and targets.
 std::mutex g_passlog_mutex;
 std::atomic<uint64_t> g_passlog_frame{0};  // the frame to log, 0 = off
-bool g_passlog_after_taa = false;
 std::vector<std::string> g_passlog;
 std::shared_mutex g_name_mutex;
 std::unordered_map<uint64_t, std::string> g_pipeline_names;  // pixel shader names of non-material pipelines
@@ -864,26 +862,13 @@ bool PassThroughTaa(command_list* cmd_list, CmdData& data, resource color, resou
 
 void RestoreTaaState(command_list* cmd_list, const CmdData& data);
 
-// Upscaling at the TAA, after DLSS wrote the full image: the passes recorded after the TAA run at the output size.
-// Stretches the buffers they read that the scene rendered at the render size (depth buffer and its copy for the
-// particles and light shafts, the scene's motion for the bloom, the emissive buffer for the glow, the half-size depth
-// for the depth of field), then switches the render context to full size until the composite (FinishPost). Returns
-// false when the context was not found: the post-processing then stays at the render size.
-bool PrepareFullSizePost(command_list* cmd_list, CmdData& data, uint32_t width, uint32_t height, uint32_t in_width,
-                         uint32_t in_height) {
+// Upscaling at the TAA, after DLSS wrote the full image: stretches the buffers the passes after the TAA read that the
+// scene rendered at the render size (depth buffer and its copy for the particles and light shafts, the scene's motion
+// for the bloom, the emissive buffer for the glow, the half-size depth for the depth of field).
+void StretchPostInputs(command_list* cmd_list, CmdData& data, uint32_t width, uint32_t height, uint32_t in_width,
+                       uint32_t in_height) {
   device* const dev = cmd_list->get_device();
   auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
-  // A miss searches the whole stack window with memory queries; after a few, stop trying.
-  if (g_context_misses.load() >= 30) return false;
-  const uintptr_t context = g_post.FindOnStack(g_context.load());
-  if (context == 0) {
-    if (++g_context_misses == 30)
-      Log(reshade::log::level::warning, "Render context not found at the TAA; post-processing stays at the render "
-                                        "size, so the render scale is not applied.");
-    return false;
-  }
-  g_context_misses = 0;
-  g_context = context;
   if (!g_stretch.ready() && !g_stretch_failed &&
       !g_stretch.Init(reinterpret_cast<ID3D12Device*>(dev->get_native()))) {
     g_stretch_failed = true;
@@ -908,31 +893,145 @@ bool PrepareFullSizePost(command_list* cmd_list, CmdData& data, uint32_t width, 
     else
       ++stretched;
   }
-  const bool switched = g_post_mask != 0 && g_post.SwitchToFull(context, g_post_mask);
-  if (switched && (g_post_mask & erdlss::PostResolution::kGlobal)) {
-    // Jobs that start later build their contexts from these; the engine recomputes them every frame, and they are
-    // put back at present in case it does so late.
-    std::lock_guard lock(g_effective_mutex);
-    const float one[4] = {1, 1, 1, 1};
-    if (!g_effective_written && g_render_scale.ReadEffective(g_saved_effective) &&
-        g_render_scale.WriteEffective(one))
-      g_effective_written = true;
-  }
   RestoreTaaState(cmd_list, data);
   static uint32_t last_stretched = ~0u;
   if (stretched != last_stretched) {
     last_stretched = stretched;
-    Log(reshade::log::level::info, "Full-size post-processing: " + std::to_string(stretched) + " buffers stretched, " +
-                                       std::to_string(skipped) + " skipped (state unknown yet); " +
-                                       (switched ? "switched " : "did not switch ") +
-                                       erdlss::PostResolution::Describe(context));
+    Log(reshade::log::level::info, "Upscaling: " + std::to_string(stretched) + " buffers stretched to full size, " +
+                                       std::to_string(skipped) + " skipped (unknown yet).");
   }
-  return switched || g_post_mask == 0;
 }
 
-// The frame's post-processing is recorded: puts the render context back.
-void FinishPost() {
-  if (g_post.switched()) g_post.Restore();
+std::string PipelineName(uint64_t pipeline) {
+  std::shared_lock lock(g_name_mutex);
+  const auto it = g_pipeline_names.find(pipeline);
+  return it == g_pipeline_names.end() ? std::string() : it->second;
+}
+
+// Edits `count` floats at byte `offset` of the constant buffer bound to `reg` of `stage`, in the upload heap before
+// the GPU reads them (every pass after the TAA has its own allocations: tools/rdc_cbbinds.py). `edit` gets the
+// values and returns whether it changed them.
+template <typename Edit>
+bool EditBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg, uint32_t offset, uint32_t count,
+                        Edit edit) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr || count > 16) return false;
+  const auto it = state->descriptor_tables.find(stage == shader_stage::compute ? shader_stage::all_compute
+                                                                                : shader_stage::all_graphics);
+  if (it == state->descriptor_tables.end()) return false;
+  descriptor_heap heap = {0};
+  uint32_t slot = 0;
+  if (!descriptors->Find(dev, it->second.first, it->second.second, stage, RegisterKind::kConstantBuffer, reg, 0, &heap,
+                         &slot))
+    return false;
+  const buffer_range range = descriptors->Buffer(heap, slot);
+  if (range.buffer == 0 || range.size < offset + count * 4) return false;
+  void* mapped = nullptr;
+  if (!dev->map_buffer_region(range.buffer, range.offset + offset, count * 4, map_access::read_write, &mapped))
+    return false;
+  float values[16];
+  std::memcpy(values, mapped, count * 4);
+  const bool changed = edit(values);
+  if (changed) std::memcpy(mapped, values, count * 4);
+  dev->unmap_buffer_region(range.buffer);
+  return changed;
+}
+
+bool IsShare(float v) { return v > 0.2f && v < 0.999f; }
+
+// Upscaling at the TAA: corrects a pass recorded after the TAA in the same command list. The engine sized it for the
+// scene's share of the targets; DLSS made the frame full size. Every correction checks the values it replaces, so a
+// pass that is already full size stays as it is. The values (docs/recon.md, round 4; tools/rdc_cbdump.py on the 67%
+// and 100% captures): full-size viewports, cbPostProcessCommon's four screen-percentage pairs, the particles'
+// g_dynamicResolution_UVScale and screen sizes, the particle simulation's dynamicResolutionX/Y, and the glow blur's
+// viewport-derived scales.
+void CorrectPostPass(command_list* cmd_list, CmdData& data, bool compute) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  if (state == nullptr) return;
+  const std::string name = PipelineName(data.current.handle);
+  bool fixed = false;
+  if (compute) {
+    if (name == "CS_VFX_StandardParticleForce")  // ccbSceneParam (b0): dynamicResolutionX/Y at byte 568
+      fixed = EditBoundConstants(cmd_list, shader_stage::compute, 0, 568, 2, [](float* v) {
+        if (!IsShare(v[0]) || !IsShare(v[1])) return false;
+        v[0] = v[1] = 1.0f;
+        return true;
+      });
+    if (fixed) ++g_post_fixes;
+    return;
+  }
+  device* const dev = cmd_list->get_device();
+  const float sx = data.post_scale[0], sy = data.post_scale[1];
+  const float out_w = static_cast<float>(data.out_width), out_h = static_cast<float>(data.out_height);
+
+  // The viewport: the scene's share of the target becomes the whole target.
+  float old_vp[2] = {0, 0}, new_vp[2] = {0, 0};
+  if (!state->viewports.empty()) {
+    const viewport vp = state->viewports[0];
+    resource target = {0};
+    if (!state->render_targets.empty() && state->render_targets[0] != 0)
+      target = dev->get_resource_from_view(state->render_targets[0]);
+    else if (state->depth_stencil != 0)
+      target = dev->get_resource_from_view(state->depth_stencil);
+    if (target != 0 && vp.x == 0 && vp.y == 0) {
+      const resource_desc td = dev->get_resource_desc(target);
+      const auto tw = static_cast<float>(td.texture.width), th = static_cast<float>(td.texture.height);
+      if (vp.width < tw && std::fabs(vp.width - std::round(tw * sx)) <= 1.0f &&
+          std::fabs(vp.height - std::round(th * sy)) <= 1.0f) {
+        viewport full = vp;
+        full.width = tw;
+        full.height = th;
+        cmd_list->bind_viewports(0, 1, &full);
+        const rect scissor = {0, 0, static_cast<int32_t>(tw), static_cast<int32_t>(th)};
+        cmd_list->bind_scissor_rects(0, 1, &scissor);
+        old_vp[0] = vp.width, old_vp[1] = vp.height, new_vp[0] = tw, new_vp[1] = th;
+        fixed = true;
+      }
+    }
+  }
+  const bool particles = name.rfind("GXFfx", 0) == 0 || name.rfind("PS_VFX_", 0) == 0;
+  // cbPostProcessCommon (b4, vertex or pixel shader): g_dynamicScreenPercentage, _Primary, _Prev, _PrevPrimary
+  // (bytes 0, 16, 32, 48), each followed by a texel size. Particles (often hundreds of draws) have none.
+  if (!particles)
+    for (const shader_stage stage : {shader_stage::vertex, shader_stage::pixel})
+      fixed |= EditBoundConstants(cmd_list, stage, 4, 0, 14, [](float* v) {
+        if (!IsShare(v[0]) || !IsShare(v[1]) || std::fabs(v[0] - v[4]) > 0.01f) return false;
+        for (const int i : {0, 1, 4, 5, 8, 9, 12, 13})
+          if (IsShare(v[i])) v[i] = 1.0f;
+        return true;
+      });
+  if (particles) {
+    // PSCommonBuffer (pixel b0): g_dynamicResolution_UVScale (byte 816) = (share x, share y, 1, 1).
+    fixed |= EditBoundConstants(cmd_list, shader_stage::pixel, 0, 816, 4, [](float* v) {
+      if (!IsShare(v[0]) || !IsShare(v[1]) || v[2] != 1.0f || v[3] != 1.0f) return false;
+      v[0] = v[1] = 1.0f;
+      return true;
+    });
+    // VSCommonBuffer (vertex b0) of the point sprites: g_screenSize and g_recScreenSize (bytes 208, 216) and the
+    // tile lighting's screenSize (608: size and its reciprocal).
+    const auto render_size = [&](const float* v) {
+      return std::fabs(v[0] - std::round(out_w * sx)) <= 1.0f && std::fabs(v[1] - std::round(out_h * sy)) <= 1.0f;
+    };
+    if (name.find("PointSprite") != std::string::npos)
+      for (const uint32_t offset : {208u, 608u})
+        fixed |= EditBoundConstants(cmd_list, shader_stage::vertex, 0, offset, 4, [&](float* v) {
+          if (!render_size(v)) return false;
+          v[0] = out_w, v[1] = out_h, v[2] = 1.0f / out_w, v[3] = 1.0f / out_h;
+          return true;
+        });
+  }
+  if (name == "Sample13Weight" && new_vp[0] != 0) {
+    // cbFilterParam (pixel b0): g_vRandomRatationTexScale (byte 0) is the viewport over the 64-texel noise texture,
+    // g_vScreenSpaceTexCoordScale (16) one over the viewport.
+    fixed |= EditBoundConstants(cmd_list, shader_stage::pixel, 0, 0, 6, [&](float* v) {
+      v[0] *= new_vp[0] / old_vp[0], v[1] *= new_vp[1] / old_vp[1];
+      v[4] = 1.0f / new_vp[0], v[5] = 1.0f / new_vp[1];
+      return true;
+    });
+  }
+  if (fixed) ++g_post_fixes;
 }
 
 // Returns true when DLSS replaced the draw. `screen` is CB_AA's g_vScreenPercentage: the share of the targets the
@@ -1070,12 +1169,19 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   cmd_list->barrier(target, resource_usage::copy_dest, resource_usage::render_target);
   cmd_list->barrier(g_output, resource_usage::copy_source, resource_usage::unordered_access);
   data.dlss_applied = true;
-  // Upscaled: the post-processing has to follow to full size (before the engine applies the scale, the frame is
-  // already full size). The render scale is only held while this works.
-  if (g_config.render_scale < 1.0f &&
-      ((in_width == width && in_height == height) ||
-       PrepareFullSizePost(cmd_list, data, width, height, in_width, in_height)))
+  // Upscaled: the passes after the TAA have to follow to full size (before the engine applies the scale, the frame is
+  // already full size). The render scale is only held while DLSS keeps upscaling.
+  if (g_config.render_scale < 1.0f) {
     g_last_upscale = g_frame.load();
+    if (in_width < width || in_height < height) {
+      StretchPostInputs(cmd_list, data, width, height, in_width, in_height);
+      data.post_fix = g_post_fix;
+      data.post_scale[0] = static_cast<float>(in_width) / static_cast<float>(width);
+      data.post_scale[1] = static_cast<float>(in_height) / static_cast<float>(height);
+      data.out_width = width;
+      data.out_height = height;
+    }
+  }
   const uint64_t frames = ++g_dlss_frames;
   if (frames == 1 || frames % 3000 == 0) {
     char text[384];
@@ -1664,13 +1770,15 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
     break;
   }
   if (!material) {
-    // The pixel shader's name from its debug path (...\<name>.ppo.pdb), for the pass log.
+    // The pixel (or compute) shader's name from its debug path (...\<name>.ppo.pdb, .cpo.pdb), for the corrections
+    // after the TAA and the pass log.
     for (uint32_t i = 0; i < count; ++i) {
-      if (subobjects[i].type != pipeline_subobject_type::pixel_shader) continue;
+      const bool compute = subobjects[i].type == pipeline_subobject_type::compute_shader;
+      if (subobjects[i].type != pipeline_subobject_type::pixel_shader && !compute) continue;
       const auto* ps = static_cast<const shader_desc*>(subobjects[i].data);
       if (ps == nullptr || ps->code == nullptr) break;
       const std::string_view code(static_cast<const char*>(ps->code), ps->code_size);
-      const size_t end = code.find(".ppo.pdb");
+      const size_t end = code.find(compute ? ".cpo.pdb" : ".ppo.pdb");
       if (end == std::string_view::npos) break;
       const size_t start = code.find_last_of("\\/", end);
       if (start == std::string_view::npos) break;
@@ -2301,20 +2409,16 @@ void TreeDumpDraw(command_list* cmd_list, const CmdData& data, uint32_t instance
   cmd_list->bind_pipeline(pipeline_stage::all, data.current);
 }
 
+// Every named draw (no materials) of the frame, with its command list and thread, whether it follows an upscaled TAA
+// in its command list (corrected), and its viewport and targets as the game set them.
 void LogPass(command_list* cmd_list, const CmdData& data) {
   if (g_passlog_frame.load() != g_frame.load()) return;
+  const std::string name = data.pass == Pass::kTaa ? "TempAA" : PipelineName(data.current.handle);
+  if (name.empty()) return;
   std::lock_guard lock(g_passlog_mutex);
-  if (data.pass == Pass::kTaa) g_passlog_after_taa = true;
-  if (!g_passlog_after_taa) return;
   device* const dev = cmd_list->get_device();
   auto* const state = cmd_list->get_private_data<state_tracking>();
-  std::string name = "?";
-  {
-    std::shared_lock names(g_name_mutex);
-    const auto it = g_pipeline_names.find(data.current.handle);
-    if (it != g_pipeline_names.end()) name = it->second;
-  }
-  char text[256];
+  char text[320];
   float vw = 0, vh = 0;
   uint32_t rw = 0, rh = 0, dw = 0, dh = 0;
   if (state != nullptr) {
@@ -2328,8 +2432,9 @@ void LogPass(command_list* cmd_list, const CmdData& data) {
       dw = d.texture.width, dh = d.texture.height;
     }
   }
-  std::snprintf(text, sizeof(text), "%-48s viewport %.0fx%.0f  target %ux%u  depth %ux%u", name.c_str(), vw, vh, rw,
-                rh, dw, dh);
+  std::snprintf(text, sizeof(text), "list %04llx thread %5lu %s %-44s viewport %.0fx%.0f  target %ux%u  depth %ux%u",
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(cmd_list) & 0xFFFF), GetCurrentThreadId(),
+                data.post_fix ? "fix" : "   ", name.c_str(), vw, vh, rw, rh, dw, dh);
   g_passlog.push_back(text);
 }
 
@@ -2357,18 +2462,14 @@ void OnPostPass(command_list* cmd_list, CmdData& data) {
       }
     }
   }
-  if (data.pass == Pass::kBlendUi) {
-    if (g_upscale_at_composite)
-      FinishUpscale(cmd_list, data);
-    else
-      FinishPost();
-  }
+  if (data.pass == Pass::kBlendUi && g_upscale_at_composite) FinishUpscale(cmd_list, data);
 }
 
 bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index,
                    int32_t vertex_offset, uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
+  if (data->post_fix) CorrectPostPass(cmd_list, *data, false);
   OnPostPass(cmd_list, *data);
   if (data->pass == Pass::kBlendUi) return false;
   if (g_tree_end.load() != 0) TreeDumpDraw(cmd_list, *data, instance_count);
@@ -2483,13 +2584,6 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   }
   if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) {
     if (g_passlog_frame.load() != 0) LogPass(cmd_list, *data);
-    if (g_stackdump.exchange(false)) {
-      std::ofstream(g_addon_dir / L"shots" / L"stack.txt") << erdlss::PostResolution::DumpStack(64 * 1024);
-      char text[96];
-      std::snprintf(text, sizeof(text), "Stack dump in shots/stack.txt; the context search finds 0x%llx.",
-                    static_cast<unsigned long long>(g_post.FindOnStack(0)));
-      Log(reshade::log::level::info, text);
-    }
     float screen[2] = {1, 1};
     ObserveTaaResolution(cmd_list, screen);
     if (g_config.wind_motion && g_wind_ready.load()) ResolveWind(cmd_list, *data);
@@ -2497,6 +2591,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     if (g_dump_remaining.load() > 0) DumpTaaInputs(cmd_list);
     return ReplaceTaa(cmd_list, *data, screen);
   }
+  if (data->post_fix) CorrectPostPass(cmd_list, *data, false);
   // Its target is the TAA's input, which already holds the image after a pass-through.
   if (data->pass == Pass::kSharpen && data->taa_passthrough) return true;
   if (data->pass == Pass::kSharpen && data->dlss_applied && vertex_count == 3 && instance_count == 1) {
@@ -2505,6 +2600,12 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   }
   OnPostPass(cmd_list, *data);
   if (data->pass == Pass::kToneMap && !g_config.chromatic_aberration) RemoveChromaticAberration(cmd_list);
+  return false;
+}
+
+bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
+  auto* const data = cmd_list->get_private_data<CmdData>();
+  if (data != nullptr && data->post_fix) CorrectPostPass(cmd_list, *data, true);
   return false;
 }
 
@@ -2550,9 +2651,7 @@ void LogOutputMode(swapchain* sc) {
 // next frame.
 void ApplyRenderScale() {
   float scale = 1.0f;
-  // Without the render context the passes after the TAA cannot follow to full size.
-  const bool post_ok = g_upscale_at_composite || g_context_misses.load() < 30;
-  if (g_config.enabled && g_config.render_scale < 1.0f && post_ok && g_frame.load() <= g_last_upscale.load() + 4) {
+  if (g_config.enabled && g_config.render_scale < 1.0f && g_frame.load() <= g_last_upscale.load() + 4) {
     std::lock_guard lock(g_dlss_mutex);
     if (g_dlss.has_feature() && g_dlss.feature_hdr() != g_upscale_at_composite &&
         g_dlss.feature_scale() == g_config.render_scale)
@@ -2594,12 +2693,6 @@ void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, ui
     std::lock_guard lock(g_dlss_mutex);
     g_dlss.ReleaseFeature();
   }
-  g_post.Restore();
-  {
-    std::lock_guard lock(g_effective_mutex);
-    if (g_effective_written) g_render_scale.WriteEffective(g_saved_effective);
-    g_effective_written = false;
-  }
   ApplyRenderScale();
   const uint64_t passlog = g_passlog_frame.load();
   if (passlog != 0 && frame > passlog) {
@@ -2610,7 +2703,6 @@ void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, ui
     for (const std::string& line : g_passlog) out << line << "\n";
     Log(reshade::log::level::info, "Pass log: " + std::to_string(g_passlog.size()) + " draws in shots/passlog.txt");
     g_passlog.clear();
-    g_passlog_after_taa = false;
     g_passlog_frame = 0;
   }
   if (!g_retired.empty() && g_device != nullptr) {
@@ -2935,26 +3027,18 @@ void OnReshadePresent(effect_runtime* runtime) {
     result = text;
   } else if (command == "passlog") {
     g_passlog_frame = g_frame.load() + 1;
-    result = "logging the next frame's draws after the TAA to shots/passlog.txt";
-  } else if (command == "ctx") {
-    const uintptr_t context = g_context.load();
-    result = erdlss::PostResolution::Describe(context);
+    result = "logging the next frame's named draws to shots/passlog.txt";
+  } else if (command == "postinfo" || command == "postfix") {
+    // postfix on|off: correct the passes after the TAA to full size (development)
+    if (command == "postfix") g_post_fix = arg != "off";
     char text[256];
-    std::snprintf(text, sizeof(text), "; switch mask %u, stretch %s (%llu runs); motion %s, emissive %s, half depth %s",
-                  g_post_mask, g_stretch_failed ? "failed" : g_stretch.ready() ? "ready" : "not started",
+    std::snprintf(text, sizeof(text), "post fixes %s, %llu passes corrected; stretch %s (%llu runs); motion %s, "
+                  "emissive %s, half depth %s",
+                  g_post_fix ? "on" : "off", static_cast<unsigned long long>(g_post_fixes.load()),
+                  g_stretch_failed ? "failed" : g_stretch.ready() ? "ready" : "not started",
                   static_cast<unsigned long long>(g_stretch.runs()), g_motion_src.load() ? "known" : "unknown",
                   g_emissive.load() ? "known" : "unknown", g_half_depth.load() ? "known" : "unknown");
-    result += text;
-  } else if (command == "stackdump") {
-    g_stackdump = true;
-    result = "dumping the stack at the next TAA to shots/stack.txt (result in the log)";
-  } else if (command == "postretry") {
-    g_context_misses = 0;
-    result = "searching for the render context again";
-  } else if (command == "postfull") {
-    // postfull <mask>: what the switch to full size changes (1 mode, 2 percentages, 4 flag, 8 camera); off = 0
-    g_post_mask = arg == "off" ? 0u : static_cast<uint32_t>(std::strtoul(arg.c_str(), nullptr, 0));
-    result = "switch mask " + std::to_string(g_post_mask);
+    result = text;
   } else if (command == "upscaleat") {
     g_upscale_at_composite = arg == "composite";
     g_recreate = true;
@@ -3115,7 +3199,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
-      reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
+      reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
+      // The barrier listener costs on every barrier the game records (loading screens record many), so it is only
+      // registered when upscaling is set at startup (the stretch passes need the textures' states).
+      if (g_config.render_scale < 1.0f) reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
       reshade::register_overlay(nullptr, OnOverlay);
