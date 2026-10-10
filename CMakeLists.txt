@@ -107,3 +107,8 @@ target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui ${SHADER_
 target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
 target_link_libraries(EldenRingDLSS PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib d3d12)
 set_target_properties(EldenRingDLSS PROPERTIES SUFFIX ".addon64")
+
+# Development tool: times DLSS outside the game (tools/dlss_bench/dlss_bench.cpp).
+add_executable(dlss_bench tools/dlss_bench/dlss_bench.cpp)
+target_include_directories(dlss_bench SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
+target_link_libraries(dlss_bench PRIVATE ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib d3d12 dxgi)

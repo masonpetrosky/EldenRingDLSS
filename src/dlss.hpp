@@ -38,12 +38,13 @@ class Dlss {
   bool Init(ID3D12Device* device, const std::wstring& dll_dir, const std::wstring& log_dir);
   void Shutdown();
 
-  // Records feature creation on the command list for an output of `width` x `height`. `scale` (render / output
-  // size) picks DLSS's quality mode, 1 for DLAA; evaluations may then pass any render size accepts() allows.
-  // `hdr`: linear HDR color (before tonemapping); otherwise display-encoded color in [0, 1]. For HDR without
-  // `auto_exposure`, every evaluation must pass an exposure texture.
-  bool Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, float scale, int preset, bool hdr,
-              bool auto_exposure);
+  // Records feature creation on the command list for an output of `width` x `height` and render sizes up to
+  // `render_width` x `render_height` (the size the game renders at: presets L and M cost what this size costs, and
+  // larger frames would make DLSS reallocate; guide 310.6, section 3.2.2.1). `scale` (render / output size) picks
+  // DLSS's quality mode, 1 for DLAA. `hdr`: linear HDR color (before tonemapping); otherwise display-encoded color in
+  // [0, 1]. For HDR without `auto_exposure`, every evaluation must pass an exposure texture (presets J and K use it).
+  bool Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, uint32_t render_width,
+              uint32_t render_height, float scale, int preset, bool hdr, bool auto_exposure);
   // Releases the feature. The GPU must no longer use it.
   void ReleaseFeature();
   bool Evaluate(ID3D12GraphicsCommandList* cmd, const DlssInputs& inputs);
@@ -53,6 +54,8 @@ class Dlss {
   uint32_t feature_width() const { return width_; }  // output size
   uint32_t feature_height() const { return height_; }
   float feature_scale() const { return scale_; }
+  uint32_t feature_render_width() const { return max_width_; }  // the render size it was created for
+  uint32_t feature_render_height() const { return max_height_; }
   // Whether evaluations may pass this render size.
   bool accepts(uint32_t width, uint32_t height) const {
     return width >= min_width_ && height >= min_height_ && width <= max_width_ && height <= max_height_;

@@ -7,6 +7,7 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -119,13 +120,14 @@ void Dlss::Shutdown() {
   status_ = "shut down";
 }
 
-bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, float scale, int preset, bool hdr,
-                  bool auto_exposure) {
+bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, uint32_t render_width,
+                  uint32_t render_height, float scale, int preset, bool hdr, bool auto_exposure) {
   if (!available_) return false;
   ReleaseFeature();
   for (const Mode& m : kModes) NVSDK_NGX_Parameter_SetUI(params_, m.preset_hint, static_cast<unsigned>(preset));
 
-  // The render sizes the mode accepts (dynamic resolution); the feature is created for the largest.
+  // The smallest render size the mode accepts; the feature is created for the size the game renders at, not the
+  // mode's largest (that would make presets L and M cost a full-size input).
   const Mode& mode = PickMode(scale);
   uint32_t optimal_w = 0, optimal_h = 0, max_w = 0, max_h = 0, min_w = 0, min_h = 0;
   float sharpness = 0;
@@ -136,12 +138,11 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
       max_w = 0;
     NVSDK_NGX_D3D12_DestroyParameters(caps);
   }
-  if (max_w == 0 || max_h == 0 || max_w > width || max_h > height || min_w > max_w || min_h > max_h) {
-    // No usable answer: allow everything up to the output size.
-    min_w = min_h = 1;
-    max_w = width;
-    max_h = height;
-  }
+  if (max_w == 0 || max_h == 0 || min_w > max_w || min_h > max_h) min_w = min_h = 1;  // no usable answer
+  max_w = (std::clamp)(render_width, (std::min)(min_w, width), width);
+  max_h = (std::clamp)(render_height, (std::min)(min_h, height), height);
+  min_w = (std::min)(min_w, max_w);
+  min_h = (std::min)(min_h, max_h);
 
   NVSDK_NGX_DLSS_Create_Params create = {};
   create.Feature.InWidth = max_w;
