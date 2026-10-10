@@ -601,3 +601,25 @@ constants patched in the upload heap before each draw (as `SetSharpenStrength` a
 
 The add-on's barrier listener (states for the stretch) may slow the loading screens (reported by the user);
 measure, and limit it to upscaled frames.
+
+### Upscaling works (2026-10-10, in game)
+
+- The pass log (remote `passlog`, every named draw with its command list) shows the engine records its jobs'
+  command lists in parallel: the glow and tonemap, the depth of field and the particles after the TAA each have their
+  own list. Correcting only the TAA's own list did nothing. Lists are now recognized by their first pipeline; at
+  submission, every list after the TAA's in a frame (frames with a TAA only; menus and loading screens have none) is
+  post-processing, and such kinds are corrected when recorded in later frames. The particle lists before the TAA
+  (`...BlendSoftMultiTextureGlowD`, the fog list) stay as they are.
+- Result (67%, 4K, wind motion vectors on, GPU-bound): correct full image; 9.04 ms vs 10.97 ms DLAA vs 9.38 ms game
+  TAA. Screenshot sharpness and detail match DLAA. The full-size post-processing and the stretch passes take about 1 ms
+  of the 2 ms the lower render size saves.
+- Dot pattern on static detail (statue, walls; user report): the game's jitter cycles through 8 Halton positions
+  (AA filter +0x64; counter +0x124). DLSS needs about 8 x (output / render)^2. The filter copies its settings from the
+  area's graphics parameters every frame (`0x141AD8F90`, found with a 1-second hardware write watch) unless its byte
+  +0x8 is set. `src/taa_jitter.*` finds the TAA filter by its vtable (one background scan), holds its settings with
+  18 phases at 67% while upscaling, and releases them otherwise. 32 phases by hand and 18 automatically both removed
+  the dots; the user confirmed in game.
+- Lesson: blocks found by content in memory can be transient copies (command packets, job stacks); writing to them
+  is unsafe. Only write to verified persistent objects (vtable checked).
+- User check at 67%: static detail, motion, effects, menus and the map all fine. The developer DLSS DLL in the dev
+  profile shows a "DLSS SDK - DO NOT DISTRIBUTE" watermark; the release DLL does not.
