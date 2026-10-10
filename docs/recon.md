@@ -512,3 +512,41 @@ Next: `ab_capture.ps1 -Round drsprobe` (`src/drs_probe.*`) sets every float equa
 reports what changes in `CB_AA`, `cbPostProcessCommon`, cbSceneParam's percentages and the scene viewport
 (`shots/drsprobe_<name>.txt`). The engine must keep the previous frame's percentages in a persistent object,
 which this should find if it lives in one of those objects.
+
+## Stage 3, round 3: the dynamic-resolution scale, found (2026-10-10)
+
+The probe (`drsprobe`, 927 floats equal to 1.0 in the graphics manager, two sub-objects and the render context)
+moved nothing. The engine never stores the percentages there; they come from the chain below (static analysis of
+the per-frame AA code, then live reads and writes with `tools/mem.py`).
+
+- `[0x1447F33E0]` holds the console dynamic-resolution state: requested percentages at +0xEDC..+0xEEB (4 floats),
+  a render size at +0xEFC/+0xF00 (3840x2160), a scale at **+0xF04** (1.0) and the effective percentages
+  +0xEEC..+0xEFB = scale x requested. `FUN_1419EFB70(obj, w, h)` sets the size and scale = max(w/W, h/H)
+  (clamped to 1; W, H at `[obj+0x128]+0x108/+0x10C`); `FUN_1419ECBF0(obj, &four)` sets the requested ones.
+- `FUN_141A0B840` (per frame) fills the render context from the scene object (`param_2`) and that state:
+  context+0x78C/+0x790/+0x794/+0x798 = the effective percentages (current, primary, previous, previous primary)
+  when scene+0xB0 is set (else constants), +0x79C = 0 (use +0x78C) when they are not 1.0, else 2 (use 1.0),
+  +0x7A0 = `FUN_141AD78C0(aa filter)` && byte `0x143C28801` (1 on PC), +0x7A1 = byte `0x143C28803`.
+  `FUN_141AD78C0` is true when the AA filter is TAA (filter+0xC == 4) with +0x9 and +0x21 set.
+- The context's view block at +0x570 (percentage +0x21C, primary +0x220, mode +0x22C, read by `FUN_141A309F0`)
+  sizes the passes' viewports (`FUN_141A53E00(target, percentage)` before setting render targets). The context's
+  camera is inline at +0x7B0 (pointer at +0x448); its resolution block at camera+0xA0 is
+  {W, H, w, h, w, h, w/W, h/H, percentage} (`FUN_141A55190`; `FUN_141A54AA0` rounds the size to multiples of
+  4 or 8 pixels, as on the consoles).
+- The AA filter is not at graphics manager+0xBAC0: the scene object is (main world scene, live: `0x7FF1D2ACE000`,
+  with +0xB0 = 1 and a TAA filter at +0xBAC0, vtable `0x142F242B8`). Earlier notes mixed the two up.
+
+Live tests (dev build, outdoors, 4K):
+- Writing the effective percentages directly: overwritten within a frame.
+- Writing **scale +0xF04 = 0.67**: it stays, `CB_AA` and `cbPostProcessCommon` read 0.67, and the scene renders
+  into the top-left 67% of the full-size targets. Nothing upscales it afterwards: with DLSS (which ignores the
+  percentages) and with the game's own TAA alike, the final image shows the whole view shrunk into the top-left
+  67% with stale pixels around it (captures `taa100`/`taa67`, `drs67_scale`). GPU busy 9.61 -> 7.42 ms (PresentMon
+  medians, `pm_taa100`/`pm_taa67`).
+- Also writing the render size (+0xEFC/+0xF00 = 2573x1447) changed nothing more.
+- The add-on's scene observation (`drsstatus` "scene", "Scene:" log line) only accepts draws whose screen size
+  matches the TAA size, so it cannot see a shrunk scene; its 1.0 / 3840x2160 during the tests is stale.
+
+Next: force the scale from the add-on and give DLSS the sub-rectangle (size from `CB_AA` g_vScreenPercentage,
+which is the rounded w/W), output full size, scale jitter and motion vectors to match; then check in RenderDoc
+which post-TAA passes still apply the percentages.
