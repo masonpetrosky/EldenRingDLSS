@@ -14,6 +14,9 @@ $files = @{
   'lib/Windows_x86_64/x64/nvsdk_ngx_s.lib' = 'lib/nvsdk_ngx_s.lib'
   'lib/Windows_x86_64/rel/nvngx_dlss.dll' = 'bin/rel/nvngx_dlss.dll'
   'lib/Windows_x86_64/dev/nvngx_dlss.dll' = 'bin/dev/nvngx_dlss.dll'
+  # Ray Reconstruction (DLSS-RR), for experiments (docs/raytracing.md)
+  'lib/Windows_x86_64/rel/nvngx_dlssd.dll' = 'bin/rel/nvngx_dlssd.dll'
+  'lib/Windows_x86_64/dev/nvngx_dlssd.dll' = 'bin/dev/nvngx_dlssd.dll'
 }
 foreach ($h in $headers) { $files[$h] = $h }
 

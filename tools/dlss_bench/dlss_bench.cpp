@@ -2,7 +2,8 @@
 // feature is created for), a few hundred evaluations each with GPU timestamps. Shows how the creation size affects
 // the cost (DLSS programming guide 310.6, section 3.2.2.1: presets L and M cost what their creation size costs).
 //
-// usage: dlss_bench.exe <folder with nvngx_dlss.dll> [output width] [output height]
+// usage: dlss_bench.exe <folder with nvngx_dlss.dll> [output width] [output height] [rr]
+// "rr" times DLSS Ray Reconstruction (nvngx_dlssd.dll) instead, with dummy guide buffers.
 // SPDX-License-Identifier: MIT
 
 #define WIN32_LEAN_AND_MEAN
@@ -13,6 +14,7 @@
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
+#include <nvsdk_ngx_helpers_dlssd_d3d.h>
 
 #include <algorithm>
 #include <cmath>
@@ -184,8 +186,97 @@ int main(int argc, char** argv) {
   };
   const char* preset_names[] = {"", "", "", "", "", "", "", "", "", "", "J", "K", "L", "M"};
 
-  std::printf("%-12s %-6s %-11s %-11s %9s %9s %9s %9s\n", "mode", "preset", "render", "created for", "mean ms",
-              "median ms", "min ms", "VRAM MB");
+  const bool rr = argc > 4 && std::string(argv[4]) == "rr";
+  if (rr) {
+    // Guide buffers at the output size, the render size in their top-left corner.
+    ID3D12Resource* albedo = Texture(out_w, out_h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, srv);
+    ID3D12Resource* specular = Texture(out_w, out_h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, srv);
+    ID3D12Resource* normals = Texture(out_w, out_h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_FLAG_NONE, srv);
+    ID3D12Resource* roughness = Texture(out_w, out_h, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_NONE, srv);
+    const char* rr_names[] = {"Default", "", "", "", "D", "E", "F"};
+    const std::vector<Case> rr_cases = {
+        {"DLAA", NVSDK_NGX_PerfQuality_Value_DLAA, 0, out_w, out_h, out_w, out_h},
+        {"Quality", NVSDK_NGX_PerfQuality_Value_MaxQuality, 0, q_w, q_h, q_w, q_h},
+        {"Performance", NVSDK_NGX_PerfQuality_Value_MaxPerf, 0, p_w, p_h, p_w, p_h},
+        {"Performance", NVSDK_NGX_PerfQuality_Value_MaxPerf, 4, p_w, p_h, p_w, p_h},
+        {"Performance", NVSDK_NGX_PerfQuality_Value_MaxPerf, 5, p_w, p_h, p_w, p_h},
+    };
+    std::printf("Ray Reconstruction\n%-12s %-7s %-11s %9s %9s %9s\n", "mode", "preset", "render", "mean ms",
+                "median ms", "min ms");
+    for (const Case& c : rr_cases) {
+      for (const char* hint : {NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA,
+                               NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality,
+                               NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced,
+                               NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance,
+                               NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance,
+                               NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality})
+        NVSDK_NGX_Parameter_SetUI(params, hint, static_cast<unsigned>(c.preset));
+      NVSDK_NGX_DLSSD_Create_Params create = {};
+      create.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
+      create.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Unpacked;
+      create.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_HW;
+      create.InWidth = c.create_w;
+      create.InHeight = c.create_h;
+      create.InTargetWidth = out_w;
+      create.InTargetHeight = out_h;
+      create.InPerfQualityValue = c.quality;
+      create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+                                    NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+      NVSDK_NGX_Handle* feature = nullptr;
+      if (NVSDK_NGX_FAILED(NGX_D3D12_CREATE_DLSSD_EXT(g_list, 1, 1, &feature, params, &create))) {
+        std::printf("%-12s %-7s %4ux%-6u creation failed\n", c.mode, rr_names[c.preset], c.render_w, c.render_h);
+        Submit();
+        continue;
+      }
+      Submit();
+      std::vector<double> times;
+      for (int i = 0; i < kWarmup + kTimed; ++i) {
+        NVSDK_NGX_D3D12_DLSSD_Eval_Params eval = {};
+        eval.pInDiffuseAlbedo = albedo;
+        eval.pInSpecularAlbedo = specular;
+        eval.pInNormals = normals;
+        eval.pInRoughness = roughness;
+        eval.pInColor = color;
+        eval.pInOutput = output;
+        eval.pInDepth = depth;
+        eval.pInMotionVectors = motion;
+        eval.InJitterOffsetX = Halton(i % 32 + 1, 2) - 0.5f;
+        eval.InJitterOffsetY = Halton(i % 32 + 1, 3) - 0.5f;
+        eval.InRenderSubrectDimensions = {c.render_w, c.render_h};
+        eval.InReset = i == 0 ? 1 : 0;
+        eval.InMVScaleX = 1.0f;
+        eval.InMVScaleY = 1.0f;
+        eval.InFrameTimeDeltaInMsec = 8.0f;
+        g_list->EndQuery(queries, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        if (NVSDK_NGX_FAILED(NGX_D3D12_EVALUATE_DLSSD_EXT(g_list, feature, params, &eval))) {
+          std::fprintf(stderr, "evaluation failed\n");
+          return 1;
+        }
+        g_list->EndQuery(queries, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        g_list->ResolveQueryData(queries, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback, 0);
+        Submit();
+        UINT64* ts = nullptr;
+        const D3D12_RANGE range = {0, 16};
+        readback->Map(0, &range, reinterpret_cast<void**>(&ts));
+        if (i >= kWarmup)
+          times.push_back(static_cast<double>(ts[1] - ts[0]) * 1000.0 / static_cast<double>(frequency));
+        const D3D12_RANGE none = {0, 0};
+        readback->Unmap(0, &none);
+      }
+      NVSDK_NGX_D3D12_ReleaseFeature(feature);
+      std::vector<double> sorted = times;
+      std::sort(sorted.begin(), sorted.end());
+      double sum = 0;
+      for (double t : times) sum += t;
+      std::printf("%-12s %-7s %4ux%-6u %9.3f %9.3f %9.3f\n", c.mode, rr_names[c.preset], c.render_w, c.render_h,
+                  sum / times.size(), sorted[sorted.size() / 2], sorted.front());
+    }
+    cases.clear();  // ray reconstruction only
+  }
+
+  if (!cases.empty())
+    std::printf("%-12s %-6s %-11s %-11s %9s %9s %9s %9s\n", "mode", "preset", "render", "created for", "mean ms",
+                "median ms", "min ms", "VRAM MB");
   for (const Case& c : cases) {
     for (const char* hint :
          {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
