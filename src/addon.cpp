@@ -90,11 +90,16 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   resource depth_copy = {0};  // the depth copy the same pass samples
   bool dlss_applied = false;  // DLSS replaced the TAA in this command list
   bool taa_passthrough = false;  // the TAA only passed the image on (upscaling: DLSS runs at the UI composite)
-  // Upscaling at the TAA: DLSS made the frame full size in this command list; the passes recorded after it here were
-  // sized for the scene's share `post_scale` of the `out_width` x `out_height` targets.
+  // Upscaling at the TAA: this command list's passes come after an upscaled TAA (its own draws after the TAA, or the
+  // whole list when its kind was seen submitted after the TAA's), sized for the scene's share `post_scale` of the
+  // `out_width` x `out_height` targets.
   bool post_fix = false;
   float post_scale[2] = {1, 1};
   uint32_t out_width = 0, out_height = 0;
+  // The kind of list: the pipeline of its first draw or dispatch (one engine job records one list).
+  uint64_t signature = 0;
+  bool signed_ = false;
+  bool has_taa = false;  // the TAA was recorded here
   // Wind: the game's cbSceneParam/cbPerFrame addresses last patched in this command list and the patched slot.
   uint64_t wind_scene = 0, wind_frame = 0, wind_prev = 0;
   bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
@@ -223,6 +228,15 @@ erdlss::Stretch g_stretch;
 bool g_stretch_failed = false;
 bool g_post_fix = true;                       // development (remote "postfix on|off")
 std::atomic<uint64_t> g_post_fixes{0};        // corrected passes, for the overlay and logs
+// The engine records its jobs' command lists in parallel, so the passes after the TAA are mostly in other lists,
+// recorded at the same time. Their order shows when they are submitted: every list submitted after the TAA's in a
+// frame is post-processing. Lists are recognized by their first pipeline; kinds seen only after the TAA are corrected
+// when they are recorded in later frames (the first frame a new kind appears is not).
+std::mutex g_kinds_mutex;
+std::unordered_map<uint64_t, uint8_t> g_list_kinds;  // signature -> 1 seen before the TAA, 2 after, 3 both
+bool g_frame_taa_submitted = false;                  // under g_kinds_mutex; reset at present
+std::atomic<float> g_last_post_scale_x{1.0f}, g_last_post_scale_y{1.0f};  // the last upscaled TAA's share
+std::atomic<uint32_t> g_last_out_width{0}, g_last_out_height{0};
 std::atomic<uint64_t> g_motion_src{0};       // the scene's motion: the motion prep pass's g_MoveTex
 std::atomic<uint64_t> g_emissive{0};         // the emissive buffer: EmissiveToGlowPS's source
 std::atomic<uint64_t> g_half_depth{0};       // the half-size depth: LensSimu2_ComputeCoCF's
@@ -1180,6 +1194,10 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
       data.post_scale[1] = static_cast<float>(in_height) / static_cast<float>(height);
       data.out_width = width;
       data.out_height = height;
+      g_last_post_scale_x = data.post_scale[0];
+      g_last_post_scale_y = data.post_scale[1];
+      g_last_out_width = width;
+      g_last_out_height = height;
     }
   }
   const uint64_t frames = ++g_dlss_frames;
@@ -2409,6 +2427,40 @@ void TreeDumpDraw(command_list* cmd_list, const CmdData& data, uint32_t instance
   cmd_list->bind_pipeline(pipeline_stage::all, data.current);
 }
 
+// The first draw or dispatch names the command list's kind; a kind only ever submitted after the TAA (learned in
+// OnExecuteCommandList) is corrected throughout.
+void SignList(CmdData& data) {
+  if (data.signed_) return;
+  data.signed_ = true;
+  data.signature = data.current.handle;
+  if (!g_post_fix || !g_config.enabled || g_config.render_scale >= 1.0f || g_last_out_width.load() == 0) return;
+  {
+    std::lock_guard lock(g_kinds_mutex);
+    const auto it = g_list_kinds.find(data.signature);
+    if (it == g_list_kinds.end() || it->second != 2) return;
+  }
+  data.post_fix = true;
+  data.post_scale[0] = g_last_post_scale_x.load();
+  data.post_scale[1] = g_last_post_scale_y.load();
+  data.out_width = g_last_out_width.load();
+  data.out_height = g_last_out_height.load();
+}
+
+// Command lists in GPU order: every list submitted after the one holding the TAA, until present, is post-processing.
+void OnExecuteCommandList(command_queue*, command_list* cmd_list) {
+  if (g_config.render_scale >= 1.0f) return;
+  auto* const data = cmd_list->get_private_data<CmdData>();
+  if (data == nullptr || !data->signed_) return;
+  std::lock_guard lock(g_kinds_mutex);
+  uint8_t& kind = g_list_kinds[data->signature];
+  const uint8_t was = kind;
+  kind |= g_frame_taa_submitted ? 2 : 1;
+  if (was != 0 && was != 3 && kind == 3)
+    Log(reshade::log::level::warning, "A command list kind (" + PipelineName(data->signature) +
+                                          ") came both before and after the TAA; it is not corrected.");
+  if (data->has_taa) g_frame_taa_submitted = true;
+}
+
 // Every named draw (no materials) of the frame, with its command list and thread, whether it follows an upscaled TAA
 // in its command list (corrected), and its viewport and targets as the game set them.
 void LogPass(command_list* cmd_list, const CmdData& data) {
@@ -2469,6 +2521,7 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
                    int32_t vertex_offset, uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
+  SignList(*data);
   if (data->post_fix) CorrectPostPass(cmd_list, *data, false);
   OnPostPass(cmd_list, *data);
   if (data->pass == Pass::kBlendUi) return false;
@@ -2561,6 +2614,7 @@ void ObserveTaaResolution(command_list* cmd_list, float screen[2]) {
 bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t, uint32_t) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
+  SignList(*data);
   if (data->pass == Pass::kMotionPrep) {
     data->depth = BoundResource(cmd_list, shader_stage::pixel, 0);       // g_StencilTexForCopy
     data->depth_copy = BoundResource(cmd_list, shader_stage::pixel, 2);  // g_DepthTex
@@ -2583,6 +2637,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     return false;
   }
   if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) {
+    data->has_taa = true;
     if (g_passlog_frame.load() != 0) LogPass(cmd_list, *data);
     float screen[2] = {1, 1};
     ObserveTaaResolution(cmd_list, screen);
@@ -2605,7 +2660,9 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
 
 bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
   auto* const data = cmd_list->get_private_data<CmdData>();
-  if (data != nullptr && data->post_fix) CorrectPostPass(cmd_list, *data, true);
+  if (data == nullptr) return false;
+  SignList(*data);
+  if (data->post_fix) CorrectPostPass(cmd_list, *data, true);
   return false;
 }
 
@@ -2692,6 +2749,10 @@ void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, ui
     queue->wait_idle();
     std::lock_guard lock(g_dlss_mutex);
     g_dlss.ReleaseFeature();
+  }
+  {
+    std::lock_guard lock(g_kinds_mutex);
+    g_frame_taa_submitted = false;
   }
   ApplyRenderScale();
   const uint64_t passlog = g_passlog_frame.load();
@@ -3200,6 +3261,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
       reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
+      reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       // The barrier listener costs on every barrier the game records (loading screens record many), so it is only
       // registered when upscaling is set at startup (the stretch passes need the textures' states).
       if (g_config.render_scale < 1.0f) reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
