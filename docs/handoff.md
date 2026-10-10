@@ -27,7 +27,9 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
   `build\everyday-backup\`. Only update it with the user's explicit OK and with the game closed
   (`tools/deploy.ps1 -Target main`).
 - **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLL): test builds only. It has the
-  full-size post-processing build (2026-10-10, see "Stage 3" below), with `RenderScale=0.67` and `GameExposure=1`.
+  ray tracing test build (2026-10-10: remote `rtskip`, `rtrefit`, `rtfeedback`, `rtinfo`, plus `stretch on|off` and
+  `jitter <phases>`), with `RenderScale=0.50`, `Preset=13` (M) and `GameExposure=1`. The user wants preset M at 50%
+  (sharper character detail than K there); the everyday install still runs 67% with K.
 
 ## Working rules (from the user)
 
@@ -36,6 +38,9 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 - HDR: the vanilla game starts in SDR and switches to HDR at the first main-menu click. ReShade.log's output line
   never sees the switch, so don't conclude HDR is off from it. RenderDoc sessions do save HDR off; remind the user to
   turn it back on after one. A "Game output: 2560x1600 ... SDR" line means the monitor is off or the user is remote.
+- If a launch hangs before the game creates its device (no "Redirecting D3D12CreateDevice" in ReShade.log, process
+  not responding) and a relaunch fails with "Steam is required", Steam still lists the game as running: the user
+  restarts Steam (Steam > Exit), then launch again (happened once on 2026-10-10).
 - Every normal exit ends in a WER crash report (int3 at `eldenring.exe+0xC58DB6`, a shutdown allocator check). It
   predates this work and is harmless. A session that ends without that report was a real crash.
 
@@ -99,12 +104,11 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
 
 ### Next steps
 
-1. Test the preset M fix in game (commit 3c76c9d, in the dev install, not yet run): 50% with M should cost about
-   0.6 ms more than K, not 4 ms. The everyday install (67%, preset K) is not affected: K's cost does not depend
-   on the creation size.
-2. The user's bigger goal: make ray tracing affordable. Plan and DLSS Ray Reconstruction findings in
-   `docs/raytracing.md`; first step is measuring ray tracing with upscaling (PresentMon, a RenderDoc capture with
-   RT on).
+1. Preset M fix: confirmed in game (2026-10-10): 50% M costs 0.63 ms more than K.
+2. The user's bigger goal: make ray tracing affordable. `docs/raytracing.md` has the measurements, how the game's
+   ray tracing works (captures `er117_rtmax_*`), the boiling-grass cause (long jitter cycle against the shadow
+   denoiser's 10-frame history) and the next session's tests with the dev build's switches (cost split, amortized
+   refits, denoiser history). The everyday install also boils with ray tracing on (67%, 18 phases, Low).
 3. Hear how the everyday install at 67% plays over longer sessions and other areas.
 4. Performance: the stretch passes and the full-size post-processing cost about 1 ms; check what is worth saving.
 5. Robustness: scale changes at runtime (barrier listener), resolution changes (filter and target recreation), the

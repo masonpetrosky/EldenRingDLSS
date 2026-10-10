@@ -105,6 +105,7 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   uint64_t wind_scene = 0, wind_frame = 0, wind_prev = 0;
   bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
   bool tree_wind_patched = false;   // a tree wind copy was written in this command list
+  uint32_t rt_group = 0;  // ray tracing: refits recorded so far in this list (the animation dispatches before one belong to it)
 };
 
 struct Config {
@@ -225,6 +226,7 @@ std::atomic<uint64_t> g_last_upscale{0};     // g_frame of the last upscaled fra
 // upscaled frame.
 std::atomic<uint64_t> g_feature_created{0};
 bool g_upscale_at_composite = false;         // development (remote "upscaleat"): the composite path above
+std::atomic<uint32_t> g_jitter_phases{0};   // development (remote "jitter <phases>"; 0 = from the scale)
 
 // Upscaling at the TAA (the default, NVIDIA's placement): DLSS runs where DLAA does. The engine queues the passes
 // after the TAA with render-size viewports and constants before the TAA even runs (docs/recon.md, round 4), so each
@@ -233,6 +235,7 @@ bool g_upscale_at_composite = false;         // development (remote "upscaleat")
 erdlss::Stretch g_stretch;
 bool g_stretch_failed = false;
 bool g_post_fix = true;                       // development (remote "postfix on|off")
+bool g_stretch_inputs = true;                 // development (remote "stretch on|off")
 std::atomic<uint64_t> g_post_fixes{0};        // corrected passes, for the overlay and logs
 // The engine records its jobs' command lists in parallel, so the passes after the TAA are mostly in other lists,
 // recorded at the same time. Their order shows when they are submitted: every list submitted after the TAA's in a
@@ -1210,7 +1213,7 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   if (g_config.render_scale < 1.0f) {
     g_last_upscale = g_frame.load();
     if (in_width < width || in_height < height) {
-      StretchPostInputs(cmd_list, data, width, height, in_width, in_height);
+      if (g_stretch_inputs) StretchPostInputs(cmd_list, data, width, height, in_width, in_height);
       data.post_fix = g_post_fix;
       data.post_scale[0] = static_cast<float>(in_width) / static_cast<float>(width);
       data.post_scale[1] = static_cast<float>(in_height) / static_cast<float>(height);
@@ -2696,12 +2699,70 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   return false;
 }
 
+// Ray tracing (docs/raytracing.md; captures er117_rtmax_*). With the game's ray tracing on, every frame re-animates
+// the swaying vegetation and the skinned characters in compute ("..._Animation" shaders) for the ray tracing scene and
+// refits their bottom-level acceleration structures (about 200 refits, in groups: a few animation dispatches, then the
+// refit), rebuilds the top level, traces two DispatchRays (AO at half size, shadows at full size; both follow the
+// render scale) and denoises the shadows (GXRtPost_*: a temporal pass with 90% history, then a-trous filters).
+// Development switches: skip parts to measure their cost, refit each structure only every Nth frame, and lengthen the
+// shadow denoiser's history (a long jitter cycle makes the 10-frame history boil on grass).
+std::atomic<uint32_t> g_rt_skip{0};         // remote "rtskip <mask>": 1 animation dispatches, 2 refits, 4 DispatchRays
+std::atomic<uint32_t> g_rt_refit_every{1};  // remote "rtrefit <N>": refit each structure every Nth frame
+std::atomic<float> g_rt_feedback{0.0f};     // remote "rtfeedback <weight>": the denoiser's history weight, 0 = game's
+std::atomic<uint64_t> g_rt_anim{0}, g_rt_refits{0}, g_rt_skipped{0}, g_rt_rays{0}, g_rt_tlas{0}, g_rt_edits{0};
+
+// Whether this frame skips refit group `group` of a command list (the same objects come in the same order each frame).
+bool SkipRefitGroup(uint32_t group) {
+  const uint32_t every = g_rt_refit_every.load();
+  return every > 1 && (group + g_frame.load()) % every != 0;
+}
+
 bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   SignList(*data);
   if (data->post_fix) CorrectPostPass(cmd_list, *data, true);
+  const std::string name = PipelineName(data->current.handle);
+  if (name.find("_Animation") != std::string::npos) {
+    ++g_rt_anim;
+    if ((g_rt_skip.load() & 1) || SkipRefitGroup(data->rt_group)) return true;
+  } else if (name == "GXRtPost_VarianceGuidedShadow") {
+    const float weight = g_rt_feedback.load();
+    // g_denoiseParam (b0): feedbackWeight at byte 24
+    if (weight > 0.0f && EditBoundConstants(cmd_list, shader_stage::compute, 0, 24, 1, [weight](float* v) {
+          if (v[0] <= 0.0f || v[0] >= 1.0f) return false;
+          v[0] = weight;
+          return true;
+        }))
+      ++g_rt_edits;
+  }
   return false;
+}
+
+bool OnBuildAccelerationStructure(command_list* cmd_list, acceleration_structure_type type,
+                                  acceleration_structure_build_flags, uint32_t, const acceleration_structure_build_input*,
+                                  resource, uint64_t, resource_view, resource_view,
+                                  acceleration_structure_build_mode mode) {
+  if (type == acceleration_structure_type::top_level) {
+    ++g_rt_tlas;
+    return false;
+  }
+  auto* const data = cmd_list->get_private_data<CmdData>();
+  if (data == nullptr) return false;
+  const uint32_t group = data->rt_group++;
+  if (mode != acceleration_structure_build_mode::update) return false;  // only refits can wait
+  ++g_rt_refits;
+  if ((g_rt_skip.load() & 2) || SkipRefitGroup(group)) {
+    ++g_rt_skipped;
+    return true;
+  }
+  return false;
+}
+
+bool OnDispatchRays(command_list*, resource, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, resource,
+                    uint64_t, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t) {
+  ++g_rt_rays;
+  return (g_rt_skip.load() & 4) != 0;
 }
 
 bool KeyPressed(int vk) {
@@ -2755,7 +2816,10 @@ void ApplyRenderScale() {
       scale = std::clamp(g_config.render_scale, g_dlss.min_scale(), g_dlss.max_scale());
   }
   // DLSS needs about 8 x (output / render)^2 jitter positions when it upscales (NVIDIA); the game cycles through 8.
-  g_taa_jitter.Apply(scale < 1.0f ? std::clamp(static_cast<uint32_t>(std::ceil(8.0f / (scale * scale))), 9u, 64u) : 0u);
+  const uint32_t phases = g_jitter_phases.load();
+  g_taa_jitter.Apply(scale >= 1.0f ? 0u
+                     : phases != 0 ? phases
+                                   : std::clamp(static_cast<uint32_t>(std::ceil(8.0f / (scale * scale))), 9u, 64u));
   if (scale == 1.0f && !g_render_scale_set) return;  // never touch the engine without a reason
   if (!g_render_scale.found()) {
     if (g_render_scale_missing) return;
@@ -3125,6 +3189,33 @@ void OnReshadePresent(effect_runtime* runtime) {
                   g_config.render_scale, g_render_scale.Get(), g_input_width.load(), g_input_height.load(),
                   g_render_width.load(), g_render_height.load());
     result = text;
+  } else if (command == "stretch") {
+    // stretch on|off: stretch the render-size inputs of the passes after the TAA (development)
+    if (!arg.empty()) g_stretch_inputs = arg != "off";
+    result = g_stretch_inputs ? "stretch on" : "stretch off";
+  } else if (command == "jitter") {
+    // jitter <phases>: the TAA's jitter cycle while upscaling, 8 = the game's, 0 = from the scale (development)
+    if (!arg.empty()) g_jitter_phases = static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 0, 64));
+    result = g_taa_jitter.status();
+  } else if (command == "rtskip" || command == "rtrefit" || command == "rtfeedback" || command == "rtinfo") {
+    // ray tracing development switches (see OnDispatch); rtinfo: per-frame counts since the last rtinfo
+    if (command == "rtskip" && !arg.empty()) g_rt_skip = static_cast<uint32_t>(std::atoi(arg.c_str()));
+    if (command == "rtrefit" && !arg.empty()) g_rt_refit_every = static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 1, 16));
+    if (command == "rtfeedback" && !arg.empty()) g_rt_feedback = std::clamp(std::strtof(arg.c_str(), nullptr), 0.0f, 0.995f);
+    static uint64_t last_frame = 0, last[6] = {};
+    const uint64_t now[6] = {g_rt_anim.load(), g_rt_refits.load(), g_rt_skipped.load(), g_rt_tlas.load(),
+                             g_rt_rays.load(), g_rt_edits.load()};
+    const uint64_t frames = (std::max)(uint64_t{1}, g_frame.load() - last_frame);
+    double per[6];
+    for (int i = 0; i < 6; ++i) per[i] = double(now[i] - last[i]) / double(frames), last[i] = now[i];
+    last_frame = g_frame.load();
+    char text[256];
+    std::snprintf(text, sizeof(text),
+                  "skip %u, refit every %u, feedback %.3f; per frame over %llu: %.1f animation dispatches, %.1f refits "
+                  "(%.1f skipped), %.2f top-level builds, %.2f DispatchRays, %.2f denoiser edits",
+                  g_rt_skip.load(), g_rt_refit_every.load(), g_rt_feedback.load(),
+                  static_cast<unsigned long long>(frames), per[0], per[1], per[2], per[3], per[4], per[5]);
+    result = text;
   } else if (command == "passlog") {
     g_passlog_frame = g_frame.load() + 1;
     result = "logging the next frame's named draws to shots/passlog.txt";
@@ -3300,6 +3391,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
       reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
+      reshade::register_event<reshade::addon_event::dispatch_rays>(OnDispatchRays);
+      reshade::register_event<reshade::addon_event::build_acceleration_structure>(OnBuildAccelerationStructure);
       reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       // The barrier listener costs on every barrier the game records (loading screens record many), so it is only
       // registered when upscaling is set at startup (the stretch passes need the textures' states).

@@ -9,10 +9,64 @@ Patch 1.09 (March 2023) added ray-traced **shadows and ambient occlusion**, no r
 of large frame-rate drops and recommend 1080p; reviews found a small visual gain (mostly vegetation shadows outdoors,
 AO on rocks and cliffs) for a severe cost, with no upscaler to offset it. Settings: off, low, medium, high, maximum.
 
-Not yet examined in this project: which passes trace rays (DXR pipelines or inline ray queries in compute), at which
-resolution they run (do they follow the dynamic resolution, i.e. get cheaper with the render scale?), how much of the
-cost is acceleration-structure building, and how the game denoises the results. All captures so far have ray
-tracing off.
+### How it works (RenderDoc, 2026-10-10)
+
+Captures `er117_rtmax_scale100_f7202.rdc` and `er117_rtmax_scale50_f9082.rdc` (ray tracing Maximum, night, open
+field with grass and trees; the second with the engine scale set to 0.5 through `tools/mem.py`, no add-on).
+`tools/rdc_rt.py` lists every action with shader names and the ray tracing calls' parameters. Per frame:
+
+1. About 400 compute dispatches re-animate the moving geometry for the ray tracing scene: SpeedTree trees
+   (`SpeedTree_*_Animation`, about 300), grass and bushes (`M[AMSN_V]_Vesitation_Animation`, `..._Edge_`, `[Ov_N]`)
+   and skinned characters (`C[...]_Animation_Skin`, `P[ChrCustomize]...`). The rasterizer animates in its vertex
+   shaders as before; these copies exist for the acceleration structures.
+2. 197 bottom-level acceleration structure refits (`PERFORM_UPDATE | ALLOW_UPDATE | PREFER_FAST_BUILD`), at least
+   635k triangles, each after the animation dispatches of its object (groups of 1-3 dispatches, then the refit,
+   in one command list).
+3. One top-level build (`PREFER_FAST_TRACE`, about 300-320 instances: the ray tracing scene is the area around the
+   player, not the whole view distance).
+4. Two `DispatchRays` (DXR pipelines with hit groups, 650 hit records): 1920x1080 and 3840x2160 at native,
+   960x540 and 1920x1080 at 50%. They follow the render scale. The half-size one is most likely the AO, the
+   full-size one the shadows.
+5. Denoise in compute: `GXRtPost_VarianceGuidedShadow` at full and half size (temporal: `g_denoiseParam`
+   feedbackWeight 0.9 at byte 24, a neighborhood clamp `enableConstrain`, reprojection by `mtxCurToPrevScreen`,
+   `prevResolutionScale` for dynamic resolution; inputs only the noisy result and the history), then two
+   `GXRtPost_DenoiseATrousFilter` at half size.
+6. The raster shadows still run (cascaded shadow maps, screen-space PCF, SSAO); the ray traced results are
+   composited with them (`GXRend_CompositeSeparatedShadowMaskBlendPass1/2`).
+
+RenderDoc's GPU duration counters return nothing in headless replay (also for older captures), so the per-pass
+cost is still unmeasured; the frame times below and the switches in the dev build (`rtskip`) measure it instead.
+
+### Frame times with the add-on (2026-10-10, 4K, RTX 5070 Ti, GPU busy per frame)
+
+| Setting | RT off | RT Low | RT Max |
+| --- | --- | --- | --- |
+| 50%, preset K | 8.52 | 14.74 | 13.14 |
+| 50%, preset M | 9.15 | 15.34 | 13.81 |
+| 67%, preset K | 9.31 | 15.77 | 14.51 |
+| DLAA, preset K | 10.98 | 18.15 | 17.38 |
+| Game TAA, native | 9.52 | 17.16 | 15.89 |
+
+Each ray tracing setting needs a return to the title screen, so the three columns are from separate loads of the
+same spot (Max came out cheaper than Low: the scene changed, probably time of day). Within a column: ray tracing adds
+6-7 ms, and only about 1 ms of it goes away between native and 50%. That fits the structure above: the animation,
+the refits and the top-level build do not depend on the resolution; only the two ray dispatches and the denoiser do.
+Preset M at 50% costs 0.63 ms more than K (the creation-size fix works in game).
+
+### Boiling grass with upscaling (2026-10-10)
+
+With ray tracing on, the grass boiled at 50% and 67% but not at DLAA. Cause: the jitter cycle, not the resolution.
+At 50% (ray tracing Low, then Max): 8 and 16 phases calm, 18 calm on Max, 32 boils strongly on Low and a little on
+Max; 18 phases at 67% boiled on Low. The ray traced shadows start from the jittered G-buffer positions, so on grass
+every jitter position gives a different result. The shadow denoiser keeps 90% history (about 10 frames): with up to
+about 16 positions its window covers nearly all of them and the average holds still; with 32 each window sees a
+different subset and the average drifts. Fewer rays (Low) mean more variance per position. The denoiser's constants
+have no jitter or frame index, so keeping the game's 8-step counter would not help. Static detail shows the dot
+pattern at 16 phases, so no cycle length suits both.
+
+Candidate fixes: a longer denoiser history while the jitter cycle is long (feedbackWeight, editable per dispatch like
+the post-processing constants: dev remote `rtfeedback <weight>`; risk: shadows lagging behind moving objects), or
+Ray Reconstruction (replaces the denoiser and handles jittered noisy input by design).
 
 ## Preset M cost (solved)
 
@@ -65,13 +119,20 @@ From NVIDIA's DLSS-RR Integration Guide (github.com/NVIDIA/DLSS, doc/):
 
 ## Plan, in order
 
-1. **Measure ray tracing as it is**, with the upscaling build: PresentMon at RT off / low / max, at DLAA, 67% and 50%,
-   plus a RenderDoc capture (RT on, 67%) to list the ray tracing and denoise passes, their resolutions and their GPU
-   times (RenderDoc can time passes). This answers whether the rays already get cheaper with the render scale and
-   where the remaining cost is (acceleration structures, tracing, denoising).
-2. If ray tracing passes do not follow the render scale, make them (same tools as the post-processing corrections).
-3. Then decide on RR with numbers: its cost on this GPU (above) against the game's denoising cost, and whether the
-   game's sampling suits it.
+1. Done: measured ray tracing as it is (frame times above, two RenderDoc captures). The rays follow the render scale;
+   most of the cost does not.
+2. Next session, dev build with the ray tracing switches (`OnDispatch` / `OnBuildAccelerationStructure` /
+   `OnDispatchRays` in `src/addon.cpp`; remote `rtinfo` reports per-frame counts):
+   - Cost split with PresentMon: `rtskip 1` (animation dispatches), `rtskip 3` (and the refits), `rtskip 4` (the ray
+     dispatches), against `rtskip 0`. Skipped animation should not change the rasterized image (it only feeds the
+     acceleration structures); if characters or trees freeze on screen, that assumption is wrong.
+   - Amortized refits: `rtrefit 2`, `3`, `4` refit each object every Nth frame (round robin; its animation dispatches
+     are skipped with it). Shadows of swaying trees and moving characters lag by up to N-1 frames; check how visible
+     that is and what it saves.
+   - Boiling: `rtfeedback 0.95` / `0.97` with the 32-phase jitter at 50%, on Low and Max; check grass calm and
+     shadow lag behind moving objects.
+3. Then decide on RR with numbers: its cost on this GPU (above) against the game's denoising cost and the boiling
+   fix, and whether the game's sampling suits it.
 
 ## Adding ray-traced reflections or GI (feasibility, 2026-10-10)
 
