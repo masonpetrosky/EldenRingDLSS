@@ -66,6 +66,7 @@ enum class Pass : uint8_t {
 constexpr uint32_t kSceneParamRegister = 8;
 constexpr uint32_t kSceneParamBytes = 1424;
 constexpr size_t kScreenSize = 16 / 4;           // float4 FC_ScreenSize
+constexpr size_t kCameraPos = 48 / 4;            // float4 SC_CameraPos (the map's coordinates)
 constexpr size_t kMatrixProj = 256 / 4;          // float4x4 FC_MatrixProj, column-major
 constexpr size_t kSceneExposure = 1152 / 4;      // float SC_SceneExposure
 constexpr size_t kPreExposure = 1160 / 4;        // float SC_PreExposure
@@ -79,6 +80,7 @@ struct SceneParams {
   float screen_percentage = 1;
   float percentages[8] = {1, 1, 1, 1, 1, 1, 1, 1};  // SC_DynamicResolution_ScreenPercentage and the secondary
   float velocity_scale = 1, velocity_bias = 0;
+  float camera[3] = {0, 0, 0};
 };
 
 struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
@@ -106,6 +108,7 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
   bool tree_wind_patched = false;   // a tree wind copy was written in this command list
   uint32_t rt_group = 0;  // ray tracing: refits recorded so far in this list (the animation dispatches before one belong to it)
+  bool rt_group_keep = false;  // the current group animates a skinned character: refit it every frame
 };
 
 struct Config {
@@ -236,6 +239,10 @@ erdlss::Stretch g_stretch;
 bool g_stretch_failed = false;
 bool g_post_fix = true;                       // development (remote "postfix on|off")
 bool g_stretch_inputs = true;                 // development (remote "stretch on|off")
+// The main camera's position (SC_CameraPos) from the last accepted scene constants, for the ray tracing refit schedule.
+std::mutex g_camera_mutex;
+float g_camera_pos[3] = {0, 0, 0};
+bool g_camera_valid = false;
 std::atomic<uint64_t> g_post_fixes{0};        // corrected passes, for the overlay and logs
 // The engine records its jobs' command lists in parallel, so the passes after the TAA are mostly in other lists,
 // recorded at the same time. Their order shows when they are submitted: every list submitted after the TAA's in a
@@ -554,6 +561,7 @@ bool ReadSceneParams(command_list* cmd_list, SceneParams* out) {
   std::memcpy(out->percentages, f + kScreenPercentage, sizeof(out->percentages));
   out->velocity_scale = f[kVelocityEncode];
   out->velocity_bias = f[kVelocityEncode + 1];
+  std::memcpy(out->camera, f + kCameraPos, sizeof(out->camera));
   return true;
 }
 
@@ -941,30 +949,40 @@ std::string PipelineName(uint64_t pipeline) {
 
 // Edits `count` floats at byte `offset` of the constant buffer bound to `reg` of `stage`, in the upload heap before
 // the GPU reads them (every pass after the TAA has its own allocations: tools/rdc_cbbinds.py). `edit` gets the
-// values and returns whether it changed them.
+// values and returns whether it changed them. `step` (optional) tells where it stopped: 1 no tracking, 2 no bound
+// tables, 3 register not found in the bound tables, 4 no buffer behind the descriptor, 5 mapping failed, 6 the edit
+// kept the values.
 template <typename Edit>
 bool EditBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg, uint32_t offset, uint32_t count,
-                        Edit edit) {
+                        Edit edit, int* step = nullptr) {
+  int unused = 0;
+  int& at = step != nullptr ? *step : unused;
   device* const dev = cmd_list->get_device();
   auto* const state = cmd_list->get_private_data<state_tracking>();
   auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  at = 1;
   if (state == nullptr || descriptors == nullptr || count > 16) return false;
   const auto it = state->descriptor_tables.find(stage == shader_stage::compute ? shader_stage::all_compute
                                                                                 : shader_stage::all_graphics);
+  at = 2;
   if (it == state->descriptor_tables.end()) return false;
   descriptor_heap heap = {0};
   uint32_t slot = 0;
+  at = 3;
   if (!descriptors->Find(dev, it->second.first, it->second.second, stage, RegisterKind::kConstantBuffer, reg, 0, &heap,
                          &slot))
     return false;
   const buffer_range range = descriptors->Buffer(heap, slot);
+  at = 4;
   if (range.buffer == 0 || range.size < offset + count * 4) return false;
   void* mapped = nullptr;
+  at = 5;
   if (!dev->map_buffer_region(range.buffer, range.offset + offset, count * 4, map_access::read_write, &mapped))
     return false;
   float values[16];
   std::memcpy(values, mapped, count * 4);
   const bool changed = edit(values);
+  at = changed ? 0 : 6;
   if (changed) std::memcpy(mapped, values, count * 4);
   dev->unmap_buffer_region(range.buffer);
   return changed;
@@ -2597,6 +2615,11 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   data->scene = scene;
   data->scene_valid = true;
   {
+    std::lock_guard camera_lock(g_camera_mutex);
+    std::memcpy(g_camera_pos, scene.camera, sizeof(g_camera_pos));
+    g_camera_valid = true;
+  }
+  {
     auto* const state = cmd_list->get_private_data<state_tracking>();
     std::lock_guard obs_lock(g_drs_obs_mutex);
     g_drs_obs.scene = true;
@@ -2707,14 +2730,93 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
 // Development switches: skip parts to measure their cost, refit each structure only every Nth frame, and lengthen the
 // shadow denoiser's history (a long jitter cycle makes the 10-frame history boil on grass).
 std::atomic<uint32_t> g_rt_skip{0};         // remote "rtskip <mask>": 1 animation dispatches, 2 refits, 4 DispatchRays
-std::atomic<uint32_t> g_rt_refit_every{1};  // remote "rtrefit <N>": refit each structure every Nth frame
+std::atomic<uint32_t> g_rt_refit_every{2};  // remote "rtrefit <N>": refit vegetation every Nth frame
 std::atomic<float> g_rt_feedback{0.0f};     // remote "rtfeedback <weight>": the denoiser's history weight, 0 = game's
 std::atomic<uint64_t> g_rt_anim{0}, g_rt_refits{0}, g_rt_skipped{0}, g_rt_rays{0}, g_rt_tlas{0}, g_rt_edits{0};
+std::atomic<uint64_t> g_rt_denoise{0};    // denoiser dispatches seen
+std::atomic<uint64_t> g_rt_edit_fail[7];  // where the denoiser edit stopped (EditBoundConstants `step`)
 
-// Whether this frame skips refit group `group` of a command list (the same objects come in the same order each frame).
-bool SkipRefitGroup(uint32_t group) {
+// Refit schedule by distance (remote "rtdist <near> <far>", near 0 = off): objects nearer than `near` metres are
+// refit every frame, up to `far` every Nth frame (rtrefit), beyond that every 2Nth (at most 8). The distances come
+// from the last top-level build: its instances (64-byte D3D12_RAYTRACING_INSTANCE_DESC in an upload buffer; the
+// transforms share the map's coordinates with SC_CameraPos) give each bottom-level structure's nearest distance.
+std::atomic<float> g_rt_near{20.0f}, g_rt_far{50.0f};
+std::shared_mutex g_blas_mutex;
+std::unordered_map<uint64_t, float> g_blas_distance;     // bottom-level GPU address -> nearest instance distance
+std::unordered_map<uint64_t, uint32_t> g_group_interval;  // (list kind, refit group) -> last interval
+std::atomic<uint64_t> g_rt_dist_hits{0}, g_rt_dist_misses{0};
+std::atomic<uint32_t> g_rt_buckets[3];  // structures near / middle / far at the last top-level build
+
+uint32_t RefitInterval(uint64_t blas_address) {
   const uint32_t every = g_rt_refit_every.load();
-  return every > 1 && (group + g_frame.load()) % every != 0;
+  const float near_m = g_rt_near.load(), far_m = g_rt_far.load();
+  if (near_m <= 0.0f || blas_address == 0) return every;
+  float distance = 0;
+  {
+    std::shared_lock lock(g_blas_mutex);
+    const auto it = g_blas_distance.find(blas_address);
+    if (it == g_blas_distance.end()) {
+      ++g_rt_dist_misses;
+      return every;
+    }
+    distance = it->second;
+  }
+  ++g_rt_dist_hits;
+  if (distance < near_m) return 1;
+  if (distance < far_m) return every;
+  return (std::min)(every * 2, 8u);
+}
+
+uint64_t GroupKey(uint64_t signature, uint32_t group) { return (signature * 0x9E3779B97F4A7C15ull) ^ group; }
+
+// The animation dispatches come before the refit they feed, so they follow the interval this group had last frame.
+uint32_t PredictedInterval(uint64_t signature, uint32_t group) {
+  std::shared_lock lock(g_blas_mutex);
+  const auto it = g_group_interval.find(GroupKey(signature, group));
+  return it == g_group_interval.end() ? 1u : it->second;
+}
+
+bool SkipThisFrame(uint32_t interval, uint32_t group) {
+  return interval > 1 && (group + g_frame.load()) % interval != 0;
+}
+
+void UpdateBlasDistances(device* dev, const acceleration_structure_build_input& in) {
+  if (in.type != acceleration_structure_build_input_type::instances || in.instances.array_of_pointers ||
+      in.instances.count == 0 || in.instances.count > 65536)
+    return;
+  float camera[3];
+  {
+    std::lock_guard lock(g_camera_mutex);
+    if (!g_camera_valid) return;
+    std::memcpy(camera, g_camera_pos, sizeof(camera));
+  }
+  const size_t bytes = size_t{in.instances.count} * 64;
+  std::vector<uint8_t> copy(bytes);
+  void* mapped = nullptr;
+  if (!dev->map_buffer_region(in.instances.buffer, in.instances.offset, bytes, map_access::read_only, &mapped))
+    return;
+  std::memcpy(copy.data(), mapped, bytes);
+  dev->unmap_buffer_region(in.instances.buffer);
+  std::unordered_map<uint64_t, float> next;
+  next.reserve(in.instances.count);
+  uint32_t buckets[3] = {};
+  const float near_m = g_rt_near.load(), far_m = g_rt_far.load();
+  for (uint32_t i = 0; i < in.instances.count; ++i) {
+    const uint8_t* d = copy.data() + size_t{i} * 64;
+    float m[12];
+    uint64_t address = 0;
+    std::memcpy(m, d, sizeof(m));
+    std::memcpy(&address, d + 56, sizeof(address));
+    if (address == 0) continue;
+    const float dx = m[3] - camera[0], dy = m[7] - camera[1], dz = m[11] - camera[2];
+    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const auto [it, inserted] = next.try_emplace(address, distance);
+    if (!inserted) it->second = (std::min)(it->second, distance);
+  }
+  for (const auto& [address, distance] : next) ++buckets[distance < near_m ? 0 : distance < far_m ? 1 : 2];
+  for (int i = 0; i < 3; ++i) g_rt_buckets[i] = buckets[i];
+  std::unique_lock lock(g_blas_mutex);
+  g_blas_distance.swap(next);
 }
 
 bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
@@ -2725,34 +2827,53 @@ bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
   const std::string name = PipelineName(data->current.handle);
   if (name.find("_Animation") != std::string::npos) {
     ++g_rt_anim;
-    if ((g_rt_skip.load() & 1) || SkipRefitGroup(data->rt_group)) return true;
+    // Skinned characters (C[...]_Animation_Skin, P[ChrCustomize]..._Skin) are refit every frame: a stale copy of the
+    // player shadows the real one when they move. Vegetation can wait.
+    if (name.find("_Skin") != std::string::npos) data->rt_group_keep = true;
+    if (g_rt_skip.load() & 1) return true;
+    if (!data->rt_group_keep && SkipThisFrame(PredictedInterval(data->signature, data->rt_group), data->rt_group))
+      return true;
   } else if (name == "GXRtPost_VarianceGuidedShadow") {
+    ++g_rt_denoise;
     const float weight = g_rt_feedback.load();
     // g_denoiseParam (b0): feedbackWeight at byte 24
-    if (weight > 0.0f && EditBoundConstants(cmd_list, shader_stage::compute, 0, 24, 1, [weight](float* v) {
-          if (v[0] <= 0.0f || v[0] >= 1.0f) return false;
-          v[0] = weight;
-          return true;
-        }))
-      ++g_rt_edits;
+    if (weight > 0.0f) {
+      int step = 0;
+      if (EditBoundConstants(cmd_list, shader_stage::compute, 0, 24, 1, [weight](float* v) {
+            if (v[0] <= 0.0f || v[0] >= 1.0f) return false;
+            v[0] = weight;
+            return true;
+          }, &step))
+        ++g_rt_edits;
+      else
+        ++g_rt_edit_fail[std::clamp(step, 0, 6)];
+    }
   }
   return false;
 }
 
 bool OnBuildAccelerationStructure(command_list* cmd_list, acceleration_structure_type type,
-                                  acceleration_structure_build_flags, uint32_t, const acceleration_structure_build_input*,
-                                  resource, uint64_t, resource_view, resource_view,
-                                  acceleration_structure_build_mode mode) {
+                                  acceleration_structure_build_flags, uint32_t input_count,
+                                  const acceleration_structure_build_input* inputs, resource, uint64_t, resource_view,
+                                  resource_view dest, acceleration_structure_build_mode mode) {
   if (type == acceleration_structure_type::top_level) {
     ++g_rt_tlas;
+    if (input_count == 1 && inputs != nullptr) UpdateBlasDistances(cmd_list->get_device(), inputs[0]);
     return false;
   }
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   const uint32_t group = data->rt_group++;
+  const bool keep = data->rt_group_keep;
+  data->rt_group_keep = false;
   if (mode != acceleration_structure_build_mode::update) return false;  // only refits can wait
   ++g_rt_refits;
-  if ((g_rt_skip.load() & 2) || SkipRefitGroup(group)) {
+  const uint32_t interval = keep ? 1u : RefitInterval(cmd_list->get_device()->get_resource_view_gpu_address(dest));
+  {
+    std::unique_lock lock(g_blas_mutex);
+    g_group_interval[GroupKey(data->signature, group)] = interval;
+  }
+  if ((g_rt_skip.load() & 2) || SkipThisFrame(interval, group)) {
     ++g_rt_skipped;
     return true;
   }
@@ -3197,11 +3318,17 @@ void OnReshadePresent(effect_runtime* runtime) {
     // jitter <phases>: the TAA's jitter cycle while upscaling, 8 = the game's, 0 = from the scale (development)
     if (!arg.empty()) g_jitter_phases = static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 0, 64));
     result = g_taa_jitter.status();
-  } else if (command == "rtskip" || command == "rtrefit" || command == "rtfeedback" || command == "rtinfo") {
+  } else if (command == "rtskip" || command == "rtrefit" || command == "rtfeedback" || command == "rtinfo" ||
+             command == "rtdist") {
     // ray tracing development switches (see OnDispatch); rtinfo: per-frame counts since the last rtinfo
     if (command == "rtskip" && !arg.empty()) g_rt_skip = static_cast<uint32_t>(std::atoi(arg.c_str()));
     if (command == "rtrefit" && !arg.empty()) g_rt_refit_every = static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 1, 16));
     if (command == "rtfeedback" && !arg.empty()) g_rt_feedback = std::clamp(std::strtof(arg.c_str(), nullptr), 0.0f, 0.995f);
+    if (command == "rtdist" && !arg.empty()) {
+      char* end = nullptr;
+      g_rt_near = (std::max)(0.0f, std::strtof(arg.c_str(), &end));
+      if (end != nullptr && *end != 0) g_rt_far = (std::max)(g_rt_near.load(), std::strtof(end, nullptr));
+    }
     static uint64_t last_frame = 0, last[6] = {};
     const uint64_t now[6] = {g_rt_anim.load(), g_rt_refits.load(), g_rt_skipped.load(), g_rt_tlas.load(),
                              g_rt_rays.load(), g_rt_edits.load()};
@@ -3209,12 +3336,25 @@ void OnReshadePresent(effect_runtime* runtime) {
     double per[6];
     for (int i = 0; i < 6; ++i) per[i] = double(now[i] - last[i]) / double(frames), last[i] = now[i];
     last_frame = g_frame.load();
-    char text[256];
+    char text[512];
+    const uint64_t hits = g_rt_dist_hits.exchange(0), misses = g_rt_dist_misses.exchange(0);
     std::snprintf(text, sizeof(text),
+                  "distance schedule near %.0f m far %.0f m: structures %u / %u / %u, lookups %llu hit %llu missed; "
                   "skip %u, refit every %u, feedback %.3f; per frame over %llu: %.1f animation dispatches, %.1f refits "
-                  "(%.1f skipped), %.2f top-level builds, %.2f DispatchRays, %.2f denoiser edits",
+                  "(%.1f skipped), %.2f top-level builds, %.2f DispatchRays, %.2f denoiser edits; totals: %llu denoiser "
+                  "dispatches, edit failures at steps 1-6: %llu %llu %llu %llu %llu %llu",
+                  g_rt_near.load(), g_rt_far.load(), g_rt_buckets[0].load(), g_rt_buckets[1].load(),
+                  g_rt_buckets[2].load(), static_cast<unsigned long long>(hits),
+                  static_cast<unsigned long long>(misses),
                   g_rt_skip.load(), g_rt_refit_every.load(), g_rt_feedback.load(),
-                  static_cast<unsigned long long>(frames), per[0], per[1], per[2], per[3], per[4], per[5]);
+                  static_cast<unsigned long long>(frames), per[0], per[1], per[2], per[3], per[4], per[5],
+                  static_cast<unsigned long long>(g_rt_denoise.load()),
+                  static_cast<unsigned long long>(g_rt_edit_fail[1].load()),
+                  static_cast<unsigned long long>(g_rt_edit_fail[2].load()),
+                  static_cast<unsigned long long>(g_rt_edit_fail[3].load()),
+                  static_cast<unsigned long long>(g_rt_edit_fail[4].load()),
+                  static_cast<unsigned long long>(g_rt_edit_fail[5].load()),
+                  static_cast<unsigned long long>(g_rt_edit_fail[6].load()));
     result = text;
   } else if (command == "passlog") {
     g_passlog_frame = g_frame.load() + 1;

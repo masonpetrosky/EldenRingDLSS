@@ -27,8 +27,10 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
   `build\everyday-backup\`. Only update it with the user's explicit OK and with the game closed
   (`tools/deploy.ps1 -Target main`).
 - **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLL): test builds only. It has the
-  ray tracing test build (2026-10-10: remote `rtskip`, `rtrefit`, `rtfeedback`, `rtinfo`, plus `stretch on|off` and
-  `jitter <phases>`), with `RenderScale=0.50`, `Preset=13` (M) and `GameExposure=1`. The user wants preset M at 50%
+  ray tracing test build (2026-10-10: distance-based refit schedule on by default; remote `rtskip`, `rtrefit`,
+  `rtdist`, `rtfeedback`, `rtinfo`, plus `stretch on|off` and `jitter <phases>`), with `RenderScale=0.50`,
+  `Preset=13` (M) and `GameExposure=1`. F9 toggles DLSS and saves `Enabled` to the ini: check `Enabled=1` (and the
+  "Loaded. DLSS on" log line) before measuring. The user wants preset M at 50%
   (sharper character detail than K there); the everyday install still runs 67% with K.
 
 ## Working rules (from the user)

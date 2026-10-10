@@ -131,7 +131,29 @@ From NVIDIA's DLSS-RR Integration Guide (github.com/NVIDIA/DLSS, doc/):
      that is and what it saves.
    - Boiling: `rtfeedback 0.95` / `0.97` with the 32-phase jitter at 50%, on Low and Max; check grass calm and
      shadow lag behind moving objects.
-3. Then decide on RR with numbers: its cost on this GPU (above) against the game's denoising cost and the boiling
+2. Session 2 (2026-10-10, evening; note: DLSS was off by mistake for the first part, F9 had saved `Enabled=0`, so
+   those runs were native resolution with the game's TAA, ray tracing Max, daytime):
+   - Cost split (GPU busy, native TAA, RT Max): all on 20.3 ms; without the animation dispatches 19.5 (0.8 ms);
+     without animation and refits 15.3 (refits 4.2 ms); without the ray dispatches 15.0 (rays and denoise 5.3 ms at
+     native; less at 50%); without all three 10.5. The refits are the big resolution-independent part.
+   - Skipping the animation dispatches leaves the rasterized movement normal (they only feed the ray tracing scene),
+     but the stale copy of the player casts a large shadow onto the player when they move: characters must be refit
+     every frame.
+   - Refit every Nth frame (round robin, everything including characters): N=2 saves 2.5 ms, N=3 3.3 ms, N=4 3.7 ms
+     (baseline 18.1-18.6 ms). User check at N=4: leaf shadows on a tree in strong wind look staccato next to the
+     game's every-frame refits; N=2 is "a good middle ground"; grass looked fine. The user wants the distance-based
+     schedule as well.
+   - Boiling with DLSS at 50% (preset M, 32 phases), ray tracing Low: "extreme", far worse than the game's TAA at
+     native (which boils somewhat on Low too). The `rtfeedback` edit did not apply (0 edits); its buffer is an upload
+     heap, so the failure is elsewhere: the next build reports the step where `EditBoundConstants` stops (`rtinfo`).
+3. Current dev build: characters (`_Skin` animation groups) always refit; vegetation by distance (`rtdist <near>
+   <far>`, default 20 m / 50 m: nearer every frame, up to far every `rtrefit` frames (default 2), beyond every 2N,
+   at most 8); distances from the last top-level build's instances against `SC_CameraPos` (instance transforms use the
+   map's coordinates: the player was 3.75 m from the camera in the capture). The animation dispatches follow the
+   interval their group had last frame. `rtdist 0` + `rtrefit 1` = the game's behavior. Next session: frame times and
+   the user's look at near and far trees with the default schedule; `rtinfo` for the denoiser edit failure step;
+   then the boiling test with a working `rtfeedback` on Low.
+4. Then decide on RR with numbers: its cost on this GPU (above) against the game's denoising cost and the boiling
    fix, and whether the game's sampling suits it.
 
 ## Adding ray-traced reflections or GI (feasibility, 2026-10-10)
