@@ -486,12 +486,14 @@ void Log(reshade::log::level level, const std::string& message) {
 }
 
 // Which ray generation shader the sun shadow dispatch runs (rt_pipeline.hpp): 0 the game's, 1 our port, 2 our port
-// plus the AO at the render size. Ini RtShadowRayGen (read only), remote "rtgen".
+// plus the AO at the render size (PCG noise), 3 the same with blue noise. Ini RtShadowRayGen (read only), remote
+// "rtgen".
 std::atomic<int> g_rt_shadow_raygen{0};
 
-// Mode 2's AO (1 ray per pixel at the render size, unless rtsamples says otherwise) replaces the game's half-size AO
-// only while Ray Reconstruction runs, which denoises it; otherwise the game's AO path stays and mode 2 acts as 1.
-bool OurAoActive() { return g_rt_shadow_raygen.load() == 2 && g_rr_active.load(); }
+// Mode 2 and 3's AO (1 ray per pixel at the render size, unless rtsamples says otherwise) replaces the game's
+// half-size AO only while Ray Reconstruction runs, which denoises it; otherwise the game's AO path stays and these
+// modes act as 1.
+bool OurAoActive() { return g_rt_shadow_raygen.load() >= 2 && g_rr_active.load(); }
 std::mutex g_rt_ao_mutex;
 resource g_rt_ao_copy = {0};                  // the shadow output copied after our dispatch, under g_rt_ao_mutex
 std::atomic<uint64_t> g_rt_ao_copy_frame{0};  // frame of the last copy + 1 (0: none)
@@ -537,7 +539,7 @@ void LoadConfig() {
   g_config.wind_prepass = ReadInt(L"WindPrepass", 0) != 0;
   g_config.wind_trees = ReadInt(L"WindTrees", 1) != 0;
   g_config.ray_reconstruction = ReadInt(L"RayReconstruction", 0) != 0;
-  g_rt_shadow_raygen = std::clamp(ReadInt(L"RtShadowRayGen", 0), 0, 2);
+  g_rt_shadow_raygen = std::clamp(ReadInt(L"RtShadowRayGen", 0), 0, 3);
   g_config.wind_tree_capacity = std::max(1, std::min(ReadInt(L"WindTreeCapacity", 4), 16));
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
@@ -3850,7 +3852,9 @@ bool RouteRayGen(command_list* cmd_list, resource raygen, uint64_t raygen_offset
     ++g_rt_ao_skipped;
     return true;
   }
-  const auto wanted = our_ao ? erdlss::ShadowRayGen::kPortAo : erdlss::ShadowRayGen::kPort;
+  const auto wanted = !our_ao   ? erdlss::ShadowRayGen::kPort
+                      : mode == 3 ? erdlss::ShadowRayGen::kPortAoBlue
+                                  : erdlss::ShadowRayGen::kPortAo;
   uint8_t id[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES];
   if (!erdlss::rt_pipeline::Replacement(record, wanted, id) || !EnsureRayGenRing(dev)) return false;
   std::memcpy(record, id, sizeof(id));  // the local root arguments after the identifier stay the game's
@@ -4386,8 +4390,9 @@ void OnReshadePresent(effect_runtime* runtime) {
     g_passlog_frame = g_frame.load() + 1;
     result = "logging the next frame's named draws to shots/passlog.txt";
   } else if (command == "rtgen") {
-    // rtgen [0|1|2]: the sun shadow dispatch's ray generation shader: the game's, our port, our port + render-size AO
-    if (!arg.empty()) g_rt_shadow_raygen = std::clamp(std::atoi(arg.c_str()), 0, 2);
+    // rtgen [0-3]: the sun shadow dispatch's ray generation shader: the game's, our port, our port + render-size AO
+    // with PCG noise, the same with blue noise
+    if (!arg.empty()) g_rt_shadow_raygen = std::clamp(std::atoi(arg.c_str()), 0, 3);
     result = "shadow ray generation " + std::to_string(g_rt_shadow_raygen.load()) + "; " +
              erdlss::rt_pipeline::Status() + "; redirected " + std::to_string(g_rt_raygen_redirects.load()) + ", unmapped " +
              std::to_string(g_rt_raygen_unmapped.load()) + "; our AO " + (OurAoActive() ? "on" : "off") +

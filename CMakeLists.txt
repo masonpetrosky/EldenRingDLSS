@@ -67,7 +67,7 @@ function(dxil_library symbol file)
     OUTPUT ${header}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
     COMMAND ${DXC} -nologo -T lib_6_3 -O3 -HV 2018 -Vn ${symbol} -Fh ${header} ${CMAKE_SOURCE_DIR}/src/${file}
-    DEPENDS src/${file}
+    DEPENDS src/${file} src/blue_noise.hlsli
     VERBATIM)
   set(SHADER_HEADERS ${SHADER_HEADERS} ${header} PARENT_SCOPE)
 endfunction()

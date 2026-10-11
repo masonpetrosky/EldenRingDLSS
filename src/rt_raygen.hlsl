@@ -5,7 +5,11 @@
 // ErdlssShadowAoRayGen also replaces the game's random numbers. Its hash, sin(dot(pixel / size + frameRandom, k)),
 // forms diagonal bands that the per-frame offset sweeps across the screen; the game's denoisers blur them away, but
 // Ray Reconstruction keeps them as a moving "mirage" in distant grass. PCG gives independent numbers per pixel, per
-// frame (from frameRandom, fresh every frame) and per stream (shadow and AO rays apart).
+// frame (from frameRandom, fresh every frame) and per stream (shadow and AO rays apart). ErdlssShadowAoBlueRayGen
+// draws them from blue-noise tiles instead (blue_noise.hlsli), so each frame's samples are spread evenly over the
+// screen: the shader can only use the game's bindings, so the tiles are a constant array rather than a texture.
+
+#include "blue_noise.hlsli"
 // The bindings are the game's: the global root signature's g_sceneCB (b0), scene (t64) and output (u0), and the
 // ray generation record's local root signature: l_rayGenCB (b16), G-buffer normal (t67) and depth (t68).
 
@@ -87,6 +91,20 @@ float2 PixelRandom(uint2 pixel, uint stream) {
   const uint seed = Pcg(pixel.x ^ Pcg(pixel.y ^ Pcg(asuint(g_frameRandom) + stream)));
   const uint a = Pcg(seed), b = Pcg(a);
   return float2(a >> 8, b >> 8) / 16777216.0f;
+}
+
+float BlueNoise(uint2 p, uint tile) {
+  const uint i = (tile * kBlueNoiseSize + p.y % kBlueNoiseSize) * kBlueNoiseSize + p.x % kBlueNoiseSize;
+  return (float((kBlueNoise[i >> 2] >> ((i & 3) * 8)) & 255) + 0.5f) / 256.0f;
+}
+
+// Two blue-noise numbers in [0, 1) for this pixel, frame and stream: the tiles shifted by a random offset per frame
+// and stream (each frame's pattern stays blue) and rotated by a random amount (Cranley-Patterson).
+float2 PixelBlueNoise(uint2 pixel, uint stream) {
+  const uint seed = Pcg(asuint(g_frameRandom) + stream);
+  const uint2 shift = uint2(seed & 0xFFFF, seed >> 16) % kBlueNoiseSize;
+  const float2 rotation = float2(Pcg(seed) >> 8, Pcg(seed ^ 0x9E3779B9u) >> 8) / 16777216.0f;
+  return frac(float2(BlueNoise(pixel + shift, 0), BlueNoise(pixel + shift, 1)) + rotation);
 }
 
 float RadicalInverse(uint i) {
@@ -215,4 +233,10 @@ void ErdlssShadowRayGen() {
 void ErdlssShadowAoRayGen() {
   const Surface s = LoadSurface();
   Store(s, SunShadow(s, PixelRandom(s.pixel, 0)), AmbientOcclusion(s, PixelRandom(s.pixel, 1)));
+}
+
+[shader("raygeneration")]
+void ErdlssShadowAoBlueRayGen() {
+  const Surface s = LoadSurface();
+  Store(s, SunShadow(s, PixelBlueNoise(s.pixel, 0)), AmbientOcclusion(s, PixelBlueNoise(s.pixel, 1)));
 }

@@ -128,9 +128,10 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
 2d. Own shadow ray generation shader (dev only, 2026-10-11): the add-on adds its shaders to the game's ray tracing
    pipeline through a native `CreateStateObject` hook (ReShade's pipeline events drop local root signatures) and
    runs them for the sun shadow dispatch (remote `rtgen 0|1|2`). The port matches the game's shadows at the same
-   cost. Mode 2 (the dev install's default, `RtShadowRayGen=2`) feeds RR 1 AO ray per pixel at the render size with
-   PCG noise instead of the game's half-size AO, slightly cheaper; the user: "looks great". Next: blue noise, sun
-   shadow ray counts (docs/raytracing.md, "Our own shadow ray generation shader").
+   cost. Modes 2 and 3 feed RR 1 AO ray per pixel at the render size instead of the game's half-size AO, slightly
+   cheaper; the user: "looks great". Mode 3 (blue noise; the dev install's default, `RtShadowRayGen=3`) is "a little
+   less noisy" than 2 (PCG). Next: sun shadow ray counts (docs/raytracing.md, "Our own shadow ray generation
+   shader").
 3. Hear how the everyday install at 67% plays over longer sessions and other areas.
 4. Performance: the stretch passes and the full-size post-processing cost about 1 ms; check what is worth saving.
 5. Robustness: scale changes at runtime (barrier listener), resolution changes (filter and target recreation), the

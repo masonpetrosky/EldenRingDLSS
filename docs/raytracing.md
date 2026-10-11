@@ -286,12 +286,19 @@ shaders share local root signature 6723 (`l_rayGenCB` b16, normal t67, depth t68
   / size + frameRandom, (26.439, 48.236))) hashed, form diagonal bands that the per-frame offset sweeps across the
   screen; the game's denoisers hid them, RR kept them. With the game's AO the wave was gone. Mode 2 now uses PCG
   (per pixel, per frame from `frameRandom`, separate streams for shadow and AO rays); the exact port (mode 1) keeps
-  the game's hash. User: "Yeah I think it looks great." Dev install default: `RtShadowRayGen=2`.
+  the game's hash. User: "Yeah I think it looks great."
+- Blue noise (`rtgen 3`, `ErdlssShadowAoBlueRayGen`): the shader can only use the game's bindings, so the noise is a
+  constant array in the shader (`blue_noise.hlsli`, two 64x64 tiles of 8-bit ranks by void and cluster from
+  `tools/blue_noise.py`; DXIL keeps it a global constant, no per-thread copy). Per frame and stream the tiles get a
+  random toroidal shift and a random value rotation (Cranley-Patterson) from `frameRandom`, so every frame is
+  spatially blue and frames differ. Same cost as PCG (12.68 ms both). User, switching live: "not a big difference
+  but I think blue is a little less noisy". Dev install default: `RtShadowRayGen=3`.
 
 **Next:**
-1. Blue noise or a low-discrepancy sequence per pixel instead of white noise (RR handles white noise; blue noise
-   converges faster at 1 ray per pixel).
-2. More sun shadow rays only where the cone is wide (penumbrae), or 1 ray with RR as for the AO; measure.
+1. Sun shadow rays: 1 per pixel with RR, as for the AO (the game uses 2 on Maximum), or more only in wide
+   penumbrae; measure and look.
+2. Temporal blue noise (a frame index in `g_sceneCB`'s padding, e.g. `padd4`, for golden-ratio animation or
+   spatiotemporal blue noise) if RR's accumulation benefits.
 3. Without RR: a denoiser for our AO, or keep the game's path (current).
 4. ReSTIR-style reuse matters once there are many lights to choose from (the local lights, e.g. torches, or GI);
    for the sun and AO, RR's own temporal accumulation does the reuse. The pipeline already has radiance miss and
