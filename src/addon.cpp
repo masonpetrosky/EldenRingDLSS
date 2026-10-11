@@ -3576,10 +3576,58 @@ bool OnBuildAccelerationStructure(command_list* cmd_list, acceleration_structure
   return false;
 }
 
-bool OnDispatchRays(command_list*, resource, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, resource,
-                    uint64_t, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t) {
+// The ray generation shaders (GXRayGen_dirLightShadow, GXRayGen_ao) draw their random numbers with a sin hash of
+// (pixel / size + frameRandom), frameRandom at byte 240 of g_sceneCB (cb0 of the global root signature). Ray
+// Reconstruction needs fresh noise every frame; remote "rtrandom log" records frameRandom over 64 frames,
+// "rtrandom free" replaces it with a new random value every frame, "rtrandom game" leaves it.
+std::atomic<int> g_rt_random_mode{0};  // 0 game's, 1 free (a hash of the frame number)
+std::mutex g_rt_random_mutex;
+std::vector<float> g_rt_random_log;  // under g_rt_random_mutex
+bool g_rt_random_logging = false;
+uint64_t g_rt_random_last_frame = 0;
+std::atomic<uint64_t> g_rt_random_edits{0}, g_rt_random_fails{0};
+
+float FrameRandom(uint64_t frame) {
+  uint32_t v = static_cast<uint32_t>(frame) * 747796405u + 2891336453u;
+  v = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+  v = (v >> 22u) ^ v;
+  return static_cast<float>(v & 0xFFFFFF) / 16777216.0f;
+}
+
+bool OnDispatchRays(command_list* cmd_list, resource, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t,
+                    resource, uint64_t, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t,
+                    uint32_t) {
   ++g_rt_rays;
   g_last_rays_frame = g_frame.load();
+  const int mode = g_rt_random_mode.load();
+  bool logging;
+  {
+    std::lock_guard lock(g_rt_random_mutex);
+    logging = g_rt_random_logging;
+  }
+  if (mode != 0 || logging) {
+    const uint64_t frame = g_frame.load();
+    float seen = 0.0f;
+    const bool read = EditBoundConstants(cmd_list, shader_stage::compute, 0, 240, 1, [&](float* v) {
+      seen = v[0];
+      if (mode != 1) return false;
+      v[0] = FrameRandom(frame);
+      return true;
+    }) || mode == 0;
+    if (mode == 1) ++(read ? g_rt_random_edits : g_rt_random_fails);
+    std::lock_guard lock(g_rt_random_mutex);
+    if (g_rt_random_logging && frame != g_rt_random_last_frame) {
+      g_rt_random_last_frame = frame;
+      g_rt_random_log.push_back(seen);
+      if (g_rt_random_log.size() >= 64) {
+        g_rt_random_logging = false;
+        std::string text = "frameRandom over 64 frames:";
+        char value[16];
+        for (const float f : g_rt_random_log) std::snprintf(value, sizeof(value), " %.4f", f), text += value;
+        Log(reshade::log::level::info, text);
+      }
+    }
+  }
   return (g_rt_skip.load() & 4) != 0;
 }
 
@@ -4061,6 +4109,17 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "passlog") {
     g_passlog_frame = g_frame.load() + 1;
     result = "logging the next frame's named draws to shots/passlog.txt";
+  } else if (command == "rtrandom") {
+    if (arg == "log") {
+      std::lock_guard lock(g_rt_random_mutex);
+      g_rt_random_log.clear();
+      g_rt_random_logging = true;
+    } else if (arg == "free" || arg == "game") {
+      g_rt_random_mode = arg == "free" ? 1 : 0;
+    }
+    result = std::string("frameRandom ") + (g_rt_random_mode.load() == 1 ? "free" : "game's") + ", edits " +
+             std::to_string(g_rt_random_edits.load()) + ", failed " + std::to_string(g_rt_random_fails.load()) +
+             " (rtrandom log writes 64 values to the log)";
   } else if (command == "rrraw" || command == "rrpreset") {
     if (command == "rrraw" && !arg.empty()) g_rr_raw_mode = arg == "none" ? 0 : arg == "all" ? 2 : 1;
     if (command == "rrpreset" && !arg.empty()) {
