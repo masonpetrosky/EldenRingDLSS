@@ -175,3 +175,26 @@ The user asked whether the add-on could add ray-traced reflections or global ill
 - Deciding questions for the RT-on capture: DXR pipelines with hit shaders or inline ray queries; what the
   acceleration structure contains (terrain, buildings, foliage, characters); whether instances carry material or
   texture indices.
+
+## Ray Reconstruction: first in-game results (2026-10-10, late)
+
+Built (RayReconstruction=1, remote `rr`, `rrraw`, `rrpreset`, `rrdump`): guides drawn at the sun light pass from the
+G-buffer (GBuffer0.xyz world normal, GBuffer1.x metalness, .y smoothness -> perceptual roughness
+1 - 0.95 sqrt(smoothness), GBuffer2.rgb sRGB base color; specular albedo by NVIDIA's EnvBRDFApprox2 with the view
+direction from cbLightAccParam), DLSS-RR evaluated at the TAA, only while DispatchRays run (else DLSS-SR). Raw input:
+the shadow denoiser passes through (full size); the AO path (traced at half size, game denoiser, SSAO chain's
+temporal pass, bilateral upscale) passes through with the temporal pass's history at 0 and a stochastic upscale
+(ao_upscale.hlsl) so AO noise is per pixel. Dumped guides look right (world normals, textured albedo, metal
+specular, sky defaults).
+
+- Cost at 50% (RT Max, night): RR 18.2 ms vs DLSS M 16.4 ms (+1.9 ms). The game's denoiser costs ~0.13 ms.
+- vs DLSS M with the game's denoiser: RR keeps the grass's ray traced shadows (the game's denoiser smooths them
+  away) and ghosts less on swaying trees; preset F (default, "RR2") preferred over E (similar, F recovers more grass
+  detail).
+- Raw AO through the game's bilateral upscale was much noisier (2x2 blocks); with the stochastic upscale it is as
+  quiet as keeping the game's AO denoiser, with a little more AO definition (default now `rrraw all`).
+- Open: at 50% and 67% the grass stays shimmery and loses its blades ("running together"); at native (RR DLAA) it is
+  clean. Not the refit schedule, not the jitter count (32 at 67% did not help). Suspect: the game's ray tracing
+  noise is not fresh per frame (fixed pattern or a short cycle), which NVIDIA's guide names as the main pitfall.
+  Next: extract the ray generation shader (DXIL library in CreateStateObject, capture er117_rtmax_*) and see how it
+  draws random numbers; if from a short frame counter, feed it a free-running one.
