@@ -643,3 +643,24 @@ the top-left. Causes and fixes (`src/addon.cpp`):
   present was tried and changed nothing (no next-frame lists come before present).
 - The pass log now shows per draw the list signature, its kind, the target (`*` = the TAA's input) and the
   submission order of the lists.
+
+## Stage 3: open issue, the world judders at a grace (2026-10-10)
+
+At 50%, looking at a site of grace (light beam, full-screen heat distortion: the log showed a distortion copy with the
+whole render area as scissor), the 3D world (not the HUD) jumps for single frames a few times per second, camera
+still; looking away stops it. DLAA and DLSS off are fine; frame pacing is smooth (15 ms, max 16 ms); not ray tracing
+(`rtskip 4`), not the main-camera selection (`sceneinfo`: 0 rejected), not the submission-time decision (`dual off`
+judders too). A 16-shot burst caught no shifted frame.
+
+The pass log there shows two lists of the same kind every frame, one before the TAA (distortion particles) and one
+after it (distortion and glow particles). Hypothesis: both use the same constant buffer allocations (one per emitter
+per frame), so correcting the post-TAA draws in place (at record time, or at submission in dual mode) changes the
+constants of pre-TAA draws the GPU has not run yet: the distortion that goes into DLSS is wrong in those frames.
+With `dual off` the kind's 64-frame history sits near 50/50 and flips between corrected and not, which would
+judder as well. Next: log the constant buffer addresses of the distortion draws in both lists (shared or not); if
+shared, give corrected draws private copies of their constants instead of editing the game's memory.
+
+Other notes from this session:
+- The rest camera at that grace looked toward the (then displaced) flame; check again once the flame is right, and
+  compare with DLSS off.
+- Changing ray tracing between Low and Maximum applies at once; only off <-> on needs a return to the title screen.

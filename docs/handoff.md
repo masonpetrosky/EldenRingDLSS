@@ -111,6 +111,10 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
    ray tracing works (captures `er117_rtmax_*`), the boiling-grass cause (long jitter cycle against the shadow
    denoiser's 10-frame history) and the next session's tests with the dev build's switches (cost split, amortized
    refits, denoiser history). The everyday install also boils with ray tracing on (67%, 18 phases, Low).
+2b. Open (2026-10-10 evening, dev build 483dc7d): at 50% the world judders at a site of grace (docs/recon.md, "open
+   issue"); the fire's heat distortion, sparks and the grace flame are fixed in the dev build. The everyday install
+   stays on 5ccb6f2 (67%, K) until the judder is solved; then install 50% with preset M (the user's choice) with
+   their OK.
 3. Hear how the everyday install at 67% plays over longer sessions and other areas.
 4. Performance: the stretch passes and the full-size post-processing cost about 1 ms; check what is worth saving.
 5. Robustness: scale changes at runtime (barrier listener), resolution changes (filter and target recreation), the
