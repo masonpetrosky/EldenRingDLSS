@@ -5,12 +5,12 @@ Direct3D 12: DLAA at native resolution, or upscaling from a lower render resolut
 (console) dynamic resolution, plus several fixes the game needs before DLSS looks right. It also makes the game's
 ray tracing cheaper and has an experimental DLSS Ray Reconstruction path.
 
-This is a personal research project, developed and tested on one machine (RTX 5070 Ti, 4K HDR, `eldenring.exe`
-file version 2.7.1.0, ReShade 6.8, [me3](https://github.com/garyttierney/me3) 0.13). It is published so that the
-reverse engineering and the lessons in `docs/` do not have to be repeated, and so that others can play with it: a
-ready-to-use zip is on the [Releases](https://github.com/masonpetrosky/EldenRingDLSS/releases) page. Use it at your
-own risk and offline only (me3 runs the game without Easy Anti-Cheat and keeps it off the matchmaking servers; do not
-take it online).
+This is a personal research project, developed and tested on one machine (RTX 5070 Ti, 4K HDR, ELDEN RING App Ver.
+1.17.1 (`eldenring.exe` file version 2.7.1.0), ReShade 6.8, [me3](https://github.com/garyttierney/me3) 0.13). It is
+published so that the reverse engineering and the lessons in `docs/` do not have to be repeated, and so that others
+can play with it: a ready-to-use zip is on the [Releases](https://github.com/masonpetrosky/EldenRingDLSS/releases)
+page. Use it at your own risk and offline only (me3 runs the game without Easy Anti-Cheat and keeps it off the
+matchmaking servers; do not take it online).
 
 ![Game TAA, DLAA and DLSS at 50% render scale: 1:1 crops of grass, a wall and armor from 4K screenshots](docs/images/comparison.jpg)
 
@@ -59,7 +59,7 @@ measurements.
 ## Requirements
 
 - Windows 10/11, an NVIDIA RTX GPU and a current driver.
-- ELDEN RING (Steam), the version above. Code patterns and offsets are version specific (see Limitations).
+- ELDEN RING (Steam), App Ver. 1.17.1 (shown on the title screen). Code patterns and offsets are version specific (see Limitations).
 - ReShade 6.8 **with full add-on support**.
 - A way to load ReShade into the game without Easy Anti-Cheat. The scripts here use me3 profiles.
 - To build: Visual Studio 2022 or later (MSVC, C++20), CMake, Ninja, the Windows SDK (`fxc`, `dxc`), PowerShell 7,

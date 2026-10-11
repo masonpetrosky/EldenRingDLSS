@@ -8,8 +8,8 @@ also keeps it off the matchmaking servers. Do not take it online.
 Requirements
 ------------
 - An NVIDIA RTX graphics card and a current driver.
-- ELDEN RING on Steam, eldenring.exe file version 2.7.1.0 (right-click > Properties > Details). On other versions
-  the add-on may fall back to DLAA or to the game's TAA (see ReShade.log).
+- ELDEN RING on Steam, App Ver. 1.17.1 (shown on the title screen; eldenring.exe file version 2.7.1.0). On other
+  versions the add-on may fall back to DLAA or to the game's TAA (see ReShade.log).
 - me3 (ModEngine3): https://github.com/garyttierney/me3
 - ReShade 6.8 or newer *with full add-on support*: https://reshade.me (the "with full add-on support" download).
 
