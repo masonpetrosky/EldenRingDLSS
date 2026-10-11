@@ -694,3 +694,12 @@ clamping.
 Next: a RenderDoc capture with moving NPCs. Do their materials have velocity variants that are simply not drawn
 (a per-character flag to switch on), and does the game keep their previous bone palettes? Otherwise generate the
 motion like the trees' (`src/wind.*`): a stream-output replay of the NPC skinning with last frame's bones.
+
+RenderDoc capture `er117_npcs_f978.rdc` (same spot, motion blur off): all 36 velocity draws (events
+124272-124637) belong to the player (they match the player's G-buffer draws 111520-111830 by index count); the NPC
+G-buffer draws (from 112034: soldier-size meshes 6x each, `C[Fur]` sheep 5x, fur and shell meshes 3x) have none.
+The player's `*_Velo_Skin` vertex shaders bind `cbObjMatrix` and `cbPrevObjMatrix` (3 KB bone palettes) and the
+cloth-cancel matrices with their previous copies; the NPC draws bind only the current `cbObjMatrix` (64 KB, several
+instances through `cbInstanceData`/`cbInstanceIdxParam`), so no previous pose exists for them. With the game's
+motion blur set to High, a new dump showed the same: still no motion on the soldier and the sheep. The plan is in
+`docs/handoff.md`, next steps 1 and 2.
