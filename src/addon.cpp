@@ -49,7 +49,8 @@
 
 extern "C" __declspec(dllexport) const char* NAME = "Elden Ring DLSS";
 extern "C" __declspec(dllexport) const char* DESCRIPTION =
-    "Replaces ELDEN RING's temporal anti-aliasing with NVIDIA DLSS (DLAA).";
+    "Replaces ELDEN RING's temporal anti-aliasing with NVIDIA DLSS (DLAA or upscaling). Uses the NVIDIA DLSS SDK. "
+    "https://github.com/masonpetrosky/EldenRingDLSS";
 
 using namespace reshade::api;
 using erdlss::RegisterKind;

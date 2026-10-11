@@ -104,9 +104,11 @@ shader(kWindPortPsLod1 wind_port.hlsl ps_5_0 PSMain ALPHA_TEST=3)
 dxil_shader(kWindPrepassPsGrass2 wind_prepass.hlsl ps_6_0 PSMain ALPHA_TEST=1 PHASE_COMP=y BEND_COMP=z)
 dxil_shader(kWindPrepassPsVesitation wind_prepass.hlsl ps_6_0 PSMain ALPHA_TEST=2 PHASE_COMP=x BEND_COMP=w)
 
+configure_file(src/version.rc.in ${CMAKE_BINARY_DIR}/version.rc @ONLY)
+
 add_library(EldenRingDLSS SHARED src/addon.cpp src/descriptors.cpp src/dlss.cpp src/wind.cpp src/wind_port.cpp
             src/tree_dump.cpp src/engine_resolution.cpp src/render_scale.cpp src/stretch.cpp src/taa_jitter.cpp src/rr_guides.cpp src/ao_upscale.cpp
-            src/hw_breakpoints.cpp src/drs_probe.cpp ${SHADER_HEADERS})
+            src/hw_breakpoints.cpp src/drs_probe.cpp ${CMAKE_BINARY_DIR}/version.rc ${SHADER_HEADERS})
 target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui ${SHADER_DIR})
 target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
 target_link_libraries(EldenRingDLSS PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib d3d12)

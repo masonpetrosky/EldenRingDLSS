@@ -1,0 +1,57 @@
+Elden Ring DLSS @VERSION@
+https://github.com/masonpetrosky/EldenRingDLSS
+
+A ReShade add-on that replaces ELDEN RING's temporal anti-aliasing with NVIDIA DLSS: DLAA at native resolution, or
+DLSS upscaling from a lower render resolution. Offline only: the game runs without Easy Anti-Cheat through me3, which
+also keeps it off the matchmaking servers. Do not take it online.
+
+Requirements
+------------
+- An NVIDIA RTX graphics card and a current driver.
+- ELDEN RING on Steam, eldenring.exe file version 2.7.1.0 (right-click > Properties > Details). On other versions
+  the add-on may fall back to DLAA or to the game's TAA (see ReShade.log).
+- me3 (ModEngine3): https://github.com/garyttierney/me3
+- ReShade 6.8 or newer *with full add-on support*: https://reshade.me (the "with full add-on support" download).
+
+Installing
+----------
+1. Extract this zip anywhere, for example into me3's profile folder
+   (%LOCALAPPDATA%\garyttierney\me3\config\profiles).
+2. Get ReShade64.dll out of the ReShade installer: the installer .exe is also a zip archive, so open it with 7-Zip
+   (right-click > 7-Zip > Open archive) and extract ReShade64.dll. If you already installed the add-on version of
+   ReShade into another 64-bit DirectX game, the dxgi.dll it put there is the same file.
+3. Put that file into the EldenRingDLSS folder and rename it to ReShade64.asi. The folder then holds
+   ReShade64.asi, EldenRingDLSS.addon64, nvngx_dlss.dll, nvngx_dlssd.dll, EldenRingDLSS.ini and ReShade.ini.
+4. Start the game by double-clicking EldenRingDLSS.me3 (or: me3 launch --auto-detect -p <path to EldenRingDLSS.me3>).
+
+Already using an me3 profile with other mods? Copy the [[natives]] entry from EldenRingDLSS.me3 into your profile
+and adjust its path (relative to your profile file), or move the EldenRingDLSS folder next to your profile.
+
+Using it
+--------
+- F9 switches between DLSS and the game's TAA (and saves the choice).
+- The Home key opens the ReShade overlay; the "Add-ons" tab has the settings (preset, render scale, sharpening,
+  vegetation motion vectors, ...). They are saved to EldenRingDLSS\EldenRingDLSS.ini, which documents each one.
+- Upscaling: set RenderScale (0.67 Quality, 0.58 Balanced, 0.50 Performance) and restart the game. It is tested at
+  4K; other output resolutions may show problems in some post-processing effects.
+- The ReShade log (EldenRingDLSS\ReShade.log) has the add-on's messages, prefixed [ERDLSS].
+
+Uninstalling
+------------
+Delete the EldenRingDLSS folder and EldenRingDLSS.me3. Nothing is written to the game folder.
+
+Known limitations
+-----------------
+- Tested on one machine: RTX 5070 Ti, 4K, HDR. Game updates can break it (it then falls back and logs it).
+- Ray Reconstruction (RayReconstruction=1) is experimental: at low render scales the game's thin ray tracing signal
+  makes grass shimmer.
+- Every normal exit of the game ends in a crash report (a check at shutdown); it predates the add-on and is
+  harmless.
+
+Licenses
+--------
+The add-on's own code is MIT licensed (licenses\LICENSE.txt). EldenRingDLSS.addon64 contains NVIDIA's DLSS SDK
+library, and nvngx_dlss.dll and nvngx_dlssd.dll are NVIDIA's DLSS runtime; both are under NVIDIA's RTX SDKs license
+(licenses\NVIDIA-RTX-SDKs-LICENSE.txt). The add-on also contains code from ReShade (licenses\ReShade-LICENSE.md) and
+uses Dear ImGui's headers (licenses\ImGui-LICENSE.txt). Not affiliated with or endorsed by FromSoftware, Bandai Namco
+or NVIDIA. ELDEN RING is a trademark of its owners; NVIDIA and DLSS are trademarks of NVIDIA Corporation.

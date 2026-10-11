@@ -1,0 +1,11 @@
+profileVersion = "v1"
+
+[[supports]]
+game = "eldenring"
+
+# ReShade with full add-on support, renamed to ReShade64.asi (see INSTALL.txt). It loads EldenRingDLSS.addon64
+# from the same folder. Paths are relative to this file.
+[[natives]]
+enabled = true
+load_early = true
+path = 'EldenRingDLSS/ReShade64.asi'
