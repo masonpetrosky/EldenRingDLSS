@@ -21,12 +21,13 @@ the tonemapped image at the final composite.
 Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
-  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit 30725e0, installed 2026-10-10 evening with the
-  user's OK: 58% (Balanced) with preset K (NVIDIA's default for Balanced; M and L judder at a grace's full-screen
-  heat distortion at 50%), today's distortion/sparks/grace-flame fixes, the distance-based ray tracing refits. Its
-  ini: `Preset=11`, `RenderScale=0.58`, game sharpening off, game exposure on, chromatic aberration off,
-  `WindMotion=1`, `WindMode=1`, `WindTrees=1`. Backups in `build\everyday-backup\`: 5ccb6f2 (67%, K) and 6e672fa
-  (DLAA). Only update it with the user's explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
+  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit a4ad1e0, installed 2026-10-10 late evening with the
+  user's OK: 50% with preset M (the user's choice; NVIDIA's default for Performance), DLSS jitter from the TAA
+  filter's counter (the scene constants were a frame stale in 2-3% of frames, which made M and L judder), the
+  distortion/sparks/grace-flame fixes, the distance-based ray tracing refits. Its ini: `Preset=13`,
+  `RenderScale=0.50`, game sharpening off, game exposure on, chromatic aberration off, `WindMotion=1`, `WindMode=1`,
+  `WindTrees=1`. Backups in `build\everyday-backup\`: 30725e0 (58%, K), 5ccb6f2 (67%, K), 6e672fa (DLAA). Only
+  update it with the user's explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
 - **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLL): test builds only. It has the
   ray tracing test build (2026-10-10: distance-based refit schedule on by default; remote `rtskip`, `rtrefit`,
   `rtdist`, `rtfeedback`, `rtinfo`, plus `stretch on|off` and `jitter <phases>`), with `RenderScale=0.50`,
@@ -112,7 +113,8 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
    ray tracing works (captures `er117_rtmax_*`), the boiling-grass cause (long jitter cycle against the shadow
    denoiser's 10-frame history) and the next session's tests with the dev build's switches (cost split, amortized
    refits, denoiser history). The everyday install also boils with ray tracing on (67%, 18 phases, Low).
-2b. Done (2026-10-10 evening): the world judder at a grace was presets M and L at 50% (K is clean); 58% needed a
+2b. Done (2026-10-10 evening): the world judder at a grace was a one-frame-stale jitter that M and L show and K
+   smooths over; DLSS now takes the jitter from the TAA filter's counter (remote `jitterinfo`). 58% needed a
    render-size tolerance (the engine rounds the width to 8 pixels with ray tracing on); list kinds seen on both
    sides of the TAA stay decided at submission (GPU predicates). Details in docs/recon.md.
 3. Hear how the everyday install at 67% plays over longer sessions and other areas.

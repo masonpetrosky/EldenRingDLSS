@@ -672,3 +672,11 @@ in some cases, 2224 instead of the estimated 2228; 0x141A54AA0 uses 8 when FUN_1
 with ray tracing on); fixed with a 16-pixel tolerance. The grace flame then flashed in the wrong place every few
 seconds (its list's 64-frame history fell back to "before"); list kinds seen on both sides now stay decided at
 submission.
+
+Root cause after all (same evening): not the presets. The TAA list has no scene draws, so DLSS took its jitter from
+the latest scene constants recorded in another list, which were the previous frame's in 2-3% of frames at the grace
+(every logged mismatch was the previous Halton position, e.g. counter 24 with position 23's offset). M and L show a
+misregistered frame as the whole world jumping; K smooths it. The jitter now comes from the TAA filter's counter
+(+0x124, already advanced when the TAA draw is recorded, so this frame's offset is Halton(counter) - 0.5), checked
+against the scene constants every frame (`jitterinfo`: "prev" matched 2266 times, other combinations are the stale
+frames). With it, M at 50% looked "perfect" at the grace; the everyday install moved to 50% with M.
