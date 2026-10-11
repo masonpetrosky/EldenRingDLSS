@@ -6,6 +6,7 @@
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
+#include <nvsdk_ngx_helpers_dlssd_d3d.h>
 
 #include <algorithm>
 #include <cmath>
@@ -86,9 +87,11 @@ bool Dlss::Init(ID3D12Device* device, const std::wstring& dll_dir, const std::ws
     status_ = "NGX capability query failed " + Hex(result);
     return false;
   }
-  int dlss_available = 0, needs_driver = 0;
+  int dlss_available = 0, needs_driver = 0, rr_available = 0;
   NVSDK_NGX_Parameter_GetI(caps, NVSDK_NGX_Parameter_SuperSampling_Available, &dlss_available);
   NVSDK_NGX_Parameter_GetI(caps, NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
+  NVSDK_NGX_Parameter_GetI(caps, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &rr_available);
+  rr_available_ = rr_available != 0;
   NVSDK_NGX_D3D12_DestroyParameters(caps);
   if (needs_driver) {
     status_ = "DLSS needs a newer NVIDIA driver";
@@ -121,8 +124,9 @@ void Dlss::Shutdown() {
 }
 
 bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, uint32_t render_width,
-                  uint32_t render_height, float scale, int preset, bool hdr, bool auto_exposure) {
-  if (!available_) return false;
+                  uint32_t render_height, float scale, int preset, bool hdr, bool auto_exposure,
+                  bool ray_reconstruction) {
+  if (!available_ || (ray_reconstruction && !rr_available_)) return false;
   ReleaseFeature();
   for (const Mode& m : kModes) NVSDK_NGX_Parameter_SetUI(params_, m.preset_hint, static_cast<unsigned>(preset));
 
@@ -144,17 +148,33 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
   min_w = (std::min)(min_w, max_w);
   min_h = (std::min)(min_h, max_h);
 
-  NVSDK_NGX_DLSS_Create_Params create = {};
-  create.Feature.InWidth = max_w;
-  create.Feature.InHeight = max_h;
-  create.Feature.InTargetWidth = width;
-  create.Feature.InTargetHeight = height;
-  create.Feature.InPerfQualityValue = mode.value;
   // Motion vectors at render resolution without jitter, reverse-Z depth; HDR: linear color.
-  create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
-  if (hdr) create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
-  if (hdr && auto_exposure) create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-  const NVSDK_NGX_Result result = NGX_D3D12_CREATE_DLSS_EXT(cmd, 1, 1, &feature_, params_, &create);
+  int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+  if (hdr) flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+  NVSDK_NGX_Result result;
+  if (ray_reconstruction) {
+    NVSDK_NGX_DLSSD_Create_Params create = {};
+    create.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
+    create.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Packed;  // roughness in the normals' alpha
+    create.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_HW;
+    create.InWidth = max_w;
+    create.InHeight = max_h;
+    create.InTargetWidth = width;
+    create.InTargetHeight = height;
+    create.InPerfQualityValue = mode.value;
+    create.InFeatureCreateFlags = flags;
+    result = NGX_D3D12_CREATE_DLSSD_EXT(cmd, 1, 1, &feature_, params_, &create);
+  } else {
+    NVSDK_NGX_DLSS_Create_Params create = {};
+    create.Feature.InWidth = max_w;
+    create.Feature.InHeight = max_h;
+    create.Feature.InTargetWidth = width;
+    create.Feature.InTargetHeight = height;
+    create.Feature.InPerfQualityValue = mode.value;
+    create.InFeatureCreateFlags = flags;
+    if (hdr && auto_exposure) create.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    result = NGX_D3D12_CREATE_DLSS_EXT(cmd, 1, 1, &feature_, params_, &create);
+  }
   if (NVSDK_NGX_FAILED(result)) {
     feature_ = nullptr;
     status_ = "DLSS feature creation failed " + Hex(result);
@@ -169,10 +189,14 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
   max_height_ = max_h;
   hdr_ = hdr;
   auto_exposure_ = auto_exposure;
-  char text[160];
-  std::snprintf(text, sizeof(text), "running %s, render %ux%u to %ux%u, output %ux%u (%s)", mode.name, min_w, min_h,
-                max_w, max_h, width, height,
-                !hdr ? "after tonemapping" : auto_exposure ? "auto-exposure" : "game exposure");
+  rr_ = ray_reconstruction;
+  char text[192];
+  std::snprintf(text, sizeof(text), "running %s%s, render %ux%u to %ux%u, output %ux%u (%s)",
+                ray_reconstruction ? "Ray Reconstruction " : "", mode.name, min_w, min_h, max_w, max_h, width, height,
+                ray_reconstruction ? "no exposure"
+                : !hdr             ? "after tonemapping"
+                : auto_exposure    ? "auto-exposure"
+                                   : "game exposure");
   status_ = text;
   return true;
 }
@@ -180,12 +204,38 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
 void Dlss::ReleaseFeature() {
   if (feature_ != nullptr) NVSDK_NGX_D3D12_ReleaseFeature(feature_);
   feature_ = nullptr;
+  rr_ = false;
   width_ = height_ = 0;
   min_width_ = min_height_ = max_width_ = max_height_ = 0;
 }
 
 bool Dlss::Evaluate(ID3D12GraphicsCommandList* cmd, const DlssInputs& in) {
   if (feature_ == nullptr) return false;
+  if (rr_) {
+    if (in.normal_roughness == nullptr || in.diffuse_albedo == nullptr || in.specular_albedo == nullptr) return false;
+    NVSDK_NGX_D3D12_DLSSD_Eval_Params eval = {};
+    eval.pInColor = in.color;
+    eval.pInOutput = in.output;
+    eval.pInDepth = in.depth;
+    eval.pInMotionVectors = in.motion;
+    eval.pInDiffuseAlbedo = in.diffuse_albedo;
+    eval.pInSpecularAlbedo = in.specular_albedo;
+    eval.pInNormals = in.normal_roughness;
+    eval.pInRoughness = in.normal_roughness;  // packed: read from the normals' alpha
+    eval.InJitterOffsetX = in.jitter_x;
+    eval.InJitterOffsetY = in.jitter_y;
+    eval.InRenderSubrectDimensions = {in.width, in.height};
+    eval.InReset = in.reset ? 1 : 0;
+    eval.InMVScaleX = in.mv_scale_x;
+    eval.InMVScaleY = in.mv_scale_y;
+    eval.InFrameTimeDeltaInMsec = in.frame_time_ms;
+    const NVSDK_NGX_Result result = NGX_D3D12_EVALUATE_DLSSD_EXT(cmd, feature_, params_, &eval);
+    if (NVSDK_NGX_FAILED(result)) {
+      status_ = "Ray Reconstruction evaluation failed " + Hex(result);
+      return false;
+    }
+    return true;
+  }
   NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
   eval.Feature.pInColor = in.color;
   eval.Feature.pInOutput = in.output;

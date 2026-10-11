@@ -37,6 +37,7 @@
 #include "engine_resolution.hpp"
 #include "hw_breakpoints.hpp"
 #include "render_scale.hpp"
+#include "rr_guides.hpp"
 #include "state_tracking.hpp"
 #include "stretch.hpp"
 #include "taa_jitter.hpp"
@@ -61,6 +62,7 @@ enum class Pass : uint8_t {
   kOther, kScene, kMotionPrep, kTaa, kSharpen, kToneMap, kBlendUi,
   kEmissiveGlow,  // the glow pass that reads the scene's emissive buffer
   kDofCoc,        // the depth of field pass that reads the half-size depth
+  kLightDir,      // the sun light pass, which reads the complete G-buffer (Ray Reconstruction's guides)
 };
 
 // cbSceneParam, bound at vertex shader register b8 by the scene shaders. Offsets are in floats.
@@ -159,6 +161,9 @@ struct Config {
   // Ported path: SpeedTree trees and shrubs through the stream-output path, with last frame's tree wind rebuilt on the
   // GPU (tree_wind.hlsl); WindTreeCapacity is its millions of streamed vertices per frame.
   bool wind_trees = true;
+  // DLSS Ray Reconstruction instead of super resolution (docs/raytracing.md): it denoises the game's ray traced
+  // shadows and AO itself (the game's denoiser passes its input through while RR runs) and upscales.
+  bool ray_reconstruction = false;
   int wind_tree_capacity = 4;
   // Ported path, development option: replace the grass depth prepasses' pixel shader so they write the motion
   // themselves instead of drawing the batch a second time (wind_prepass.hlsl). Works, but costs more than the second
@@ -258,6 +263,12 @@ erdlss::Stretch g_stretch;
 bool g_stretch_failed = false;
 bool g_post_fix = true;                       // development (remote "postfix on|off")
 bool g_stretch_inputs = true;                 // development (remote "stretch on|off")
+// Ray Reconstruction (MakeRrGuides, ReplaceTaa): its guide buffers, drawn at the sun light pass, and whether the last
+// TAA ran it (the game's ray tracing denoiser passes its input through meanwhile).
+erdlss::RrGuides g_rr_guides;
+bool g_rr_guides_failed = false;
+std::atomic<uint64_t> g_guides_frame{0}, g_guides_runs{0};
+std::atomic<bool> g_rr_active{false};
 // The scene color the TAA reads (its SourceTex), for the pass log. (Not a rule for corrections: the game draws into it
 // again after the TAA.)
 std::atomic<uint64_t> g_taa_source{0};
@@ -500,6 +511,7 @@ void LoadConfig() {
   g_config.wind_mode = ReadInt(L"WindMode", 1) == 0 ? 0 : 1;
   g_config.wind_prepass = ReadInt(L"WindPrepass", 0) != 0;
   g_config.wind_trees = ReadInt(L"WindTrees", 1) != 0;
+  g_config.ray_reconstruction = ReadInt(L"RayReconstruction", 0) != 0;
   g_config.wind_tree_capacity = std::max(1, std::min(ReadInt(L"WindTreeCapacity", 4), 16));
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
@@ -523,6 +535,7 @@ void SaveConfig() {
   WriteInt(L"WindMode", g_config.wind_mode);
   WriteInt(L"WindPrepass", g_config.wind_prepass);
   WriteInt(L"WindTrees", g_config.wind_trees);
+  WriteInt(L"RayReconstruction", g_config.ray_reconstruction);
   WriteInt(L"WindTreeCapacity", g_config.wind_tree_capacity);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
   WriteInt(L"FlipJitterY", g_config.flip_jitter_y);
@@ -554,6 +567,7 @@ Pass Classify(uint32_t count, const pipeline_subobject* subobjects) {
   if (Contains(ps, "GXSimple_BlendUI")) return Pass::kBlendUi;  // final composite: the UI over the finished scene
   if (Contains(ps, "EmissiveToGlowPS")) return Pass::kEmissiveGlow;
   if (Contains(ps, "LensSimu2_ComputeCoC")) return Pass::kDofCoc;
+  if (Contains(ps, "GXLightAcc_DDirLightShadowed")) return Pass::kLightDir;
   if (Contains(vs, "_Velo")) return Pass::kScene;
   return Pass::kOther;
 }
@@ -1428,7 +1442,10 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   // The render size the feature is for: the engine's, once it renders at the scale, else the one it will use.
   const uint32_t create_w = in_width < width ? in_width : EngineRenderSize(width, g_config.render_scale);
   const uint32_t create_h = in_height < height ? in_height : EngineRenderSize(height, g_config.render_scale);
-  if (g_dlss.has_feature() && (g_dlss.feature_width() != width || g_dlss.feature_height() != height ||
+  // Ray Reconstruction once its guides exist (drawn at the light pass earlier in the frame).
+  const bool want_rr = g_config.ray_reconstruction && g_dlss.rr_available() && g_guides_frame.load() != 0;
+  if (g_dlss.has_feature() && (g_dlss.feature_rr() != want_rr || g_dlss.feature_width() != width ||
+                               g_dlss.feature_height() != height ||
                                g_dlss.feature_scale() != g_config.render_scale || !g_dlss.feature_hdr() ||
                                g_dlss.feature_auto_exposure() == game_exposure ||
                                ((in_width < width || in_height < height) &&
@@ -1441,7 +1458,7 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   if (!g_dlss.has_feature()) {
     const bool created =
         g_dlss.Create(native, width, height, create_w, create_h, g_config.render_scale, g_config.preset, true,
-                      !game_exposure);
+                      !game_exposure, want_rr);
     RestoreState(cmd_list, data);
     if (!created) {
       g_config.enabled = false;
@@ -1467,7 +1484,13 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   in.depth = reinterpret_cast<ID3D12Resource*>(depth.handle);
   in.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
   in.output = reinterpret_cast<ID3D12Resource*>(g_output.handle);
-  in.exposure = game_exposure ? reinterpret_cast<ID3D12Resource*>(g_exposure.handle) : nullptr;
+  in.exposure = game_exposure && !g_dlss.feature_rr() ? reinterpret_cast<ID3D12Resource*>(g_exposure.handle) : nullptr;
+  if (g_dlss.feature_rr()) {
+    in.normal_roughness = g_rr_guides.normal_roughness();
+    in.diffuse_albedo = g_rr_guides.diffuse_albedo();
+    in.specular_albedo = g_rr_guides.specular_albedo();
+  }
+  g_rr_active = g_dlss.feature_rr();
   in.bias_mask = masked ? reinterpret_cast<ID3D12Resource*>(g_mask.handle) : nullptr;
   in.width = in_width;
   in.height = in_height;
@@ -3114,11 +3137,56 @@ void ObserveTaaResolution(command_list* cmd_list, float screen[2]) {
   std::memcpy(g_drs_obs.post, post, sizeof(post));
 }
 
+// Ray Reconstruction's guides, drawn at the sun light pass from the G-buffer it reads: GBuffer0 at t0, the depth at
+// t1, GBuffer1 at t3, GBuffer2 at t4, and cbLightAccParam at b0 (g_InvProjMatrix at byte 0, g_CameraMatrix at 128).
+// Only the main camera's pass: its target is the output size.
+void MakeRrGuides(command_list* cmd_list, CmdData& data) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  device* const dev = cmd_list->get_device();
+  if (state == nullptr || state->viewports.empty() || state->render_targets.empty() || state->render_targets[0] == 0)
+    return;
+  const resource_desc td = dev->get_resource_desc(dev->get_resource_from_view(state->render_targets[0]));
+  if (td.texture.width != g_render_width.load() || td.texture.height != g_render_height.load()) return;
+  if (!g_rr_guides.ready() && !g_rr_guides_failed &&
+      !g_rr_guides.Init(reinterpret_cast<ID3D12Device*>(dev->get_native()))) {
+    g_rr_guides_failed = true;
+    Log(reshade::log::level::error, "Ray Reconstruction guides unavailable: " + g_rr_guides.status());
+  }
+  if (g_rr_guides_failed) return;
+  erdlss::GuideInputs in;
+  in.gbuffer0 = reinterpret_cast<ID3D12Resource*>(BoundResource(cmd_list, shader_stage::pixel, 0).handle);
+  in.depth = reinterpret_cast<ID3D12Resource*>(BoundResource(cmd_list, shader_stage::pixel, 1).handle);
+  in.gbuffer1 = reinterpret_cast<ID3D12Resource*>(BoundResource(cmd_list, shader_stage::pixel, 3).handle);
+  in.gbuffer2 = reinterpret_cast<ID3D12Resource*>(BoundResource(cmd_list, shader_stage::pixel, 4).handle);
+  bool have_proj = false, have_camera = false;
+  EditBoundConstants(cmd_list, shader_stage::pixel, 0, 0, 16, [&](float* v) {
+    std::memcpy(in.inv_proj, v, sizeof(in.inv_proj));
+    have_proj = true;
+    return false;
+  });
+  EditBoundConstants(cmd_list, shader_stage::pixel, 0, 128, 12, [&](float* v) {
+    std::memcpy(in.camera, v, sizeof(in.camera));
+    have_camera = true;
+    return false;
+  });
+  in.width = static_cast<uint32_t>(state->viewports[0].width);
+  in.height = static_cast<uint32_t>(state->viewports[0].height);
+  if (!have_proj || !have_camera) return;
+  if (!g_rr_guides.Run(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()), in, td.texture.width,
+                       td.texture.height))
+    return;
+  g_guides_frame = g_frame.load();
+  ++g_guides_runs;
+  RestoreTaaState(cmd_list, data);
+}
+
 bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
             uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
+  if (data->pass == Pass::kLightDir && g_config.enabled && g_config.ray_reconstruction && g_dlss.rr_available())
+    MakeRrGuides(cmd_list, *data);
   if (data->pass == Pass::kMotionPrep) {
     data->depth = BoundResource(cmd_list, shader_stage::pixel, 0);       // g_StencilTexForCopy
     data->depth_copy = BoundResource(cmd_list, shader_stage::pixel, 2);  // g_DepthTex
@@ -3185,6 +3253,7 @@ std::atomic<int> g_rt_constrain{-1};        // remote "rtconstrain 0|1|-1": its 
 // gets the raw ray traced shadows and AO, as Ray Reconstruction wants them. rtskip 8 skips the denoiser dispatches
 // altogether (their outputs keep the last values; for measuring their cost).
 std::atomic<bool> g_rt_raw{false};
+bool RawDenoise() { return g_rt_raw.load() || g_rr_active.load(); }
 std::atomic<uint64_t> g_rt_anim{0}, g_rt_refits{0}, g_rt_skipped{0}, g_rt_rays{0}, g_rt_tlas{0}, g_rt_edits{0};
 std::atomic<uint64_t> g_rt_denoise{0};    // denoiser dispatches seen
 std::atomic<uint64_t> g_rt_edit_fail[7];  // where the denoiser edit stopped (EditBoundConstants `step`)
@@ -3332,7 +3401,7 @@ bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
       return true;
   } else if ((g_rt_skip.load() & 8) && name.rfind("GXRtPost_", 0) == 0) {
     return true;
-  } else if (g_rt_raw.load() && name == "GXRtPost_DenoiseATrousFilter") {
+  } else if (RawDenoise() && name == "GXRtPost_DenoiseATrousFilter") {
     // g_denoiseParam (b0): blendWeight at byte 136 (1 and 0.4 in the game's two passes); 0 keeps the input
     EditBoundConstants(cmd_list, shader_stage::compute, 0, 136, 1, [](float* v) {
       if (v[0] == 0.0f) return false;
@@ -3341,12 +3410,12 @@ bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
     });
   } else if (name == "GXRtPost_VarianceGuidedShadow") {
     ++g_rt_denoise;
-    const float weight = g_rt_raw.load() ? 0.0001f : g_rt_feedback.load();
-    const int constrain = g_rt_raw.load() ? 0 : g_rt_constrain.load();
+    const float weight = RawDenoise() ? 0.0001f : g_rt_feedback.load();
+    const int constrain = RawDenoise() ? 0 : g_rt_constrain.load();
     // g_denoiseParam (b0): int enableConstrain at byte 16, int denoiseWidth at 20, float feedbackWeight at 24
     if (weight > 0.0f || constrain >= 0) {
       int step = 0;
-      const bool raw = g_rt_raw.load();
+      const bool raw = RawDenoise();
       if (EditBoundConstants(cmd_list, shader_stage::compute, 0, 16, 3, [weight, constrain, raw](float* v) {
             if (v[2] <= 0.0f || v[2] >= 1.0f) return false;  // not the layout this expects
             if (weight > 0.0f) v[2] = weight;
@@ -3886,6 +3955,19 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "passlog") {
     g_passlog_frame = g_frame.load() + 1;
     result = "logging the next frame's named draws to shots/passlog.txt";
+  } else if (command == "rr") {
+    // rr on|off: Ray Reconstruction instead of super resolution (saved)
+    if (!arg.empty()) {
+      g_config.ray_reconstruction = arg == "on";
+      g_recreate = true;
+      SaveConfig();
+    }
+    result = std::string("Ray Reconstruction ") + (g_config.ray_reconstruction ? "on" : "off") +
+             (g_dlss.rr_available() ? "" : " (not available)") + ", feature " +
+             (g_dlss.has_feature() ? (g_dlss.feature_rr() ? "RR" : "SR") : "none") + ", guides drawn " +
+             std::to_string(g_guides_runs.load()) + " times (last frame " + std::to_string(g_guides_frame.load()) +
+             ", now " + std::to_string(g_frame.load()) + ")" + (g_rr_guides_failed ? ", guides failed" : "") +
+             "; " + g_dlss.status();
   } else if (command == "jitterinfo" || command == "jittersrc") {
     if (command == "jittersrc" && !arg.empty()) g_jitter_source = arg == "counter" ? 1 : 0;
     std::lock_guard lock(g_jitter_stats_mutex);

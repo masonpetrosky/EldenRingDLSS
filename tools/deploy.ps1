@@ -22,6 +22,9 @@ if ((Get-Item $ReShadeDll).VersionInfo.ProductName -ne 'ReShade') { throw "$ReSh
 Copy-Item $ReShadeDll (Join-Path $dst 'ReShade64.asi') -Force
 Copy-Item (Join-Path $root 'build\EldenRingDLSS.addon64') $dst -Force
 Copy-Item (Join-Path $root "third_party\dlss\bin\$dlssBuild\nvngx_dlss.dll") $dst -Force
+# Ray Reconstruction (RayReconstruction=1 in the add-on's ini)
+$rr = Join-Path $root "third_party\dlss\bin\$dlssBuild\nvngx_dlssd.dll"
+if (Test-Path $rr) { Copy-Item $rr $dst -Force }
 
 $reshadeIni = Join-Path $dst 'ReShade.ini'
 if (-not (Test-Path $reshadeIni)) {

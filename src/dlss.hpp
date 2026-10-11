@@ -30,6 +30,10 @@ struct DlssInputs {
   float mv_scale_y = 1.0f;
   bool reset = false;
   float frame_time_ms = 0.0f;
+  // Ray Reconstruction only (rr_guides.hpp): world normals with roughness in alpha, diffuse and specular albedo.
+  ID3D12Resource* normal_roughness = nullptr;
+  ID3D12Resource* diffuse_albedo = nullptr;
+  ID3D12Resource* specular_albedo = nullptr;
 };
 
 class Dlss {
@@ -43,13 +47,18 @@ class Dlss {
   // larger frames would make DLSS reallocate; guide 310.6, section 3.2.2.1). `scale` (render / output size) picks
   // DLSS's quality mode, 1 for DLAA. `hdr`: linear HDR color (before tonemapping); otherwise display-encoded color in
   // [0, 1]. For HDR without `auto_exposure`, every evaluation must pass an exposure texture (presets J and K use it).
+  // `ray_reconstruction`: DLSS Ray Reconstruction (nvngx_dlssd.dll) instead of super resolution; it denoises the
+  // ray traced lighting as well, takes the guide buffers and no exposure, and uses its own presets (`preset` ignored).
   bool Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t height, uint32_t render_width,
-              uint32_t render_height, float scale, int preset, bool hdr, bool auto_exposure);
+              uint32_t render_height, float scale, int preset, bool hdr, bool auto_exposure,
+              bool ray_reconstruction = false);
   // Releases the feature. The GPU must no longer use it.
   void ReleaseFeature();
   bool Evaluate(ID3D12GraphicsCommandList* cmd, const DlssInputs& inputs);
 
   bool available() const { return available_; }
+  bool rr_available() const { return rr_available_; }
+  bool feature_rr() const { return rr_; }
   bool has_feature() const { return feature_ != nullptr; }
   uint32_t feature_width() const { return width_; }  // output size
   uint32_t feature_height() const { return height_; }
@@ -77,6 +86,8 @@ class Dlss {
   NVSDK_NGX_Handle* feature_ = nullptr;
   bool initialized_ = false;
   bool available_ = false;
+  bool rr_available_ = false;
+  bool rr_ = false;  // the feature is Ray Reconstruction
   uint32_t width_ = 0;
   uint32_t height_ = 0;
   float scale_ = 1.0f;
