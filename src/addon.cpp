@@ -3593,10 +3593,16 @@ std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> g_rt_sample_original
 
 bool ResolveUpload(resource* buffer, uint64_t* offset, uint64_t size);
 
+std::atomic<uint64_t> g_rt_sample_no_record{0};
+
 void EditRayGenSamples(device* dev, resource raygen, uint64_t raygen_offset, uint64_t raygen_size) {
-  if (raygen == 0 || raygen_size < 40 || raygen_size > 4096) return;
+  // ReShade passes resource 0 and the GPU address as the offset when it does not know the shader table's buffer.
   void* record = nullptr;
-  if (!dev->map_buffer_region(raygen, raygen_offset, raygen_size, map_access::read_only, &record)) return;
+  if (raygen_size < 40 || raygen_size > 4096 || !ResolveUpload(&raygen, &raygen_offset, raygen_size) ||
+      !dev->map_buffer_region(raygen, raygen_offset, raygen_size, map_access::read_only, &record)) {
+    ++g_rt_sample_no_record;
+    return;
+  }
   uint64_t args[4] = {};
   const size_t count = (std::min)(static_cast<size_t>((raygen_size - 32) / 8), size_t{4});
   std::memcpy(args, static_cast<const uint8_t*>(record) + 32, count * 8);
@@ -4167,7 +4173,8 @@ void OnReshadePresent(effect_runtime* runtime) {
              std::to_string(g_rt_game_shadow_samples.load()) + "; override AO " +
              std::to_string(g_rt_ao_samples.load()) + ", shadows " + std::to_string(g_rt_shadow_samples.load()) +
              " (0 = game's); edits " + std::to_string(g_rt_sample_edits.load()) + ", records without the buffer " +
-             std::to_string(g_rt_sample_misses.load());
+             std::to_string(g_rt_sample_misses.load()) + ", records not readable " +
+             std::to_string(g_rt_sample_no_record.load());
   } else if (command == "rtrandom") {
     if (arg == "log") {
       std::lock_guard lock(g_rt_random_mutex);
