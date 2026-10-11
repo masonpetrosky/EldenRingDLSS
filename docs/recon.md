@@ -680,3 +680,17 @@ misregistered frame as the whole world jumping; K smooths it. The jitter now com
 (+0x124, already advanced when the TAA draw is recorded, so this frame's offset is Halton(counter) - 0.5), checked
 against the scene constants every frame (`jitterinfo`: "prev" matched 2266 times, other combinations are the stale
 frames). With it, M at 50% looked "perfect" at the grace; the everyday install moved to 50% with M.
+
+## Other characters have no motion vectors (2026-10-11)
+
+The user noticed enemies looking blurry around the edges with DLSS. A TAA input dump (remote `mv 4 enemy`, camera
+and player at rest, dev build at 50% with RR) with a soldier and two sheep moving in view: the player character
+carries motion on 99.6% of its pixels (idle animation), but the soldier and both sheep read exactly 0 while their
+pixels change between the frames (in the motion map each sheep is a black silhouette in the moving grass). So only
+the player's skinned meshes get the per-object velocity draws (`C[...]_Velo_Skin` and the player's `P[...]`
+materials); NPCs are reprojected as static, which DLSS shows as smeared edges and the game's TAA hides with its
+clamping.
+
+Next: a RenderDoc capture with moving NPCs. Do their materials have velocity variants that are simply not drawn
+(a per-character flag to switch on), and does the game keep their previous bone palettes? Otherwise generate the
+motion like the trees' (`src/wind.*`): a stream-output replay of the NPC skinning with last frame's bones.

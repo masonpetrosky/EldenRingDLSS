@@ -133,6 +133,10 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
    less noisy" than 2 (PCG). The sun shadows use 1 ray per pixel in these modes too (+4 fps, no visible change).
    Next: RR's responsivity mask for the grass at 50% (docs/raytracing.md, "Our own shadow ray generation
    shader").
+2e. Enemies and animals have no motion vectors (2026-10-11, docs/recon.md "Other characters have no motion
+   vectors"): only the player's character writes velocity, so DLSS smears NPC edges. Next: a RenderDoc capture with
+   moving NPCs to see whether velocity variants exist for them (a flag to switch on) or the motion has to be
+   generated like the trees'.
 3. Hear how the everyday install at 67% plays over longer sessions and other areas.
 4. Performance: the stretch passes and the full-size post-processing cost about 1 ms; check what is worth saving.
 5. Robustness: scale changes at runtime (barrier listener), resolution changes (filter and target recreation), the
