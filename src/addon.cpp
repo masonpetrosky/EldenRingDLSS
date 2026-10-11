@@ -282,6 +282,7 @@ struct ListKind {
   uint64_t history = 0;
   uint32_t count = 0;
   uint64_t last_log = 0;
+  bool mixed = false;  // seen on both sides at some point: decided at submission from then on
 };
 std::unordered_map<uint64_t, ListKind> g_list_kinds;  // under g_kinds_mutex
 
@@ -350,8 +351,11 @@ int KindState(uint64_t signature) {
   const uint32_t n = it->second.count;
   const uint64_t mask = n >= 64 ? ~0ull : (1ull << n) - 1;
   const uint32_t after = static_cast<uint32_t>(std::popcount(it->second.history & mask));
-  if (after == 0) return 1;
-  if (after == n) return 2;
+  // A kind once seen on both sides keeps being decided at submission (correct on either side): with a plain window
+  // the grace flame's list fell back to "before" after 64 frames and flashed in the wrong place when it next came
+  // after the TAA.
+  if (after == 0) return it->second.mixed ? 3 : 1;
+  if (after == n) return it->second.mixed ? 4 : 2;
   return after * 2 > n ? 4 : 3;
 }
 std::atomic<float> g_frame_time_ms{16.7f};
@@ -914,7 +918,10 @@ bool BuildMask(command_list* cmd_list, resource stencil, uint32_t width, uint32_
   return true;
 }
 
-// The engine's render size for a scale: its dynamic resolution rounds to multiples of 4 pixels (0x141A54AA0).
+// The engine's render size for a scale, before it renders at it: its dynamic resolution rounds to multiples of 4
+// pixels, the width to 8 under a condition (0x141A54AA0; with ray tracing on, 58% gave 2224 wide, not 2228). An
+// estimate: the feature is recreated only when the real size differs by more than kRenderSizeSlack.
+constexpr uint32_t kRenderSizeSlack = 16;
 uint32_t EngineRenderSize(uint32_t size, float scale) {
   return std::min(size, 4 * static_cast<uint32_t>(std::floor(size * scale / 4.0f + 0.5f)));
 }
@@ -1098,6 +1105,9 @@ struct Predicates {
 };
 Predicates g_predicates;
 std::atomic<uint64_t> g_dual_lists{0}, g_dual_after{0}, g_dual_draws{0};
+// Lists that landed on the side their (single) correction did not expect: uncorrected after the TAA, or corrected
+// before it. The first time a kind changes sides it is one of these; after that it is decided at submission.
+std::atomic<uint64_t> g_unhandled_after{0}, g_unhandled_before{0};
 std::atomic<bool> g_dual_enabled{true};  // development (remote "dual on|off"): off = the majority rule alone
 
 // The viewport and scissor a corrected draw needs, when it is recorded twice instead of corrected in place.
@@ -1353,8 +1363,9 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
                                g_dlss.feature_scale() != g_config.render_scale || !g_dlss.feature_hdr() ||
                                g_dlss.feature_auto_exposure() == game_exposure ||
                                ((in_width < width || in_height < height) &&
-                                (g_dlss.feature_render_width() != in_width ||
-                                 g_dlss.feature_render_height() != in_height)))) {
+                                (!g_dlss.accepts(in_width, in_height) ||
+                                 g_dlss.feature_render_width() > in_width + kRenderSizeSlack ||
+                                 g_dlss.feature_render_height() > in_height + kRenderSizeSlack)))) {
     g_recreate = true;  // the old feature may still be in flight; it is released at present once the GPU is idle
     return false;
   }
@@ -2753,6 +2764,8 @@ void OnExecuteCommandList(command_queue*, command_list* cmd_list) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr || !data->signed_) return;
   std::lock_guard lock(g_kinds_mutex);
+  if (!data->dual && data->post_fix != g_frame_taa_submitted && !data->has_taa && !data->has_ui)
+    ++(g_frame_taa_submitted ? g_unhandled_after : g_unhandled_before);
   if (data->dual && g_predicates.mapped != nullptr) {
     const bool after = g_frame_taa_submitted;
     g_predicates.mapped[data->pred_slot] = after ? 1 : 0;
@@ -2804,6 +2817,7 @@ void LearnListKindsLocked() {
       kind.history = (kind.history << 1) | (after ? 1u : 0u);
       kind.count = (std::min)(kind.count + 1, 64u);
       const int state = KindState(signature);
+      if (state == 3 || state == 4) kind.mixed = true;
       if ((state == 3 || state == 4) && g_frame.load() - kind.last_log > 3600) {
         kind.last_log = g_frame.load();
         Log(reshade::log::level::info, "A command list kind (" + KindName(signature) + ") came both before and after "
@@ -3788,7 +3802,9 @@ void OnReshadePresent(effect_runtime* runtime) {
     result = std::string(g_dual_enabled.load() ? "on" : "off") + "; lists decided at submission: " +
              std::to_string(g_dual_lists.load()) + " (" +
              std::to_string(g_dual_after.load()) + " landed after the TAA), draws recorded twice: " +
-             std::to_string(g_dual_draws.load());
+             std::to_string(g_dual_draws.load()) + "; lists on the unexpected side: " +
+             std::to_string(g_unhandled_after.load()) + " uncorrected after the TAA, " +
+             std::to_string(g_unhandled_before.load()) + " corrected before it";
   } else if (command == "postinfo" || command == "postfix") {
     // postfix on|off: correct the passes after the TAA to full size (development)
     if (command == "postfix") g_post_fix = arg != "off";
