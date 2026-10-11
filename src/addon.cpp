@@ -3181,6 +3181,10 @@ std::atomic<uint32_t> g_rt_skip{0};         // remote "rtskip <mask>": 1 animati
 std::atomic<uint32_t> g_rt_refit_every{2};  // remote "rtrefit <N>": refit vegetation every Nth frame
 std::atomic<float> g_rt_feedback{0.0f};     // remote "rtfeedback <weight>": the denoiser's history weight, 0 = game's
 std::atomic<int> g_rt_constrain{-1};        // remote "rtconstrain 0|1|-1": its neighborhood clamp, -1 = game's (1)
+// remote "rtraw on|off": the denoiser passes pass their input through (no history, no a-trous blend), so lighting
+// gets the raw ray traced shadows and AO, as Ray Reconstruction wants them. rtskip 8 skips the denoiser dispatches
+// altogether (their outputs keep the last values; for measuring their cost).
+std::atomic<bool> g_rt_raw{false};
 std::atomic<uint64_t> g_rt_anim{0}, g_rt_refits{0}, g_rt_skipped{0}, g_rt_rays{0}, g_rt_tlas{0}, g_rt_edits{0};
 std::atomic<uint64_t> g_rt_denoise{0};    // denoiser dispatches seen
 std::atomic<uint64_t> g_rt_edit_fail[7];  // where the denoiser edit stopped (EditBoundConstants `step`)
@@ -3326,19 +3330,33 @@ bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
     if (g_rt_skip.load() & 1) return true;
     if (!data->rt_group_keep && SkipThisFrame(PredictedInterval(data->signature, data->rt_group), data->rt_group))
       return true;
+  } else if ((g_rt_skip.load() & 8) && name.rfind("GXRtPost_", 0) == 0) {
+    return true;
+  } else if (g_rt_raw.load() && name == "GXRtPost_DenoiseATrousFilter") {
+    // g_denoiseParam (b0): blendWeight at byte 136 (1 and 0.4 in the game's two passes); 0 keeps the input
+    EditBoundConstants(cmd_list, shader_stage::compute, 0, 136, 1, [](float* v) {
+      if (v[0] == 0.0f) return false;
+      v[0] = 0.0f;
+      return true;
+    });
   } else if (name == "GXRtPost_VarianceGuidedShadow") {
     ++g_rt_denoise;
-    const float weight = g_rt_feedback.load();
-    const int constrain = g_rt_constrain.load();
+    const float weight = g_rt_raw.load() ? 0.0001f : g_rt_feedback.load();
+    const int constrain = g_rt_raw.load() ? 0 : g_rt_constrain.load();
     // g_denoiseParam (b0): int enableConstrain at byte 16, int denoiseWidth at 20, float feedbackWeight at 24
     if (weight > 0.0f || constrain >= 0) {
       int step = 0;
-      if (EditBoundConstants(cmd_list, shader_stage::compute, 0, 16, 3, [weight, constrain](float* v) {
+      const bool raw = g_rt_raw.load();
+      if (EditBoundConstants(cmd_list, shader_stage::compute, 0, 16, 3, [weight, constrain, raw](float* v) {
             if (v[2] <= 0.0f || v[2] >= 1.0f) return false;  // not the layout this expects
             if (weight > 0.0f) v[2] = weight;
             if (constrain >= 0) {
               const int32_t value = constrain;
               std::memcpy(&v[0], &value, sizeof(value));
+            }
+            if (raw) {
+              const int32_t width = 0;  // denoiseWidth: no spatial filter either
+              std::memcpy(&v[1], &width, sizeof(width));
             }
             return true;
           }, &step))
@@ -3823,7 +3841,8 @@ void OnReshadePresent(effect_runtime* runtime) {
     if (!arg.empty()) g_jitter_phases = static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 0, 64));
     result = g_taa_jitter.status();
   } else if (command == "rtskip" || command == "rtrefit" || command == "rtfeedback" || command == "rtinfo" ||
-             command == "rtdist" || command == "rtconstrain") {
+             command == "rtdist" || command == "rtconstrain" || command == "rtraw") {
+    if (command == "rtraw" && !arg.empty()) g_rt_raw = arg == "on";
     if (command == "rtconstrain" && !arg.empty()) g_rt_constrain = std::clamp(std::atoi(arg.c_str()), -1, 1);
     // ray tracing development switches (see OnDispatch); rtinfo: per-frame counts since the last rtinfo
     if (command == "rtskip" && !arg.empty()) g_rt_skip = static_cast<uint32_t>(std::atoi(arg.c_str()));
@@ -3845,7 +3864,7 @@ void OnReshadePresent(effect_runtime* runtime) {
     std::snprintf(text, sizeof(text),
                   "distance schedule near %.0f m far %.0f m: structures %u / %u / %u, lookups %llu hit %llu missed, "
                   "instance reads %llu ok %llu failed; "
-                  "skip %u, refit every %u, feedback %.3f, constrain %d; per frame over %llu: %.1f animation dispatches, %.1f refits "
+                  "raw %d, skip %u, refit every %u, feedback %.3f, constrain %d; per frame over %llu: %.1f animation dispatches, %.1f refits "
                   "(%.1f skipped), %.2f top-level builds, %.2f DispatchRays, %.2f denoiser edits; totals: %llu denoiser "
                   "dispatches, edit failures at steps 1-6: %llu %llu %llu %llu %llu %llu",
                   g_rt_near.load(), g_rt_far.load(), g_rt_buckets[0].load(), g_rt_buckets[1].load(),
@@ -3853,7 +3872,8 @@ void OnReshadePresent(effect_runtime* runtime) {
                   static_cast<unsigned long long>(misses),
                   static_cast<unsigned long long>(g_rt_instance_reads.load()),
                   static_cast<unsigned long long>(g_rt_instance_fails.load()),
-                  g_rt_skip.load(), g_rt_refit_every.load(), g_rt_feedback.load(), g_rt_constrain.load(),
+                  g_rt_raw.load() ? 1 : 0, g_rt_skip.load(), g_rt_refit_every.load(), g_rt_feedback.load(),
+                  g_rt_constrain.load(),
                   static_cast<unsigned long long>(frames), per[0], per[1], per[2], per[3], per[4], per[5],
                   static_cast<unsigned long long>(g_rt_denoise.load()),
                   static_cast<unsigned long long>(g_rt_edit_fail[1].load()),
