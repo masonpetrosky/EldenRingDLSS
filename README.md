@@ -15,10 +15,24 @@ take it online).
 ![Game TAA, DLAA and DLSS at 50% render scale: 1:1 crops of grass, a wall and armor from 4K screenshots](docs/images/comparison.jpg)
 
 1:1 crops from 4K screenshots of the same view, taken seconds apart (HDR, tonemapped for the web; the grass sways
-between shots), with the GPU time per frame in that scene (RTX 5070 Ti, same game settings for all three; DLSS at 67%
-took 16.1 ms). The game's TAA sharpens its output, which reads as crisper in a still but is pixel noise that crawls in
-motion; DLSS drops that noise, and detail of 4 px and coarser is the same. `GameSharpening=1` puts the game's
+between shots). The game's TAA sharpens its output, which reads as crisper in a still but is pixel noise that crawls
+in motion; DLSS drops that noise, and detail of 4 px and coarser is the same. `GameSharpening=1` puts the game's
 sharpening back on top of DLSS if you prefer that look.
+
+Frame rates at the same spot (RTX 5070 Ti, 3840x2160, HDR, Maximum settings with ray tracing on Maximum, frame cap
+removed; 5 s each with PresentMon, released add-on):
+
+| | Render size | Average fps | 1% low | GPU time per frame |
+| --- | --- | --- | --- | --- |
+| Unmodified game (its TAA and ray tracing) | 3840x2160 | 41.7 | 40.0 | 23.9 ms |
+| Game TAA + the add-on's cheaper ray tracing | 3840x2160 | 48.4 | 45.5 | 20.6 ms |
+| DLAA | 3840x2160 | 45.3 | 43.1 | 22.1 ms |
+| DLSS Quality (67%) | 2572x1448 | 62.0 | 58.2 | 16.1 ms |
+| DLSS Performance (50%) | 1920x1080 | 69.8 | 64.3 | 14.3 ms |
+
+The ray tracing savings stay on with F9 (game TAA), so the first row was measured with the add-on's refit schedule
+switched off (remote `rtdist 0`, `rtrefit 1`); `tools/ab_capture.ps1 -Round showcase` and `showcasert` repeat the
+measurements.
 
 ## Features
 

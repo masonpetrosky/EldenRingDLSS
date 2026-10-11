@@ -29,7 +29,7 @@
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
                'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe', 'upscale',
-               'showcase')][string]$Round = 'sharpen',
+               'showcase', 'showcasert')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -231,6 +231,13 @@ if ($Round -eq 'sharpen') {
   Send 'scale 1' 5.0; Send 'scale'; Send 'capture show_dlaa'; LogFrames 'show_dlaa'
   Send 'dlss off' 2.0; Send 'capture show_taa'; LogFrames 'show_taa'
   Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'
+} elseif ($Round -eq 'showcasert') {
+  # The showcase's ray tracing baseline: the game's TAA with the add-on's refit schedule off (every structure refit
+  # every frame, as the game does), then on, then DLSS at 0.50. Restores the default schedule (rtdist 20 50, rtrefit 2).
+  Send 'dlss on'; Send 'scale 1' 5.0; Send 'dlss off'; Send 'rtdist 0'; Send 'rtrefit 1' 3.0
+  Send 'capture showrt_vanilla'; LogFrames 'showrt_vanilla'
+  Send 'rtdist 20 50'; Send 'rtrefit 2' 3.0; LogFrames 'showrt_taa'
+  Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'; LogFrames 'showrt_dlss50'
 } elseif ($Round -eq 'treecost') {
   # Where the trees' cost goes: grass and trees with and without the resolve draw, grass only.
   Send 'dlss on'; Send 'wind on'; Send 'windtrees on' 3.0; LogFrames 'tc_trees'
