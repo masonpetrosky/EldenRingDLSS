@@ -3581,6 +3581,54 @@ bool OnBuildAccelerationStructure(command_list* cmd_list, acceleration_structure
 // Reconstruction needs fresh noise every frame; remote "rtrandom log" records frameRandom over 64 frames,
 // "rtrandom free" replaces it with a new random value every frame, "rtrandom game" leaves it.
 std::atomic<int> g_rt_random_mode{0};  // 0 game's, 1 free (a hash of the frame number)
+// Rays per pixel: l_rayGenCB starts with uint aoSampleCount and uint dirLightShadowSampleCount. It is a local
+// constant buffer: its GPU address sits in the ray generation record of the shader table, after the 32-byte shader
+// identifier. Remote "rtsamples <ao> <shadow>" (0 = the game's) raises them for Ray Reconstruction; the game's values
+// are written back when the override is cleared (the buffer may be written only once).
+std::atomic<uint32_t> g_rt_ao_samples{0}, g_rt_shadow_samples{0};
+std::atomic<uint32_t> g_rt_game_ao_samples{0}, g_rt_game_shadow_samples{0};
+std::atomic<uint64_t> g_rt_sample_edits{0}, g_rt_sample_misses{0};
+std::mutex g_rt_samples_mutex;
+std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> g_rt_sample_originals;  // CB address -> game's counts
+
+bool ResolveUpload(resource* buffer, uint64_t* offset, uint64_t size);
+
+void EditRayGenSamples(device* dev, resource raygen, uint64_t raygen_offset, uint64_t raygen_size) {
+  if (raygen == 0 || raygen_size < 40 || raygen_size > 4096) return;
+  void* record = nullptr;
+  if (!dev->map_buffer_region(raygen, raygen_offset, raygen_size, map_access::read_only, &record)) return;
+  uint64_t args[4] = {};
+  const size_t count = (std::min)(static_cast<size_t>((raygen_size - 32) / 8), size_t{4});
+  std::memcpy(args, static_cast<const uint8_t*>(record) + 32, count * 8);
+  dev->unmap_buffer_region(raygen);
+  const uint32_t ao = g_rt_ao_samples.load(), shadow = g_rt_shadow_samples.load();
+  for (size_t i = 0; i < count; ++i) {
+    resource buffer = {0};
+    uint64_t offset = args[i];
+    if (offset == 0 || !ResolveUpload(&buffer, &offset, 96)) continue;
+    void* cb = nullptr;
+    if (!dev->map_buffer_region(buffer, offset, 8, map_access::read_write, &cb)) continue;
+    uint32_t counts[2];
+    std::memcpy(counts, cb, sizeof(counts));
+    bool found = false;
+    if (counts[0] <= 64 && counts[1] <= 64 && (counts[0] | counts[1]) != 0) {
+      found = true;
+      std::lock_guard lock(g_rt_samples_mutex);
+      auto it = g_rt_sample_originals.find(args[i]);
+      if (it == g_rt_sample_originals.end()) it = g_rt_sample_originals.emplace(args[i], std::pair{counts[0], counts[1]}).first;
+      g_rt_game_ao_samples = it->second.first;
+      g_rt_game_shadow_samples = it->second.second;
+      const uint32_t want[2] = {ao != 0 ? ao : it->second.first, shadow != 0 ? shadow : it->second.second};
+      if (want[0] != counts[0] || want[1] != counts[1]) {
+        std::memcpy(cb, want, sizeof(want));
+        ++g_rt_sample_edits;
+      }
+    }
+    dev->unmap_buffer_region(buffer);
+    if (found) return;
+  }
+  ++g_rt_sample_misses;
+}
 std::mutex g_rt_random_mutex;
 std::vector<float> g_rt_random_log;  // under g_rt_random_mutex
 bool g_rt_random_logging = false;
@@ -3594,11 +3642,12 @@ float FrameRandom(uint64_t frame) {
   return static_cast<float>(v & 0xFFFFFF) / 16777216.0f;
 }
 
-bool OnDispatchRays(command_list* cmd_list, resource, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t,
-                    resource, uint64_t, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t,
-                    uint32_t) {
+bool OnDispatchRays(command_list* cmd_list, resource raygen, uint64_t raygen_offset, uint64_t raygen_size, resource,
+                    uint64_t, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, resource, uint64_t, uint64_t,
+                    uint64_t, uint32_t, uint32_t, uint32_t) {
   ++g_rt_rays;
   g_last_rays_frame = g_frame.load();
+  EditRayGenSamples(cmd_list->get_device(), raygen, raygen_offset, raygen_size);
   const int mode = g_rt_random_mode.load();
   bool logging;
   {
@@ -4109,6 +4158,16 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "passlog") {
     g_passlog_frame = g_frame.load() + 1;
     result = "logging the next frame's named draws to shots/passlog.txt";
+  } else if (command == "rtsamples") {
+    if (!arg.empty()) {
+      g_rt_ao_samples = static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 0, 16));
+      g_rt_shadow_samples = static_cast<uint32_t>(std::clamp(std::atoi(arg2.c_str()), 0, 16));
+    }
+    result = "rays per pixel: game's AO " + std::to_string(g_rt_game_ao_samples.load()) + ", shadows " +
+             std::to_string(g_rt_game_shadow_samples.load()) + "; override AO " +
+             std::to_string(g_rt_ao_samples.load()) + ", shadows " + std::to_string(g_rt_shadow_samples.load()) +
+             " (0 = game's); edits " + std::to_string(g_rt_sample_edits.load()) + ", records without the buffer " +
+             std::to_string(g_rt_sample_misses.load());
   } else if (command == "rtrandom") {
     if (arg == "log") {
       std::lock_guard lock(g_rt_random_mutex);
