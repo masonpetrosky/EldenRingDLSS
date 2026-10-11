@@ -38,6 +38,7 @@
 #include "hw_breakpoints.hpp"
 #include "render_scale.hpp"
 #include "rr_guides.hpp"
+#include "ao_upscale.hpp"
 #include "state_tracking.hpp"
 #include "stretch.hpp"
 #include "taa_jitter.hpp"
@@ -63,6 +64,8 @@ enum class Pass : uint8_t {
   kEmissiveGlow,  // the glow pass that reads the scene's emissive buffer
   kDofCoc,        // the depth of field pass that reads the half-size depth
   kLightDir,      // the sun light pass, which reads the complete G-buffer (Ray Reconstruction's guides)
+  kAoReproj,      // the AO chain's temporal pass (half size)
+  kAoUpscale,     // the AO chain's bilateral upscale to full size
 };
 
 // cbSceneParam, bound at vertex shader register b8 by the scene shaders. Offsets are in floats.
@@ -577,6 +580,8 @@ Pass Classify(uint32_t count, const pipeline_subobject* subobjects) {
   if (Contains(ps, "EmissiveToGlowPS")) return Pass::kEmissiveGlow;
   if (Contains(ps, "LensSimu2_ComputeCoC")) return Pass::kDofCoc;
   if (Contains(ps, "GXLightAcc_DDirLightShadowed")) return Pass::kLightDir;
+  if (Contains(ps, "ScreenSpaceAO2_SeparatedReProj")) return Pass::kAoReproj;
+  if (Contains(ps, "ScreenSpaceAO2_BilateralUpScale")) return Pass::kAoUpscale;
   if (Contains(vs, "_Velo")) return Pass::kScene;
   return Pass::kOther;
 }
@@ -3206,6 +3211,54 @@ void MakeRrGuides(command_list* cmd_list, CmdData& data) {
   RestoreTaaState(cmd_list, data);
 }
 
+// The AO chain's upscale, replaced while RR gets raw AO: the game binds the full-size depth at t0 and the half-size AO
+// at t1 (x = AO, yzw = packed depth), cbSSAOParam at b0, cbSSAOParam2 at b2 and cbPostProcessCommon at b4.
+int RawMode();  // with the ray tracing switches further down
+
+erdlss::AoUpscale g_ao_upscale;
+bool g_ao_upscale_failed = false;
+std::atomic<uint64_t> g_ao_upscales{0};
+
+bool StochasticAoUpscale(command_list* cmd_list, CmdData& data) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  device* const dev = cmd_list->get_device();
+  if (state == nullptr || state->viewports.empty() || state->render_targets.empty() || state->render_targets[0] == 0)
+    return false;
+  if (!g_ao_upscale.ready() && !g_ao_upscale_failed &&
+      !g_ao_upscale.Init(reinterpret_cast<ID3D12Device*>(dev->get_native()))) {
+    g_ao_upscale_failed = true;
+    Log(reshade::log::level::error, "Stochastic AO upscale unavailable: " + g_ao_upscale.status());
+  }
+  if (g_ao_upscale_failed) return false;
+  erdlss::AoUpscaleInputs in;
+  in.depth = reinterpret_cast<ID3D12Resource*>(BoundResource(cmd_list, shader_stage::pixel, 0).handle);
+  in.src = reinterpret_cast<ID3D12Resource*>(BoundResource(cmd_list, shader_stage::pixel, 1).handle);
+  in.target.ptr = static_cast<SIZE_T>(state->render_targets[0].handle);
+  const viewport& vp = state->viewports[0];
+  in.viewport = {vp.x, vp.y, vp.width, vp.height, vp.min_depth, vp.max_depth};
+  bool ok = true;
+  ok &= EditBoundConstants(cmd_list, shader_stage::pixel, 0, 0, 4, [&](float* v) {
+    std::memcpy(in.depth_param, v, sizeof(in.depth_param));
+    return false;
+  }, nullptr) || in.depth_param[1] != 0.0f;
+  EditBoundConstants(cmd_list, shader_stage::pixel, 2, 64, 4, [&](float* v) {
+    std::memcpy(in.screen, v, sizeof(in.screen));
+    return false;
+  });
+  EditBoundConstants(cmd_list, shader_stage::pixel, 4, 0, 2, [&](float* v) {
+    std::memcpy(in.percentage, v, sizeof(in.percentage));
+    return false;
+  });
+  in.frame = static_cast<uint32_t>(g_frame.load());
+  if (!ok || in.screen[2] == 0.0f || dev->get_resource_desc(dev->get_resource_from_view(state->render_targets[0]))
+                                          .texture.format != format::r8_unorm)
+    return false;
+  if (!g_ao_upscale.Run(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()), in)) return false;
+  ++g_ao_upscales;
+  RestoreTaaState(cmd_list, data);
+  return true;
+}
+
 bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
             uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
@@ -3214,6 +3267,13 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   if (data->pass == Pass::kLightDir && g_config.enabled && g_config.ray_reconstruction && g_dlss.rr_available() &&
       RayTracingActive())
     MakeRrGuides(cmd_list, *data);
+  if (data->pass == Pass::kAoReproj && RawMode() == 2)
+    EditBoundConstants(cmd_list, shader_stage::pixel, 2, 240, 1, [](float* v) {
+      if (v[0] == 0.0f) return false;
+      v[0] = 0.0f;  // g_vPrevFrameStrengh.x: no history
+      return true;
+    });
+  if (data->pass == Pass::kAoUpscale && RawMode() == 2 && StochasticAoUpscale(cmd_list, *data)) return true;
   if (data->pass == Pass::kMotionPrep) {
     data->depth = BoundResource(cmd_list, shader_stage::pixel, 0);       // g_StencilTexForCopy
     data->depth_copy = BoundResource(cmd_list, shader_stage::pixel, 2);  // g_DepthTex
@@ -3282,7 +3342,9 @@ std::atomic<int> g_rt_constrain{-1};        // remote "rtconstrain 0|1|-1": its 
 std::atomic<bool> g_rt_raw{false};
 // remote "rrraw none|shadows|all": what the game's denoiser passes through while RR runs. The shadows are traced at
 // the render size, the AO at half of it and upscaled afterwards, so raw AO reaches RR as 2x2 blocks of noise, which RR
-// cannot tell from detail; "shadows" keeps the game's AO denoiser (the half-size pass and the a-trous filters).
+// cannot tell from detail; "shadows" keeps the game's AO denoiser (the half-size pass and the a-trous filters). "all"
+// also turns off the AO chain's own temporal pass (ScreenSpaceAO2_SeparatedReProj: g_vPrevFrameStrengh.x, the
+// history weight, at cbSSAOParam2 byte 240) and replaces its upscale with a stochastic one (ao_upscale.hlsl).
 std::atomic<int> g_rr_raw_mode{1};
 int RawMode() { return g_rt_raw.load() ? 2 : g_rr_active.load() ? g_rr_raw_mode.load() : 0; }
 bool RawDenoise() { return RawMode() != 0; }
@@ -4005,7 +4067,8 @@ void OnReshadePresent(effect_runtime* runtime) {
       g_recreate = true;
     }
     static const char* const kRaw[3] = {"none", "shadows", "all"};
-    result = std::string("raw ") + kRaw[std::clamp(g_rr_raw_mode.load(), 0, 2)] + ", RR preset " +
+    result = std::string("raw ") + kRaw[std::clamp(g_rr_raw_mode.load(), 0, 2)] + " (stochastic AO upscales " +
+             std::to_string(g_ao_upscales.load()) + ")" + ", RR preset " +
              std::to_string(g_rr_preset.load()) + "; " + g_dlss.status();
   } else if (command == "rrdump") {
     std::lock_guard lock(g_dump_mutex);

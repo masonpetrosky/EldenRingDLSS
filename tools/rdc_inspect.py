@@ -89,7 +89,12 @@ def inspect(controller, eid, textures, buffers, names, targets):
         lines.append("viewport x=%g y=%g w=%g h=%g" % (vp.x, vp.y, vp.width, vp.height))
     except Exception as exc:
         lines.append("viewport unavailable: %s" % exc)
-    compute = pipe.GetShader(rd.ShaderStage.Compute) != rd.ResourceId.Null()
+    # D3D12 keeps the last compute pipeline bound during draws, so the action decides, not the bound shaders.
+    action = controller.GetAction(eid) if hasattr(controller, "GetAction") else None
+    if action is not None:
+        compute = bool(action.flags & rd.ActionFlags.Dispatch)
+    else:
+        compute = pipe.GetShader(rd.ShaderStage.Compute) != rd.ResourceId.Null()
     stages = [rd.ShaderStage.Compute] if compute else [rd.ShaderStage.Vertex, rd.ShaderStage.Pixel]
     pipeline_obj = pipe.GetComputePipelineObject() if compute else pipe.GetGraphicsPipelineObject()
 
