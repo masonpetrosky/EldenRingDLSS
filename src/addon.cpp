@@ -3344,9 +3344,10 @@ std::atomic<bool> g_rt_raw{false};
 // the render size, the AO at half of it and upscaled afterwards, so raw AO reaches RR as 2x2 blocks of noise, which RR
 // cannot tell from detail; "shadows" keeps the game's AO denoiser (the half-size pass and the a-trous filters). "all"
 // also turns off the AO chain's own temporal pass (ScreenSpaceAO2_SeparatedReProj: g_vPrevFrameStrengh.x, the
-// history weight, at cbSSAOParam2 byte 240) and replaces its upscale with a stochastic one (ao_upscale.hlsl): as
-// quiet as "shadows" in game, with a little more AO definition, and RR does all the denoising. The default.
-std::atomic<int> g_rr_raw_mode{2};
+// history weight, at cbSSAOParam2 byte 240) and replaces its upscale with a stochastic one (ao_upscale.hlsl). In
+// grass the 4 half-size neighbors differ strongly, so picking one at random is noise of its own that more AO rays
+// do not remove: "shadows" is the default until the AO is traced at full size (docs/raytracing.md).
+std::atomic<int> g_rr_raw_mode{1};
 int RawMode() { return g_rt_raw.load() ? 2 : g_rr_active.load() ? g_rr_raw_mode.load() : 0; }
 bool RawDenoise() { return RawMode() != 0; }
 std::atomic<uint64_t> g_rt_anim{0}, g_rt_refits{0}, g_rt_skipped{0}, g_rt_rays{0}, g_rt_tlas{0}, g_rt_edits{0};
@@ -3407,7 +3408,7 @@ std::mutex g_upload_mutex;
 std::vector<UploadBuffer> g_upload_buffers;
 
 void OnInitResource(device*, const resource_desc& desc, const subresource_data*, resource_usage, resource res) {
-  if (desc.type != resource_type::buffer || desc.heap != memory_heap::upload || desc.buffer.size < (16u << 20))
+  if (desc.type != resource_type::buffer || desc.heap != memory_heap::upload || desc.buffer.size < (64u << 10))
     return;
   auto* const native = reinterpret_cast<ID3D12Resource*>(res.handle);
   if (native == nullptr) return;
@@ -3608,10 +3609,35 @@ void EditRayGenSamples(device* dev, resource raygen, uint64_t raygen_offset, uin
   std::memcpy(args, static_cast<const uint8_t*>(record) + 32, count * 8);
   dev->unmap_buffer_region(raygen);
   const uint32_t ao = g_rt_ao_samples.load(), shadow = g_rt_shadow_samples.load();
+  static std::atomic<bool> logged{false};
+  const bool log_now = !logged.exchange(true);
+  std::string log_text;
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
   for (size_t i = 0; i < count; ++i) {
     resource buffer = {0};
     uint64_t offset = args[i];
-    if (offset == 0 || !ResolveUpload(&buffer, &offset, 96)) continue;
+    bool resolved = offset != 0 && ResolveUpload(&buffer, &offset, 96);
+    const char* how = "address";
+    if (!resolved && offset != 0 && descriptors != nullptr) {
+      // A local descriptor table: its first descriptor is l_rayGenCB's CBV (register b16 is the table's only CBV).
+      descriptor_heap heap = {0};
+      uint32_t slot = 0;
+      dev->get_descriptor_heap_offset(descriptor_table{args[i]}, 0, 0, &heap, &slot);
+      const buffer_range range = heap != 0 ? descriptors->Buffer(heap, slot) : buffer_range{};
+      if (range.buffer != 0) {
+        buffer = range.buffer;
+        offset = range.offset;
+        resolved = true;
+        how = "table";
+      }
+    }
+    if (log_now) {
+      char text[96];
+      std::snprintf(text, sizeof(text), " [%zu] %016llx %s", i, static_cast<unsigned long long>(args[i]),
+                    resolved ? how : "unresolved");
+      log_text += text;
+    }
+    if (!resolved) continue;
     void* cb = nullptr;
     if (!dev->map_buffer_region(buffer, offset, 8, map_access::read_write, &cb)) continue;
     uint32_t counts[2];
@@ -3630,9 +3656,18 @@ void EditRayGenSamples(device* dev, resource raygen, uint64_t raygen_offset, uin
         ++g_rt_sample_edits;
       }
     }
+    if (log_now) {
+      char text[48];
+      std::snprintf(text, sizeof(text), " (counts %u %u)", counts[0], counts[1]);
+      log_text += text;
+    }
     dev->unmap_buffer_region(buffer);
-    if (found) return;
+    if (found) {
+      if (log_now) Log(reshade::log::level::info, "Ray generation record:" + log_text);
+      return;
+    }
   }
+  if (log_now) Log(reshade::log::level::info, "Ray generation record:" + log_text);
   ++g_rt_sample_misses;
 }
 std::mutex g_rt_random_mutex;

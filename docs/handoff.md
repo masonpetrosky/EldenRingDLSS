@@ -10,8 +10,10 @@ with DLSS. Full history and measurements are in `docs/recon.md`; this file is th
 | 1. Recon | Done (2026-10-08) |
 | 2. DLAA (DLSS at native resolution) | Done, in the everyday install |
 | Wind motion vectors (grass, bushes, trees) | Done, in the everyday install |
-| 3. Upscaling (render below native, DLSS upscales) | Works; in the everyday install at 67% since 2026-10-10 |
-| 4. Release | Not started. Publish to GitHub only when the user says so |
+| 3. Upscaling (render below native, DLSS upscales) | Works; in the everyday install at 50% with preset M |
+| Ray tracing cost (distance-based BLAS refits) | Done, in the everyday install (halves the RT cost on Maximum) |
+| DLSS Ray Reconstruction | Works in the dev install; image limited by the game's raw signal (see below) |
+| 4. Release | Source published on GitHub (2026-10-10, at the user's request); no binaries |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -28,12 +30,12 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
   `RenderScale=0.50`, game sharpening off, game exposure on, chromatic aberration off, `WindMotion=1`, `WindMode=1`,
   `WindTrees=1`. Backups in `build\everyday-backup\`: 30725e0 (58%, K), 5ccb6f2 (67%, K), 6e672fa (DLAA). Only
   update it with the user's explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
-- **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLL): test builds only. It has the
-  ray tracing test build (2026-10-10: distance-based refit schedule on by default; remote `rtskip`, `rtrefit`,
-  `rtdist`, `rtfeedback`, `rtinfo`, plus `stretch on|off` and `jitter <phases>`), with `RenderScale=0.50`,
-  `Preset=13` (M) and `GameExposure=1`. F9 toggles DLSS and saves `Enabled` to the ini: check `Enabled=1` (and the
-  "Loaded. DLSS on" log line) before measuring. The user wants preset M at 50%
-  (sharper character detail than K there); the everyday install still runs 67% with K.
+- **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLLs including `nvngx_dlssd.dll`):
+  test builds only. Latest build (2026-10-10 night): DLSS Ray Reconstruction (`RayReconstruction=1` in its ini, used
+  only while the game's ray tracing runs), raw shadows into RR, plus all ray tracing switches (`rr`, `rrraw`,
+  `rrpreset`, `rrdump`, `rtsamples`, `rtrandom`, `rtskip`, `rtrefit`, `rtdist`, `rtinfo`, `jitter`, `jittersrc`,
+  `dual`, `dualinfo`, `sceneinfo`). Ini: `RenderScale=0.50`, `Preset=13` (M), `GameExposure=1`. F9 toggles DLSS and
+  saves `Enabled` to the ini: check `Enabled=1` (and the "Loaded. DLSS on" log line) before measuring.
 
 ## Working rules (from the user)
 
@@ -82,7 +84,7 @@ pwsh -NoProfile -File tools/deploy.ps1 -Target dev    # use pwsh and absolute pa
 - Experiments kept off by default: `WindPrepass=1` (replacing the grass prepass pixel shader, correct but slower),
   `WindMode=0` (stream output for everything).
 
-## Stage 3: upscaling (works in the dev install)
+## Stage 3: upscaling (in the everyday install)
 
 Details and measurements: `docs/recon.md`, "Stage 3" rounds 1-4 (addresses for `eldenring.exe` 2.7.1.0).
 
@@ -117,6 +119,11 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
    smooths over; DLSS now takes the jitter from the TAA filter's counter (remote `jitterinfo`). 58% needed a
    render-size tolerance (the engine rounds the width to 8 pixels with ray tracing on); list kinds seen on both
    sides of the TAA stay decided at submission (GPU predicates). Details in docs/recon.md.
+2c. Ray Reconstruction (dev only, 2026-10-10): works end to end (guides from the G-buffer at the sun light pass, raw
+   shadows, automatic switch with ray tracing), +1.9 ms over DLSS M at 50%; keeps grass shadows and ghosts less than
+   the game's denoiser, but at 50% the grass shimmers because the game's raw signal is thin (AO at half size, few
+   rays). **Next session:** replace the shadow ray generation shader with one that also traces full-size AO
+   (docs/raytracing.md, "Next: replace the shadow ray generation shader"). The everyday install keeps DLSS M.
 3. Hear how the everyday install at 67% plays over longer sessions and other areas.
 4. Performance: the stretch passes and the full-size post-processing cost about 1 ms; check what is worth saving.
 5. Robustness: scale changes at runtime (barrier listener), resolution changes (filter and target recreation), the
@@ -125,16 +132,6 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
 
 ## Recent commits
 
-```
-6ec5b24 Notes: upscaling works in game, jitter cycle fix
-5ccb6f2 Stage 3: lengthen the TAA jitter cycle while upscaling
-ce9f770 Stage 3: learn list order only from frames that have a TAA
-5bb4ca7 Stage 3: learn which command lists follow the TAA from submission order
-d4e7cf7 Stage 3: correct the passes after the TAA per draw (untested)
-0b84427 Stage 3: upscale at the final UI composite
-c42575c Stage 3: render scale through the engine's dynamic resolution, DLSS sub-rect input
-e643a54 Stage 3: find the dynamic-resolution scale, add an external memory tool
-a3d552f Add a handoff note for the next session
-19faa1b Stage 3 research: resolution-state probe, Ghidra queries, corrected notes
-6e672fa Tree motion vectors: overlay checkbox, lazy start, indirect resolve   <- everyday install
-```
+See `git log`; the latest work (2026-10-10): DLSS jitter from the TAA filter's counter (a4ad1e0), list kinds
+decided at submission with GPU predicates (483dc7d, 30725e0), the fire and grace fixes (bca896f), Ray
+Reconstruction (98e203c and later), raw AO and rays-per-pixel switches (c641558, 657677a).

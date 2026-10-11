@@ -198,3 +198,51 @@ specular, sky defaults).
   noise is not fresh per frame (fixed pattern or a short cycle), which NVIDIA's guide names as the main pitfall.
   Next: extract the ray generation shader (DXIL library in CreateStateObject, capture er117_rtmax_*) and see how it
   draws random numbers; if from a short frame counter, feed it a free-running one.
+
+## Ray Reconstruction: the raw signal (2026-10-10, night)
+
+Findings from the session after "first in-game results" (dev build 657677a and later):
+
+- **The game's randomness is fine per frame.** Extracted the ray tracing shaders from the capture (DXIL libraries in
+  `CreateStateObject`; `dxc -dumpbin`): ray generation `GXRayGen`, `GXRayGen_ao`, `GXRayGen_dirLightShadow`, miss
+  and hit shaders, and per-material hit groups (SpeedTree, vegetation, ...) with any-hit shaders for alpha testing
+  (so material lookups at hits exist, which matters for any future reflections). The shadow and AO ray generation
+  shaders hash `frac(frac(sin(dot(pixel / size + frameRandom, (26.44, 48.24))) * 347.97) * 578.2)`; `frameRandom`
+  (`g_sceneCB` byte 240) logged over 64 frames was a fresh value in [0, 1) every frame (`rtrandom log`). Not the
+  cause.
+- **Rays per pixel** (`l_rayGenCB`: `aoSampleCount`, `dirLightShadowSampleCount`; a local constant buffer reached
+  through the descriptor table in the ray generation record, after the 32-byte shader identifier; `rtsamples <ao>
+  <shadow>`): Maximum uses AO 4, shadows 2. With RR at 50%: shadows 4 "a little better" (+0.9 ms), 8 no better than
+  4; raw AO with 8 or 16 rays still noisy (16: +3.7 ms more).
+- **Why raw AO stays noisy:** the AO is traced at half size. The stochastic upscale turns the differences between the
+  4 half-size neighbors into per-pixel noise; in grass (every blade at another depth) that noise is large no matter
+  how clean each sample is. Feeding RR the game's fully denoised input is calm, so the noise is the raw signal, not
+  RR. The game's denoiser looks calmer because it blurs (a-trous, 10-frame history without motion), losing the fine
+  grass shadows; RR keeps detail and needs a denser signal to tell detail from noise (clean at native).
+- Current default: RR with raw shadows (`rrraw shadows`), AO from the game's denoiser; shadow rays at the game's 2
+  (4 is a reasonable option, +0.9 ms). Measured: RR +1.9 ms over DLSS M at 50%.
+
+How games built for RR do it: every effect traced at the render size (1-2 rays per pixel), well-distributed samples
+(blue noise, importance sampling) and sample reuse (ReSTIR), all inputs RR asks for, and performance from low
+render scales and frame generation rather than many rays. Foliage is hard for RR everywhere.
+
+## Next: replace the shadow ray generation shader (plan, not started)
+
+The user's call: stop tuning RR around the game's cheap signal and give it a proper one.
+
+1. Port `GXRayGen_dirLightShadow` and `GXRayGen_ao` from the DXIL disassembly to HLSL (about 400 IR lines each;
+   bindings: `g_sceneCB` cb0, local `l_rayGenCB` cb16, TLAS t64, local `l_texGBufferNormal` t67 and `l_texDepth` t68,
+   `g_renderOutput` u0; payload `RayPayload_shadow` (one int); ray type indices, cone radius, sample counts, ray
+   lengths and alpha flags from the constants).
+2. One combined shader for the full-size shadow dispatch: the game's shadow rays unchanged, plus AO rays per pixel,
+   the AO written to the shadow output's 4th channel (always 0 in the capture: `tex50009` min/max w = 0). The game's
+   hit groups stay, so alpha-tested foliage stays correct.
+3. Swap it in at pipeline creation: ReShade's `create_pipeline` event receives ray tracing pipelines as subobjects
+   (raygen/miss/hit shaders, libraries) and lets the add-on replace the description. Skip the half-size AO dispatch.
+4. The AO upscale replacement (ao_upscale.hlsl) reads the full-size AO from that channel instead of upscaling, so RR
+   gets per-pixel AO noise at the render size like the shadows. Better sampling (blue noise) can follow in the same
+   shader.
+
+Check first: that ReShade really passes D3D12 state objects through `create_pipeline` with the libraries (log the
+subobjects), and which channels the shadow denoiser and the composite read (the 4th must survive the pass-through
+denoiser and the copy back into `tex50009`).

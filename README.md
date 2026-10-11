@@ -1,0 +1,139 @@
+# Elden Ring DLSS
+
+A [ReShade](https://reshade.me) 6.8 add-on that replaces ELDEN RING's temporal anti-aliasing with NVIDIA DLSS on
+Direct3D 12: DLAA at native resolution, or upscaling from a lower render resolution through the engine's own
+(console) dynamic resolution, plus several fixes the game needs before DLSS looks right. It also makes the game's
+ray tracing cheaper and has an experimental DLSS Ray Reconstruction path.
+
+This is a personal research project, developed and tested on one machine (RTX 5070 Ti, 4K HDR, `eldenring.exe`
+file version 2.7.1.0, ReShade 6.8, [me3](https://github.com/garyttierney/me3) 0.13). It is published so that the
+reverse engineering and the lessons in `docs/` do not have to be repeated. There are no binary releases; you build it
+yourself and use it at your own risk, offline (me3 runs the game without Easy Anti-Cheat; do not take it online).
+
+## Features
+
+- **DLSS at the TAA**, before tonemapping, with HDR input and the game's exposure (NVIDIA's recommended placement).
+  Presets selectable (K, M, L, ...). F9 toggles between DLSS and the game's TAA.
+- **Upscaling** through the engine's dynamic resolution scale (`RenderScale`, e.g. 0.50 = Performance, 0.58 =
+  Balanced, 0.67 = Quality). Everything after the TAA was queued by the engine at the render size; the add-on
+  corrects those passes per draw (viewports, scissors, resolution constants), stretches the render-size inputs they
+  read, and decides at submission time (with GPU predicates) for command lists that land on either side of the TAA.
+- **Correct jitter**: a longer jitter cycle while upscaling (the game cycles 8 positions), taken from the TAA
+  filter's own counter (the scene constants are sometimes a frame stale, which presets M and L show as judder).
+- **Motion vectors for wind-animated vegetation** (grass, bushes, SpeedTree trees), which the game does not write and
+  DLSS therefore smears: a port of the game's grass wind shader and a stream-output replay of the tree shaders.
+- **Cheaper ray tracing**: the game re-animates and refits ~200 bottom-level acceleration structures every frame;
+  the add-on refits vegetation by distance (near every frame, far every 2nd/4th frame) and characters every frame,
+  which halved the ray tracing cost on Maximum in testing.
+- **DLSS Ray Reconstruction (experimental)**: guide buffers (world normals, roughness, diffuse and specular albedo)
+  drawn from the game's G-buffer, the game's ray traced shadows passed raw into RR, used only while ray tracing is
+  on. Works end to end; at 50% the result is limited by the game's thin ray tracing signal (see
+  `docs/raytracing.md`).
+- Removes the game's chromatic aberration (optional), texture LOD bias for the upscale, fixes for the heat
+  distortion, sparks and grace flames at reduced render sizes.
+
+## Requirements
+
+- Windows 10/11, an NVIDIA RTX GPU and a current driver.
+- ELDEN RING (Steam), the version above. Code patterns and offsets are version specific (see Limitations).
+- ReShade 6.8 **with full add-on support**.
+- A way to load ReShade into the game without Easy Anti-Cheat. The scripts here use me3 profiles.
+- To build: Visual Studio 2022 or later (MSVC, C++20), CMake, Ninja, the Windows SDK (`fxc`, `dxc`), PowerShell 7,
+  and the [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) (fetched by a script; not part of this repository).
+
+## Building
+
+```
+pwsh tools/fetch_dlss_sdk.ps1     # DLSS SDK headers, static library and DLLs into third_party/dlss (NVIDIA license)
+pwsh build.ps1                    # configures and builds build/EldenRingDLSS.addon64
+```
+
+## Installing
+
+`tools/deploy.ps1 -Target main` copies ReShade, the add-on and NVIDIA's release DLSS DLL(s) into an me3 natives folder
+and adds it to the `eldenring-default` profile; `-Target dev` makes a separate `eldenring-dlss-dev` profile with
+NVIDIA's developer DLLs (watermark, extra logging). Pass `-ReShadeDll <path>` with your ReShade 6.8 add-on DLL.
+Without me3, put `ReShade64.dll` (renamed as your loader needs), `EldenRingDLSS.addon64`, `nvngx_dlss.dll` (and
+`nvngx_dlssd.dll` for Ray Reconstruction) in the folder your loader uses as ReShade's base path.
+
+The game must be closed while installing (the add-on file is locked while it runs).
+
+## Settings
+
+`EldenRingDLSS.ini` next to the add-on (most are also in the ReShade overlay):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `Enabled` | 0 | DLSS on (1) or the game's TAA (0). F9 toggles it and saves it. |
+| `Preset` | 0 | DLSS preset: 0 = NVIDIA's default for the mode, 11 = K, 12 = L, 13 = M. |
+| `RenderScale` | 1.0 | Render size per axis; below 1 DLSS upscales (0.50, 0.58, 0.67, 0.77). |
+| `GameExposure` | 1 | Give DLSS the game's exposure instead of DLSS's auto-exposure. |
+| `GameSharpening` | 0 | Run the game's TAA sharpening on the DLSS output (`SharpenStrength`). |
+| `MipBias` | -1.0 | Texture LOD bias for DLAA; log2(RenderScale) is added when upscaling. Needs a restart. |
+| `ChromaticAberration` | 1 | Keep the game's chromatic aberration (0 removes it). |
+| `WindMotion` | 0 | Motion vectors for wind-animated vegetation. |
+| `WindMode` | 1 | 1 = ported grass shader plus tree replay; 0 = stream output for everything. |
+| `WindTrees` | 1 | Include SpeedTree trees and shrubs (`WindTreeCapacity`, millions of vertices per frame). |
+| `RayReconstruction` | 0 | DLSS Ray Reconstruction while the game's ray tracing is on. |
+| `ToggleKey` | 120 | Virtual key code for the DLSS toggle (120 = F9). |
+
+`VegetationMask`, `WindPrepass`, `WindCapacity`, `FlipJitterX/Y`, `FlipMotion` and `UseDepthCopy` are development
+options.
+
+## How it works
+
+The add-on recognizes the game's passes by the shader debug names FromSoftware ships in the bytecode (`TempAA`,
+`GXLightAcc_DDirLightShadowed1`, `GXFfx*`, ...) and works at the D3D12 level through ReShade's add-on API: it
+replaces the TAA draw with a DLSS evaluation, edits constant buffers in the upload heap before the GPU reads them,
+records extra passes with native D3D12, and watches ray tracing calls (`dispatch_rays`,
+`build_acceleration_structure`). Details, measurements and the dead ends:
+
+- [`docs/recon.md`](docs/recon.md): the investigation log: TAA inputs, motion vectors and jitter, the wind motion
+  vectors, the engine's dynamic resolution, upscaling and every post-processing fix, with addresses for
+  `eldenring.exe` 2.7.1.0.
+- [`docs/raytracing.md`](docs/raytracing.md): how the game's ray tracing works (re-animation, refits, DXR
+  pipelines, denoisers), its cost, the refit schedule, and Ray Reconstruction (guides, raw signal, findings, next
+  steps).
+- [`docs/handoff.md`](docs/handoff.md): the current state and working notes for picking the project up.
+
+Source layout: `src/addon.cpp` (events, pass recognition, DLSS at the TAA, post-processing corrections, ray tracing
+hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale.*` (the engine's resolution scale),
+`src/taa_jitter.*` (jitter cycle and counter), `src/stretch.*`, `src/rr_guides.*`, `src/ao_upscale.*` (native passes),
+`src/wind*.*`, `src/tree_*` (vegetation motion vectors), `src/descriptors.*` (descriptor tracking).
+
+## Development tools
+
+- **Remote control** (dev builds): write a command into `remote.txt` next to the add-on, the answer appears in
+  `remote.done` (`tools/remote.ps1 "<command>"`). Commands for screenshots (`capture`), motion-vector dumps (`mv`),
+  pass logs (`passlog`), the render scale (`scale`), presets, jitter, ray tracing switches (`rtskip`, `rtrefit`,
+  `rtdist`, `rtsamples`, `rtinfo`) and Ray Reconstruction (`rr`, `rrraw`, `rrpreset`, `rrdump`); see
+  `OnReshadePresent` in `src/addon.cpp`.
+- `tools/ab_capture.ps1`: scripted comparison rounds with PresentMon frame-time logs.
+- `tools/mem.py`: read, search and write the running game's memory from outside.
+- `tools/rdc_*.py`: RenderDoc 1.46 scripts (run with `qrenderdoc.exe --python`) to list passes, constants, bindings,
+  ray tracing calls and readers of a resource in a capture.
+- `tools/ghidra/`: headless Ghidra queries (decompile, cross references) against an analyzed `eldenring.exe`.
+- `tools/dlss_bench/`: times DLSS SR and RR outside the game.
+
+## Limitations
+
+- Version specific: the TAA filter's vtable address is hard-coded; the resolution scale is found by a code pattern.
+  A game update can break either (the add-on then falls back to DLAA or the game's TAA and logs it).
+- Tested on one GPU, at 4K and in HDR. Some corrections depend on exact sizes (render sizes are rounded by the engine
+  to 4 or 8 pixels).
+- Ray Reconstruction at 50-67% shows shimmering grass: the game traces AO at half resolution with few rays. A
+  replacement ray generation shader with full-resolution AO is the planned fix.
+- Every normal exit of the game ends in a harmless WER crash report (an allocator check at shutdown); it predates
+  this add-on.
+
+## Credits and licenses
+
+The add-on's own code is MIT licensed (`LICENSE`). It uses:
+
+- ReShade's add-on headers and the state/descriptor tracking examples by Patrick Mours (`third_party/reshade`,
+  BSD-3-Clause or MIT, see `third_party/reshade/LICENSE.md`).
+- Dear ImGui headers (`third_party/imgui`, MIT, see `third_party/imgui/LICENSE.txt`).
+- The NVIDIA DLSS SDK, under NVIDIA's license, fetched by `tools/fetch_dlss_sdk.ps1` and not included here.
+
+Not affiliated with or endorsed by FromSoftware, Bandai Namco or NVIDIA. ELDEN RING is a trademark of its owners;
+DLSS is a trademark of NVIDIA.
