@@ -270,6 +270,9 @@ bool g_rr_guides_failed = false;
 std::atomic<uint64_t> g_guides_frame{0}, g_guides_runs{0};
 std::atomic<bool> g_rr_active{false};
 std::atomic<int> g_rr_preset{0};  // remote "rrpreset 0|4|5|6": NVIDIA's default (F), D, E (transformer) or F
+// The frame of the last DispatchRays: Ray Reconstruction only runs while the game's ray tracing is on (without it
+// there is nothing to denoise and DLSS super resolution is cheaper).
+std::atomic<uint64_t> g_last_rays_frame{0};
 std::string g_rr_dump_name;  // remote "rrdump <name>": the next RR frame's guides and noisy color (under g_dump_mutex)
 // The scene color the TAA reads (its SourceTex), for the pass log. (Not a rule for corrections: the game draws into it
 // again after the TAA.)
@@ -355,6 +358,10 @@ D3D12_RESOURCE_STATES ToD3D12(resource_usage usage) {
 }
 
 std::atomic<uint64_t> g_frame{0};
+bool RayTracingActive() {
+  const uint64_t last = g_last_rays_frame.load();
+  return last != 0 && g_frame.load() - last < 30;
+}
 
 // 0 unknown, 1 only before the TAA, 2 only after it, 3 both but mostly before, 4 both but mostly after. Kinds 2 and 4
 // are corrected. Caller holds g_kinds_mutex.
@@ -1445,7 +1452,9 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   const uint32_t create_w = in_width < width ? in_width : EngineRenderSize(width, g_config.render_scale);
   const uint32_t create_h = in_height < height ? in_height : EngineRenderSize(height, g_config.render_scale);
   // Ray Reconstruction once its guides exist (drawn at the light pass earlier in the frame).
-  const bool want_rr = g_config.ray_reconstruction && g_dlss.rr_available() && g_guides_frame.load() != 0;
+  // and the game's ray tracing is on.
+  const bool want_rr = g_config.ray_reconstruction && g_dlss.rr_available() && g_guides_frame.load() != 0 &&
+                       RayTracingActive();
   if (g_dlss.has_feature() && (g_dlss.feature_rr() != want_rr || g_dlss.feature_width() != width ||
                                g_dlss.feature_height() != height ||
                                g_dlss.feature_scale() != g_config.render_scale || !g_dlss.feature_hdr() ||
@@ -3202,7 +3211,8 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
-  if (data->pass == Pass::kLightDir && g_config.enabled && g_config.ray_reconstruction && g_dlss.rr_available())
+  if (data->pass == Pass::kLightDir && g_config.enabled && g_config.ray_reconstruction && g_dlss.rr_available() &&
+      RayTracingActive())
     MakeRrGuides(cmd_list, *data);
   if (data->pass == Pass::kMotionPrep) {
     data->depth = BoundResource(cmd_list, shader_stage::pixel, 0);       // g_StencilTexForCopy
@@ -3506,6 +3516,7 @@ bool OnBuildAccelerationStructure(command_list* cmd_list, acceleration_structure
 bool OnDispatchRays(command_list*, resource, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, resource,
                     uint64_t, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t) {
   ++g_rt_rays;
+  g_last_rays_frame = g_frame.load();
   return (g_rt_skip.load() & 4) != 0;
 }
 
@@ -4008,7 +4019,8 @@ void OnReshadePresent(effect_runtime* runtime) {
       SaveConfig();
     }
     result = std::string("Ray Reconstruction ") + (g_config.ray_reconstruction ? "on" : "off") +
-             (g_dlss.rr_available() ? "" : " (not available)") + ", feature " +
+             (g_dlss.rr_available() ? "" : " (not available)") + ", ray tracing " +
+             (RayTracingActive() ? "on" : "off") + ", feature " +
              (g_dlss.has_feature() ? (g_dlss.feature_rr() ? "RR" : "SR") : "none") + ", guides drawn " +
              std::to_string(g_guides_runs.load()) + " times (last frame " + std::to_string(g_guides_frame.load()) +
              ", now " + std::to_string(g_frame.load()) + ")" + (g_rr_guides_failed ? ", guides failed" : "") +
