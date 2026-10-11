@@ -84,6 +84,14 @@ struct SceneParams {
   float camera[3] = {0, 0, 0};
 };
 
+// A constant edit to apply when its command list is submitted after the TAA.
+struct PendingEdit {
+  resource buffer = {0};
+  uint64_t offset = 0;
+  uint32_t count = 0;
+  float values[16] = {};
+};
+
 struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   pipeline current = {0};
   Pass pass = Pass::kOther;
@@ -106,6 +114,12 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   bool has_taa = false;  // the TAA was recorded here
   uint64_t first_target = 0;  // the texture the first draw drew into (part of the signature)
   bool has_ui = false;        // the final UI composite was recorded here: the frame's last list
+  // A list whose kind comes both before and after the TAA (the fire's distortion and sparks, the grace flame):
+  // decided when it is submitted. Its corrected draws are recorded twice under a GPU predicate (slot `pred_slot`,
+  // written at submission) and its constant edits wait for the submission (`edits`).
+  bool dual = false;
+  uint32_t pred_slot = 0;
+  std::vector<struct PendingEdit> edits;
   // Wind: the game's cbSceneParam/cbPerFrame addresses last patched in this command list and the patched slot.
   uint64_t wind_scene = 0, wind_frame = 0, wind_prev = 0;
   bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
@@ -200,6 +214,8 @@ std::unordered_map<uint64_t, Pass> g_pipelines;
 
 std::mutex g_scene_mutex;
 SceneParams g_scene;  // most recent valid scene constants, for command lists without their own
+std::atomic<uint64_t> g_scene_rejected{0};  // scene constants of the right size from other cameras (other depth)
+std::atomic<uint64_t> g_scene_accept_frame{0};
 std::atomic<uint64_t> g_depth{0};
 std::atomic<uint64_t> g_depth_copy{0};
 std::atomic<uint32_t> g_render_width{0};   // the TAA's target size (= output size)
@@ -982,6 +998,10 @@ std::string PipelineName(uint64_t pipeline) {
   return it == g_pipeline_names.end() ? std::string() : it->second;
 }
 
+// While set (CorrectPostPass for a list decided at submission), EditBoundConstants computes its edits into this list
+// instead of writing them.
+thread_local std::vector<PendingEdit>* t_defer = nullptr;
+
 // Edits `count` floats at byte `offset` of the constant buffer bound to `reg` of `stage`, in the upload heap before
 // the GPU reads them (every pass after the TAA has its own allocations: tools/rdc_cbbinds.py). `edit` gets the
 // values and returns whether it changed them. `step` (optional) tells where it stopped: 1 no tracking, 2 no bound
@@ -1023,12 +1043,69 @@ bool EditBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg
   std::memcpy(values, mapped, count * 4);
   const bool changed = edit(values);
   at = changed ? 0 : 6;
-  if (changed) std::memcpy(mapped, values, count * 4);
+  if (changed && t_defer != nullptr) {
+    PendingEdit pending;
+    pending.buffer = range.buffer;
+    pending.offset = range.offset + offset;
+    pending.count = count;
+    std::memcpy(pending.values, values, count * 4);
+    t_defer->push_back(pending);
+  } else if (changed) {
+    std::memcpy(mapped, values, count * 4);
+  }
   dev->unmap_buffer_region(range.buffer);
   return changed;
 }
 
 bool IsShare(float v) { return v > 0.2f && v < 0.999f; }
+
+// GPU predicates for the lists decided at submission: one 64-bit slot per list, 1 = after the TAA. An upload buffer
+// (GENERIC_READ includes the PREDICATION state), mapped for good.
+struct Predicates {
+  static constexpr uint32_t kSlots = 4096;  // about 40 frames of such lists
+  std::mutex mutex;
+  ID3D12Resource* buffer = nullptr;
+  uint64_t* mapped = nullptr;
+  std::atomic<uint32_t> next{0};
+  bool failed = false;
+
+  bool Ready(ID3D12Device* device) {
+    std::lock_guard lock(mutex);
+    if (buffer != nullptr) return true;
+    if (failed || device == nullptr) return false;
+    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = kSlots * sizeof(uint64_t);
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* data = nullptr;
+    const D3D12_RANGE none = {0, 0};
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                               nullptr, IID_PPV_ARGS(&buffer))) ||
+        FAILED(buffer->Map(0, &none, &data))) {
+      if (buffer != nullptr) buffer->Release();
+      buffer = nullptr;
+      failed = true;
+      return false;
+    }
+    buffer->SetName(L"EldenRingDLSS predicates");
+    mapped = static_cast<uint64_t*>(data);
+    std::memset(mapped, 0, kSlots * sizeof(uint64_t));
+    return true;
+  }
+};
+Predicates g_predicates;
+std::atomic<uint64_t> g_dual_lists{0}, g_dual_after{0}, g_dual_draws{0};
+std::atomic<bool> g_dual_enabled{true};  // development (remote "dual on|off"): off = the majority rule alone
+
+// The viewport and scissor a corrected draw needs, when it is recorded twice instead of corrected in place.
+struct DrawFix {
+  bool viewport = false, scissor = false;
+  reshade::api::viewport vp = {};
+  rect sc = {};
+};
 
 // Upscaling at the TAA: corrects a pass recorded after the TAA in the same command list. The engine sized it for the
 // scene's share of the targets; DLSS made the frame full size. Every correction checks the values it replaces, so a
@@ -1036,7 +1113,18 @@ bool IsShare(float v) { return v > 0.2f && v < 0.999f; }
 // and 100% captures): full-size viewports, cbPostProcessCommon's four screen-percentage pairs, the particles'
 // g_dynamicResolution_UVScale and screen sizes, the particle simulation's dynamicResolutionX/Y, and the glow blur's
 // viewport-derived scales.
-void CorrectPostPass(command_list* cmd_list, CmdData& data, bool compute) {
+void CorrectPostPassImpl(command_list* cmd_list, CmdData& data, bool compute, DrawFix* fix);
+
+// For a list decided at submission (`data.dual`), the constant edits wait for the submission and the viewport and
+// scissor go to `fix` for a draw recorded twice; otherwise everything is applied now.
+void CorrectPostPass(command_list* cmd_list, CmdData& data, bool compute, DrawFix* fix = nullptr) {
+  if (!data.dual) return CorrectPostPassImpl(cmd_list, data, compute, nullptr);
+  t_defer = &data.edits;
+  CorrectPostPassImpl(cmd_list, data, compute, fix);
+  t_defer = nullptr;
+}
+
+void CorrectPostPassImpl(command_list* cmd_list, CmdData& data, bool compute, DrawFix* fix) {
   auto* const state = cmd_list->get_private_data<state_tracking>();
   if (state == nullptr) return;
   const std::string name = PipelineName(data.current.handle);
@@ -1072,9 +1160,15 @@ void CorrectPostPass(command_list* cmd_list, CmdData& data, bool compute) {
         viewport full = vp;
         full.width = tw;
         full.height = th;
-        cmd_list->bind_viewports(0, 1, &full);
         const rect scissor = {0, 0, static_cast<int32_t>(tw), static_cast<int32_t>(th)};
-        cmd_list->bind_scissor_rects(0, 1, &scissor);
+        if (fix != nullptr) {
+          fix->viewport = fix->scissor = true;
+          fix->vp = full;
+          fix->sc = scissor;
+        } else {
+          cmd_list->bind_viewports(0, 1, &full);
+          cmd_list->bind_scissor_rects(0, 1, &scissor);
+        }
         old_vp[0] = vp.width, old_vp[1] = vp.height, new_vp[0] = tw, new_vp[1] = th;
         fixed = true;
       }
@@ -1141,7 +1235,12 @@ void CorrectPostPass(command_list* cmd_list, CmdData& data, bool compute) {
       const rect scaled = {static_cast<int32_t>(std::floor(r.left / sx)), static_cast<int32_t>(std::floor(r.top / sy)),
                            (std::min)(tw, static_cast<int32_t>(std::ceil(r.right / sx))),
                            (std::min)(th, static_cast<int32_t>(std::ceil(r.bottom / sy)))};
-      cmd_list->bind_scissor_rects(0, 1, &scaled);
+      if (fix != nullptr) {
+        fix->scissor = true;
+        fix->sc = scaled;
+      } else {
+        cmd_list->bind_scissor_rects(0, 1, &scaled);
+      }
       fixed = true;
       static std::atomic<uint32_t> logged{0};
       if (logged++ < 2)
@@ -2566,6 +2665,39 @@ void TreeDumpDraw(command_list* cmd_list, const CmdData& data, uint32_t instance
   cmd_list->bind_pipeline(pipeline_stage::all, data.current);
 }
 
+// Records a corrected draw of a list decided at submission twice: corrected (runs if the list lands after the TAA)
+// and as the game made it (runs otherwise), chosen by the list's predicate slot. Returns false if it cannot.
+template <typename Draw>
+bool DualDraw(command_list* cmd_list, const CmdData& data, const DrawFix& fix, Draw draw) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  if (state == nullptr || g_predicates.buffer == nullptr) return false;
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  const UINT64 slot = UINT64{data.pred_slot} * sizeof(uint64_t);
+  std::vector<D3D12_VIEWPORT> viewports;
+  for (const viewport& v : state->viewports) viewports.push_back({v.x, v.y, v.width, v.height, v.min_depth, v.max_depth});
+  std::vector<D3D12_RECT> scissors;
+  for (const rect& r : state->scissor_rects) scissors.push_back({r.left, r.top, r.right, r.bottom});
+  if (viewports.empty() || scissors.empty()) return false;
+  // Predication skips the draws while the condition holds: EQUAL_ZERO skips them before the TAA (slot 0).
+  native->SetPredication(g_predicates.buffer, slot, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  if (fix.viewport) {
+    const D3D12_VIEWPORT v = {fix.vp.x, fix.vp.y, fix.vp.width, fix.vp.height, fix.vp.min_depth, fix.vp.max_depth};
+    native->RSSetViewports(1, &v);
+  }
+  if (fix.scissor) {
+    const D3D12_RECT r = {fix.sc.left, fix.sc.top, fix.sc.right, fix.sc.bottom};
+    native->RSSetScissorRects(1, &r);
+  }
+  draw(native);
+  native->SetPredication(g_predicates.buffer, slot, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO);
+  native->RSSetViewports(static_cast<UINT>(viewports.size()), viewports.data());
+  native->RSSetScissorRects(static_cast<UINT>(scissors.size()), scissors.data());
+  draw(native);
+  native->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  ++g_dual_draws;
+  return true;
+}
+
 // The first draw or dispatch names the command list's kind: its pipeline and, for a draw, the texture it draws into.
 // A kind only ever submitted after the TAA (learned in OnExecuteCommandList) is corrected throughout. The target is
 // part of the kind because the particle lists start with the same few pipelines before and after the TAA, depending
@@ -2594,7 +2726,16 @@ void SignList(command_list* cmd_list, CmdData& data, bool draw) {
   {
     std::lock_guard lock(g_kinds_mutex);
     const int state = KindState(data.signature);
-    if (state != 2 && state != 4) return;
+    if (state != 2 && state != 3 && state != 4) return;
+    if (state != 2) {
+      if (!g_dual_enabled.load() || !g_predicates.Ready(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()))) {
+        if (state == 3) return;  // without predicates: the old majority rule
+      } else {
+        data.dual = true;
+        data.pred_slot = g_predicates.next++ % Predicates::kSlots;
+        ++g_dual_lists;
+      }
+    }
   }
   data.post_fix = true;
   data.post_scale[0] = g_last_post_scale_x.load();
@@ -2612,6 +2753,20 @@ void OnExecuteCommandList(command_queue*, command_list* cmd_list) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr || !data->signed_) return;
   std::lock_guard lock(g_kinds_mutex);
+  if (data->dual && g_predicates.mapped != nullptr) {
+    const bool after = g_frame_taa_submitted;
+    g_predicates.mapped[data->pred_slot] = after ? 1 : 0;
+    if (after) {
+      ++g_dual_after;
+      device* const dev = cmd_list->get_device();
+      for (const PendingEdit& e : data->edits) {
+        void* mapped = nullptr;
+        if (!dev->map_buffer_region(e.buffer, e.offset, e.count * 4, map_access::write_only, &mapped)) continue;
+        std::memcpy(mapped, e.values, e.count * 4);
+        dev->unmap_buffer_region(e.buffer);
+      }
+    }
+  }
   g_frame_lists.emplace_back(data->signature, g_frame_taa_submitted);
   if (g_passlog_frame.load() != 0 && g_passlog_frame.load() == g_frame.load()) {
     const int state = KindState(data->signature);
@@ -2753,8 +2908,14 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
-  if (data->post_fix) CorrectPostPass(cmd_list, *data, false);
+  DrawFix fix;
+  if (data->post_fix) CorrectPostPass(cmd_list, *data, false, &fix);
   OnPostPass(cmd_list, *data);
+  if ((fix.viewport || fix.scissor) &&
+      DualDraw(cmd_list, *data, fix, [&](ID3D12GraphicsCommandList* native) {
+        native->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
+      }))
+    return true;
   if (data->pass == Pass::kBlendUi) return false;
   if (g_tree_end.load() != 0) TreeDumpDraw(cmd_list, *data, instance_count);
   if (g_config.wind_motion && g_wind_ready.load() && (g_config.wind_mode == 0 || g_config.wind_trees) &&
@@ -2784,6 +2945,27 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   if (w != 0 && !(scene.width == static_cast<float>(w) && scene.height == static_cast<float>(h)) &&
       !(scene.width == static_cast<float>(iw) && scene.height == static_cast<float>(ih)))
     return false;
+  // The size alone is not enough: at 50% the main camera renders at 1920x1080, the size of a half-resolution
+  // camera at 4K, and its jitter in DLSS made the image jump a few times a second in some places. The main camera
+  // draws into the main depth buffer (the one the motion prep pass reads), other cameras into their own.
+  if (const uint64_t main_depth = g_depth.load(); main_depth != 0) {
+    auto* const state = cmd_list->get_private_data<state_tracking>();
+    const uint64_t bound = state != nullptr && state->depth_stencil != 0
+                               ? cmd_list->get_device()->get_resource_from_view(state->depth_stencil).handle
+                               : 0;
+    // Safety net: if nothing passed for 30 frames, the main camera draws elsewhere after all; accept and say so.
+    if (bound != main_depth) {
+      if (g_frame.load() - g_scene_accept_frame.load() < 30) {
+        ++g_scene_rejected;
+        return false;
+      }
+      static std::atomic<bool> logged{false};
+      if (!logged.exchange(true))
+        Log(reshade::log::level::warning, "No scene constants from draws into the main depth buffer for 30 frames; "
+                                          "accepting them by size alone.");
+    }
+  }
+  g_scene_accept_frame = g_frame.load();
   data->scene = scene;
   data->scene_valid = true;
   {
@@ -2847,7 +3029,8 @@ void ObserveTaaResolution(command_list* cmd_list, float screen[2]) {
   std::memcpy(g_drs_obs.post, post, sizeof(post));
 }
 
-bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t, uint32_t) {
+bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
+            uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
@@ -2882,7 +3065,15 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     if (g_dump_remaining.load() > 0) DumpTaaInputs(cmd_list);
     return ReplaceTaa(cmd_list, *data, screen);
   }
-  if (data->post_fix) CorrectPostPass(cmd_list, *data, false);
+  DrawFix fix;
+  if (data->post_fix) CorrectPostPass(cmd_list, *data, false, &fix);
+  if ((fix.viewport || fix.scissor) &&
+      DualDraw(cmd_list, *data, fix, [&](ID3D12GraphicsCommandList* native) {
+        native->DrawInstanced(vertex_count, instance_count, first_vertex, first_instance);
+      })) {
+    OnPostPass(cmd_list, *data);
+    return true;
+  }
   // Its target is the TAA's input, which already holds the image after a pass-through.
   if (data->pass == Pass::kSharpen && data->taa_passthrough) return true;
   if (data->pass == Pass::kSharpen && data->dlss_applied && vertex_count == 3 && instance_count == 1) {
@@ -3590,6 +3781,14 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "passlog") {
     g_passlog_frame = g_frame.load() + 1;
     result = "logging the next frame's named draws to shots/passlog.txt";
+  } else if (command == "sceneinfo") {
+    result = "scene constants from other cameras rejected: " + std::to_string(g_scene_rejected.load());
+  } else if (command == "dualinfo" || command == "dual") {
+    if (command == "dual" && !arg.empty()) g_dual_enabled = arg != "off";
+    result = std::string(g_dual_enabled.load() ? "on" : "off") + "; lists decided at submission: " +
+             std::to_string(g_dual_lists.load()) + " (" +
+             std::to_string(g_dual_after.load()) + " landed after the TAA), draws recorded twice: " +
+             std::to_string(g_dual_draws.load());
   } else if (command == "postinfo" || command == "postfix") {
     // postfix on|off: correct the passes after the TAA to full size (development)
     if (command == "postfix") g_post_fix = arg != "off";
