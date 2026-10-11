@@ -226,23 +226,58 @@ How games built for RR do it: every effect traced at the render size (1-2 rays p
 (blue noise, importance sampling) and sample reuse (ReSTIR), all inputs RR asks for, and performance from low
 render scales and frame generation rather than many rays. Foliage is hard for RR everywhere.
 
-## Next: replace the shadow ray generation shader (plan, not started)
+## Our own shadow ray generation shader in the game's pipeline (2026-10-11)
 
-The user's call: stop tuning RR around the game's cheap signal and give it a proper one.
+The user's call (2026-10-10): stop tuning RR around the game's cheap signal and give it a proper one. First step done:
+the add-on can run its own ray generation shader for the game's sun shadow dispatch, with the game's scene, hit
+groups and miss shaders.
 
-1. Port `GXRayGen_dirLightShadow` and `GXRayGen_ao` from the DXIL disassembly to HLSL (about 400 IR lines each;
-   bindings: `g_sceneCB` cb0, local `l_rayGenCB` cb16, TLAS t64, local `l_texGBufferNormal` t67 and `l_texDepth` t68,
-   `g_renderOutput` u0; payload `RayPayload_shadow` (one int); ray type indices, cone radius, sample counts, ray
-   lengths and alpha flags from the constants).
-2. One combined shader for the full-size shadow dispatch: the game's shadow rays unchanged, plus AO rays per pixel,
-   the AO written to the shadow output's 4th channel (always 0 in the capture: `tex50009` min/max w = 0). The game's
-   hit groups stay, so alpha-tested foliage stays correct.
-3. Swap it in at pipeline creation: ReShade's `create_pipeline` event receives ray tracing pipelines as subobjects
-   (raygen/miss/hit shaders, libraries) and lets the add-on replace the description. Skip the half-size AO dispatch.
-4. The AO upscale replacement (ao_upscale.hlsl) reads the full-size AO from that channel instead of upscaling, so RR
-   gets per-pixel AO noise at the render size like the shadows. Better sampling (blue noise) can follow in the same
-   shader.
+**The game's shaders** (`tools/rdc_rtlibs.py` dumps every state object's DXIL libraries from a capture; `dxc
+-dumpbin` disassembles them). The ray tracing pipeline (one `CreateStateObject` of type RAYTRACING_PIPELINE) holds
+`GXRayGen`, `GXRayGen_ao`, `GXRayGen_dirLightShadow`, shadow and radiance miss/closest-hit/any-hit shaders, hit
+groups `Model[shadow|radiance]`, `Ignore[...]` and `Dummy`, and ~20 existing collections with the per-material hit
+groups (each a collection with its own closest-hit and alpha-testing any-hit shader). The ray generation and miss
+shaders share local root signature 6723 (`l_rayGenCB` b16, normal t67, depth t68); the global one (6722) has
+`g_sceneCB` b0, the scene t64 and the output u0, all space 0; shader model lib_6_3, payload 12 bytes.
+- `GXRayGen_dirLightShadow` (full render size): world position from the depth and `mtxInvProj`/`mtxCamera`; two
+  random numbers from the pixel and `frameRandom` (the sin hash above); `dirLightShadowSampleCount` rays toward
+  `lightDir` inside a cone (`dirLightShadowConeRadius`, sqrt-radius and van der Corput angle), origin pushed along
+  the normal when `adjustRayStartPosition` is set, 1 ray and no cone beyond `dirLightShadowMaxDist`; flags accept
+  first hit, skip closest hit, cull back faces (+ force opaque unless `enableShadowAlpha`), instance mask 2.
+  Output: (fraction of rays that reach the sky, view depth as a half float split into two bytes, 0).
+- `GXRayGen_ao` (half size; half-size depth, full-size normal at 2x the pixel): the same hash; `aoSampleCount`
+  cosine-weighted rays around the normal (mask 1), up to `aoMaxDist`; output through `aoScaleOffset`, same layout.
+- `l_rayGenCB` is one buffer for all three, so the AO settings are readable in the shadow dispatch.
 
-Check first: that ReShade really passes D3D12 state objects through `create_pipeline` with the libraries (log the
-subobjects), and which channels the shadow denoiser and the composite read (the 4th must survive the pass-through
-denoiser and the copy back into `tex50009`).
+**How ours gets in** (`src/rt_pipeline.*`, `src/rt_raygen.hlsl`):
+- ReShade's `create_pipeline` event cannot change it: when an add-on edits a D3D12 state object, ReShade 6.8
+  rebuilds it from its own description, which drops local root signatures (`case
+  D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE: break;` in its d3d12_device.cpp).
+- So the add-on hooks the native device's `CreateStateObject` (vtable slot 62, checked with `offsetof` on the SDK's
+  C declaration) below ReShade, and appends to the game's pipeline description our DXIL library (exports
+  `ErdlssShadowRayGen`, `ErdlssShadowAoRayGen`) and an association giving them the game's ray generation local root
+  signature. The game's shaders stay; if creation fails, the game's description is used unchanged.
+- At each `DispatchRays` whose ray generation record holds `GXRayGen_dirLightShadow`'s identifier, the add-on copies
+  the record (identifier + the game's local root arguments) into its own upload ring with our identifier and issues
+  the dispatch again with it. The game's shader table is never written (rewriting it could race a frame in flight).
+- Remote `rtgen 0|1|2` (ini `RtShadowRayGen`, read only): the game's shader, our port, our port plus AO at the
+  render size in the output's 4th channel.
+
+**In game** (dev build, 4K at 50%, preset M, RR on, ray tracing Maximum, daytime):
+- The game created its pipeline 8 times while loading; every time with our shaders added, no fallback.
+- The port matches the game's shader: alternating screenshots differ by less than two frames of the same shader
+  (12x12 area means, max 0.8 vs 2.4 levels); GPU 17.36 ms vs 17.37 ms.
+- AO at the render size with the game's 4 rays per pixel: 23.7 ms (+6.4 ms; four times the game's AO rays).
+- Our AO in the 4th channel does not change the image (alternating shots within frame-to-frame noise): the
+  shadow denoiser and the composite do not visibly read it.
+
+**Next:**
+1. AO rays per pixel as a setting (1 at the render size = the game's ray count; what RR expects) and skip the
+   game's half-size AO dispatch while ours runs.
+2. Feed it to RR: the AO upscale replacement (`ao_upscale.hlsl`) reads the 4th channel of the shadow output instead
+   of upscaling the half-size AO. Needs the shadow output texture (the UAV bound to the shadow dispatch, or the
+   shadow denoiser's input) and a check that the 4th channel survives the denoiser pass-through and the copy back.
+3. Better samples in our shader: blue noise instead of the sin hash, per-frame decorrelation for RR.
+4. ReSTIR-style reuse matters once there are many lights to choose from (the local lights, e.g. torches, or GI);
+   for the sun and AO, RR's own temporal accumulation does the reuse. The pipeline already has radiance miss and
+   closest-hit shaders (`GXMiss_radiance`, `GXClosestHit_radiance`, `GXRayGen`), useful for reflections or GI.

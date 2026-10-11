@@ -38,6 +38,7 @@
 #include "hw_breakpoints.hpp"
 #include "render_scale.hpp"
 #include "rr_guides.hpp"
+#include "rt_pipeline.hpp"
 #include "ao_upscale.hpp"
 #include "state_tracking.hpp"
 #include "stretch.hpp"
@@ -484,6 +485,10 @@ void Log(reshade::log::level level, const std::string& message) {
   reshade::log::message(level, ("[ERDLSS] " + message).c_str());
 }
 
+// Which ray generation shader the sun shadow dispatch runs (rt_pipeline.hpp): 0 the game's, 1 our port, 2 our port
+// plus the AO at the render size. Ini RtShadowRayGen (read only), remote "rtgen".
+std::atomic<int> g_rt_shadow_raygen{0};
+
 // --- Configuration -----------------------------------------------------------------------------------------
 
 int ReadInt(const wchar_t* key, int fallback) {
@@ -525,6 +530,7 @@ void LoadConfig() {
   g_config.wind_prepass = ReadInt(L"WindPrepass", 0) != 0;
   g_config.wind_trees = ReadInt(L"WindTrees", 1) != 0;
   g_config.ray_reconstruction = ReadInt(L"RayReconstruction", 0) != 0;
+  g_rt_shadow_raygen = std::clamp(ReadInt(L"RtShadowRayGen", 0), 0, 2);
   g_config.wind_tree_capacity = std::max(1, std::min(ReadInt(L"WindTreeCapacity", 4), 16));
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
@@ -1777,7 +1783,11 @@ void OnInitDevice(device* dev) {
     Log(reshade::log::level::info, "DLSS is available.");
   else
     Log(reshade::log::level::warning, "DLSS unavailable: " + g_dlss.status());
+  if (!erdlss::rt_pipeline::InstallHook(reinterpret_cast<ID3D12Device*>(dev->get_native())))
+    Log(reshade::log::level::warning, "Could not hook CreateStateObject; the shadow ray generation shaders are off.");
 }
+
+void DestroyRayGenRing(device* dev);
 
 void OnDestroyDevice(device* dev) {
   if (dev != g_device) return;
@@ -1798,6 +1808,7 @@ void OnDestroyDevice(device* dev) {
   if (g_exposure != 0) dev->destroy_resource(g_exposure);
   g_exposure = g_exposure_upload = {0};
   g_exposure_mapped = nullptr;
+  DestroyRayGenRing(dev);
   DestroyMask(dev);
   if (g_mask_pipeline != 0) dev->destroy_pipeline(g_mask_pipeline);
   if (g_mask_layout != 0) dev->destroy_pipeline_layout(g_mask_layout);
@@ -3684,9 +3695,85 @@ float FrameRandom(uint64_t frame) {
   return static_cast<float>(v & 0xFFFFFF) / 16777216.0f;
 }
 
-bool OnDispatchRays(command_list* cmd_list, resource raygen, uint64_t raygen_offset, uint64_t raygen_size, resource,
-                    uint64_t, uint64_t, uint64_t, resource, uint64_t, uint64_t, uint64_t, resource, uint64_t, uint64_t,
-                    uint64_t, uint32_t, uint32_t, uint32_t) {
+// The sun shadow dispatch runs one of our ray generation shaders (rt_pipeline.hpp) through a copy of its ray
+// generation record with our shader identifier, in a ring of the add-on's upload memory, and the dispatch is issued
+// again with that record. The game's shader table stays untouched (rewriting it could race a frame in flight).
+constexpr uint32_t kRayGenSlots = 16;
+constexpr uint32_t kRayGenSlotBytes = 256;  // multiple of the 64-byte shader table alignment
+std::mutex g_raygen_ring_mutex;
+resource g_raygen_ring = {0};
+uint8_t* g_raygen_ring_mapped = nullptr;
+bool g_raygen_ring_failed = false;
+std::atomic<uint32_t> g_raygen_ring_next{0};
+std::atomic<uint64_t> g_rt_raygen_redirects{0}, g_rt_raygen_unmapped{0};
+
+bool EnsureRayGenRing(device* dev) {
+  std::lock_guard lock(g_raygen_ring_mutex);
+  if (g_raygen_ring != 0) return true;
+  if (g_raygen_ring_failed) return false;
+  const resource_desc desc(kRayGenSlots * kRayGenSlotBytes, memory_heap::upload, resource_usage::shader_resource);
+  void* mapped = nullptr;
+  if (!dev->create_resource(desc, nullptr, resource_usage::cpu_access, &g_raygen_ring) ||
+      !dev->map_buffer_region(g_raygen_ring, 0, UINT64_MAX, map_access::write_only, &mapped)) {
+    Log(reshade::log::level::error, "Could not create the ray generation record ring; using the game's shader.");
+    if (g_raygen_ring != 0) dev->destroy_resource(g_raygen_ring);
+    g_raygen_ring = {0};
+    g_raygen_ring_failed = true;
+    return false;
+  }
+  dev->set_resource_name(g_raygen_ring, "EldenRingDLSS ray generation records");
+  g_raygen_ring_mapped = static_cast<uint8_t*>(mapped);
+  return true;
+}
+
+void DestroyRayGenRing(device* dev) {
+  std::lock_guard lock(g_raygen_ring_mutex);
+  if (g_raygen_ring == 0) return;
+  dev->unmap_buffer_region(g_raygen_ring);
+  dev->destroy_resource(g_raygen_ring);
+  g_raygen_ring = {0};
+  g_raygen_ring_mapped = nullptr;
+}
+
+// True when the dispatch was issued with our ray generation shader (the caller then skips the game's).
+bool RedirectShadowRayGen(command_list* cmd_list, resource raygen, uint64_t raygen_offset, uint64_t raygen_size,
+                          resource miss, uint64_t miss_offset, uint64_t miss_size, uint64_t miss_stride, resource hit,
+                          uint64_t hit_offset, uint64_t hit_size, uint64_t hit_stride, resource callable,
+                          uint64_t callable_offset, uint64_t callable_size, uint64_t callable_stride, uint32_t width,
+                          uint32_t height, uint32_t depth) {
+  const auto wanted = static_cast<erdlss::ShadowRayGen>(g_rt_shadow_raygen.load());
+  if (wanted == erdlss::ShadowRayGen::kGame || raygen_size < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES ||
+      raygen_size > kRayGenSlotBytes)
+    return false;
+  device* const dev = cmd_list->get_device();
+  resource buffer = raygen;
+  uint64_t offset = raygen_offset;
+  void* mapped = nullptr;
+  if (!ResolveUpload(&buffer, &offset, raygen_size) ||
+      !dev->map_buffer_region(buffer, offset, raygen_size, map_access::read_only, &mapped)) {
+    ++g_rt_raygen_unmapped;
+    return false;
+  }
+  uint8_t record[kRayGenSlotBytes];
+  std::memcpy(record, mapped, static_cast<size_t>(raygen_size));
+  dev->unmap_buffer_region(buffer);
+  uint8_t id[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES];
+  if (!erdlss::rt_pipeline::Replacement(record, wanted, id) || !EnsureRayGenRing(dev)) return false;
+  std::memcpy(record, id, sizeof(id));  // the local root arguments after the identifier stay the game's
+  const uint64_t slot = (g_raygen_ring_next++ % kRayGenSlots) * uint64_t{kRayGenSlotBytes};
+  std::memcpy(g_raygen_ring_mapped + slot, record, static_cast<size_t>(raygen_size));
+  cmd_list->dispatch_rays(g_raygen_ring, slot, raygen_size, miss, miss_offset, miss_size, miss_stride, hit, hit_offset,
+                          hit_size, hit_stride, callable, callable_offset, callable_size, callable_stride, width,
+                          height, depth);
+  ++g_rt_raygen_redirects;
+  return true;
+}
+
+bool OnDispatchRays(command_list* cmd_list, resource raygen, uint64_t raygen_offset, uint64_t raygen_size,
+                    resource miss, uint64_t miss_offset, uint64_t miss_size, uint64_t miss_stride, resource hit,
+                    uint64_t hit_offset, uint64_t hit_size, uint64_t hit_stride, resource callable,
+                    uint64_t callable_offset, uint64_t callable_size, uint64_t callable_stride, uint32_t width,
+                    uint32_t height, uint32_t depth) {
   ++g_rt_rays;
   g_last_rays_frame = g_frame.load();
   EditRayGenSamples(cmd_list->get_device(), raygen, raygen_offset, raygen_size);
@@ -3719,7 +3806,10 @@ bool OnDispatchRays(command_list* cmd_list, resource raygen, uint64_t raygen_off
       }
     }
   }
-  return (g_rt_skip.load() & 4) != 0;
+  if ((g_rt_skip.load() & 4) != 0) return true;
+  return RedirectShadowRayGen(cmd_list, raygen, raygen_offset, raygen_size, miss, miss_offset, miss_size, miss_stride,
+                              hit, hit_offset, hit_size, hit_stride, callable, callable_offset, callable_size,
+                              callable_stride, width, height, depth);
 }
 
 bool KeyPressed(int vk) {
@@ -4200,6 +4290,12 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "passlog") {
     g_passlog_frame = g_frame.load() + 1;
     result = "logging the next frame's named draws to shots/passlog.txt";
+  } else if (command == "rtgen") {
+    // rtgen [0|1|2]: the sun shadow dispatch's ray generation shader: the game's, our port, our port + render-size AO
+    if (!arg.empty()) g_rt_shadow_raygen = std::clamp(std::atoi(arg.c_str()), 0, 2);
+    result = "shadow ray generation " + std::to_string(g_rt_shadow_raygen.load()) + "; " +
+             erdlss::rt_pipeline::Status() + "; redirected " + std::to_string(g_rt_raygen_redirects.load()) + ", unmapped " +
+             std::to_string(g_rt_raygen_unmapped.load());
   } else if (command == "rtsamples") {
     if (!arg.empty()) {
       g_rt_ao_samples = static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 0, 16));
@@ -4457,6 +4553,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_overlay(nullptr, OnOverlay);
       break;
     case DLL_PROCESS_DETACH:
+      erdlss::rt_pipeline::RemoveHook();
       reshade::unregister_addon(module);
       break;
   }

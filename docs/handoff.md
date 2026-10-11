@@ -124,8 +124,12 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
 2c. Ray Reconstruction (dev only, 2026-10-10): works end to end (guides from the G-buffer at the sun light pass, raw
    shadows, automatic switch with ray tracing), +1.9 ms over DLSS M at 50%; keeps grass shadows and ghosts less than
    the game's denoiser, but at 50% the grass shimmers because the game's raw signal is thin (AO at half size, few
-   rays). **Next session:** replace the shadow ray generation shader with one that also traces full-size AO
-   (docs/raytracing.md, "Next: replace the shadow ray generation shader"). The everyday install keeps DLSS M.
+   rays). The everyday install keeps DLSS M.
+2d. Own shadow ray generation shader (dev only, 2026-10-11): the add-on adds its shaders to the game's ray tracing
+   pipeline through a native `CreateStateObject` hook (ReShade's pipeline events drop local root signatures) and
+   runs them for the sun shadow dispatch (remote `rtgen 0|1|2`). The port matches the game's shadows at the same
+   cost; AO at the render size works but costs +6.4 ms at the game's 4 rays. **Next session:** 1 AO ray per pixel,
+   skip the game's half-size AO, feed our AO to RR (docs/raytracing.md, "Our own shadow ray generation shader").
 3. Hear how the everyday install at 67% plays over longer sessions and other areas.
 4. Performance: the stretch passes and the full-size post-processing cost about 1 ms; check what is worth saving.
 5. Robustness: scale changes at runtime (barrier listener), resolution changes (filter and target recreation), the
