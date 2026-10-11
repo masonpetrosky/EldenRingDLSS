@@ -269,6 +269,8 @@ erdlss::RrGuides g_rr_guides;
 bool g_rr_guides_failed = false;
 std::atomic<uint64_t> g_guides_frame{0}, g_guides_runs{0};
 std::atomic<bool> g_rr_active{false};
+std::atomic<int> g_rr_preset{0};  // remote "rrpreset 0|4|5|6": NVIDIA's default (F), D, E (transformer) or F
+std::string g_rr_dump_name;  // remote "rrdump <name>": the next RR frame's guides and noisy color (under g_dump_mutex)
 // The scene color the TAA reads (its SourceTex), for the pass log. (Not a rule for corrections: the game draws into it
 // again after the TAA.)
 std::atomic<uint64_t> g_taa_source{0};
@@ -1457,8 +1459,8 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   }
   if (!g_dlss.has_feature()) {
     const bool created =
-        g_dlss.Create(native, width, height, create_w, create_h, g_config.render_scale, g_config.preset, true,
-                      !game_exposure, want_rr);
+        g_dlss.Create(native, width, height, create_w, create_h, g_config.render_scale,
+                      want_rr ? g_rr_preset.load() : g_config.preset, true, !game_exposure, want_rr);
     RestoreState(cmd_list, data);
     if (!created) {
       g_config.enabled = false;
@@ -1491,6 +1493,21 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
     in.specular_albedo = g_rr_guides.specular_albedo();
   }
   g_rr_active = g_dlss.feature_rr();
+  if (g_dlss.feature_rr()) {
+    std::lock_guard dump_lock(g_dump_mutex);
+    if (!g_rr_dump_name.empty()) {
+      const uint64_t frame = g_frame.load();
+      const std::string& n = g_rr_dump_name;
+      CopyToReadback(cmd_list, resource{reinterpret_cast<uint64_t>(in.normal_roughness)}, frame, n + "_normal",
+                     resource_usage::shader_resource_non_pixel);
+      CopyToReadback(cmd_list, resource{reinterpret_cast<uint64_t>(in.diffuse_albedo)}, frame, n + "_diffuse",
+                     resource_usage::shader_resource_non_pixel);
+      CopyToReadback(cmd_list, resource{reinterpret_cast<uint64_t>(in.specular_albedo)}, frame, n + "_specular",
+                     resource_usage::shader_resource_non_pixel);
+      CopyToReadback(cmd_list, color, frame, n + "_color");
+      g_rr_dump_name.clear();
+    }
+  }
   in.bias_mask = masked ? reinterpret_cast<ID3D12Resource*>(g_mask.handle) : nullptr;
   in.width = in_width;
   in.height = in_height;
@@ -3253,7 +3270,12 @@ std::atomic<int> g_rt_constrain{-1};        // remote "rtconstrain 0|1|-1": its 
 // gets the raw ray traced shadows and AO, as Ray Reconstruction wants them. rtskip 8 skips the denoiser dispatches
 // altogether (their outputs keep the last values; for measuring their cost).
 std::atomic<bool> g_rt_raw{false};
-bool RawDenoise() { return g_rt_raw.load() || g_rr_active.load(); }
+// remote "rrraw none|shadows|all": what the game's denoiser passes through while RR runs. The shadows are traced at
+// the render size, the AO at half of it and upscaled afterwards, so raw AO reaches RR as 2x2 blocks of noise, which RR
+// cannot tell from detail; "shadows" keeps the game's AO denoiser (the half-size pass and the a-trous filters).
+std::atomic<int> g_rr_raw_mode{1};
+int RawMode() { return g_rt_raw.load() ? 2 : g_rr_active.load() ? g_rr_raw_mode.load() : 0; }
+bool RawDenoise() { return RawMode() != 0; }
 std::atomic<uint64_t> g_rt_anim{0}, g_rt_refits{0}, g_rt_skipped{0}, g_rt_rays{0}, g_rt_tlas{0}, g_rt_edits{0};
 std::atomic<uint64_t> g_rt_denoise{0};    // denoiser dispatches seen
 std::atomic<uint64_t> g_rt_edit_fail[7];  // where the denoiser edit stopped (EditBoundConstants `step`)
@@ -3401,7 +3423,7 @@ bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
       return true;
   } else if ((g_rt_skip.load() & 8) && name.rfind("GXRtPost_", 0) == 0) {
     return true;
-  } else if (RawDenoise() && name == "GXRtPost_DenoiseATrousFilter") {
+  } else if (RawMode() == 2 && name == "GXRtPost_DenoiseATrousFilter") {
     // g_denoiseParam (b0): blendWeight at byte 136 (1 and 0.4 in the game's two passes); 0 keeps the input
     EditBoundConstants(cmd_list, shader_stage::compute, 0, 136, 1, [](float* v) {
       if (v[0] == 0.0f) return false;
@@ -3410,12 +3432,22 @@ bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
     });
   } else if (name == "GXRtPost_VarianceGuidedShadow") {
     ++g_rt_denoise;
-    const float weight = RawDenoise() ? 0.0001f : g_rt_feedback.load();
-    const int constrain = RawDenoise() ? 0 : g_rt_constrain.load();
+    // g_denoiseParam (b0) starts with TextureRect (uint2): the render size for the shadows, half of it for the AO.
+    bool shadows = true;
+    if (RawMode() == 1)
+      EditBoundConstants(cmd_list, shader_stage::compute, 0, 0, 1, [&shadows](float* v) {
+        uint32_t width = 0;
+        std::memcpy(&width, v, sizeof(width));
+        shadows = width + 4 >= g_input_width.load();
+        return false;
+      });
+    const bool pass_raw = RawMode() == 2 || (RawMode() == 1 && shadows);
+    const float weight = pass_raw ? 0.0001f : g_rt_feedback.load();
+    const int constrain = pass_raw ? 0 : g_rt_constrain.load();
     // g_denoiseParam (b0): int enableConstrain at byte 16, int denoiseWidth at 20, float feedbackWeight at 24
     if (weight > 0.0f || constrain >= 0) {
       int step = 0;
-      const bool raw = RawDenoise();
+      const bool raw = pass_raw;
       if (EditBoundConstants(cmd_list, shader_stage::compute, 0, 16, 3, [weight, constrain, raw](float* v) {
             if (v[2] <= 0.0f || v[2] >= 1.0f) return false;  // not the layout this expects
             if (weight > 0.0f) v[2] = weight;
@@ -3955,6 +3987,19 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "passlog") {
     g_passlog_frame = g_frame.load() + 1;
     result = "logging the next frame's named draws to shots/passlog.txt";
+  } else if (command == "rrraw" || command == "rrpreset") {
+    if (command == "rrraw" && !arg.empty()) g_rr_raw_mode = arg == "none" ? 0 : arg == "all" ? 2 : 1;
+    if (command == "rrpreset" && !arg.empty()) {
+      g_rr_preset = std::atoi(arg.c_str());
+      g_recreate = true;
+    }
+    static const char* const kRaw[3] = {"none", "shadows", "all"};
+    result = std::string("raw ") + kRaw[std::clamp(g_rr_raw_mode.load(), 0, 2)] + ", RR preset " +
+             std::to_string(g_rr_preset.load()) + "; " + g_dlss.status();
+  } else if (command == "rrdump") {
+    std::lock_guard lock(g_dump_mutex);
+    g_rr_dump_name = arg.empty() ? "rr" : arg;
+    result = "dumping the next Ray Reconstruction frame's guides to shots/" + g_rr_dump_name + "_*.bin";
   } else if (command == "rr") {
     // rr on|off: Ray Reconstruction instead of super resolution (saved)
     if (!arg.empty()) {

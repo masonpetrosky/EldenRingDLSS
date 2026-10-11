@@ -129,6 +129,16 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
   if (!available_ || (ray_reconstruction && !rr_available_)) return false;
   ReleaseFeature();
   for (const Mode& m : kModes) NVSDK_NGX_Parameter_SetUI(params_, m.preset_hint, static_cast<unsigned>(preset));
+  // Ray Reconstruction's presets (0 default, 4 D, 5 E, 6 F) have their own hints.
+  static const char* const kRrHints[] = {
+      NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA,
+      NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality,
+      NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality,
+      NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced,
+      NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance,
+      NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance};
+  if (ray_reconstruction)
+    for (const char* hint : kRrHints) NVSDK_NGX_Parameter_SetUI(params_, hint, static_cast<unsigned>(preset));
 
   // The smallest render size the mode accepts; the feature is created for the size the game renders at, not the
   // mode's largest (that would make presets L and M cost a full-size input).
@@ -191,8 +201,9 @@ bool Dlss::Create(ID3D12GraphicsCommandList* cmd, uint32_t width, uint32_t heigh
   auto_exposure_ = auto_exposure;
   rr_ = ray_reconstruction;
   char text[192];
-  std::snprintf(text, sizeof(text), "running %s%s, render %ux%u to %ux%u, output %ux%u (%s)",
-                ray_reconstruction ? "Ray Reconstruction " : "", mode.name, min_w, min_h, max_w, max_h, width, height,
+  std::snprintf(text, sizeof(text), "running %s%s (preset %d), render %ux%u to %ux%u, output %ux%u (%s)",
+                ray_reconstruction ? "Ray Reconstruction " : "", mode.name, preset, min_w, min_h, max_w, max_h, width,
+                height,
                 ray_reconstruction ? "no exposure"
                 : !hdr             ? "after tonemapping"
                 : auto_exposure    ? "auto-exposure"
