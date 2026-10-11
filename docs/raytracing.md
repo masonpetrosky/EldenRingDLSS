@@ -293,12 +293,21 @@ shaders share local root signature 6723 (`l_rayGenCB` b16, normal t67, depth t68
   random toroidal shift and a random value rotation (Cranley-Patterson) from `frameRandom`, so every frame is
   spatially blue and frames differ. Same cost as PCG (12.68 ms both). User, switching live: "not a big difference
   but I think blue is a little less noisy". Dev install default: `RtShadowRayGen=3`.
+- Temporal blue noise (`rtgen 4`, `ErdlssShadowAoTemporalRayGen`): the add-on writes the frame number into
+  `g_sceneCB`'s padding after `frameRandom` (`padd4`, byte 244) at the shadow dispatch; each pixel steps its
+  blue-noise value along the R2 sequence (fixed point, exact for any frame). Same cost; the user saw no difference
+  from mode 3 ("they look the same"). Kept as an option; mode 3 stays the default.
+- A spot the user found noisy at 50% stayed noisy with the game's AO (`rtgen 0`), with the game's shadow denoiser
+  back on (`rrraw none`) and with RR off (DLSS SR, preset M): not the ray traced signals. Calmer at full size
+  (DLAA) and mostly calmer at 67%: the 50% upscale of fine grass. Cost there (RR, ray tracing Maximum): 50% 58.2
+  fps / 17.1 ms, 58% 49.3 / 20.2 ms, 67% 45.8 / 21.8 ms. The user chose 50% (frame rate also helps the temporal
+  accumulation). NVIDIA's RR guide (SDK 310.9.1, 3.13) recommends the default preset (F) for all modes; its
+  responsivity mask (preset F only; negative values favor stability over responsiveness) is a lever for that grass.
 
 **Next:**
 1. Sun shadow rays: 1 per pixel with RR, as for the AO (the game uses 2 on Maximum), or more only in wide
    penumbrae; measure and look.
-2. Temporal blue noise (a frame index in `g_sceneCB`'s padding, e.g. `padd4`, for golden-ratio animation or
-   spatiotemporal blue noise) if RR's accumulation benefits.
+2. RR's responsivity mask on vegetation (negative: steadier grass at 50%).
 3. Without RR: a denoiser for our AO, or keep the game's path (current).
 4. ReSTIR-style reuse matters once there are many lights to choose from (the local lights, e.g. torches, or GI);
    for the sun and AO, RR's own temporal accumulation does the reuse. The pipeline already has radiance miss and

@@ -8,6 +8,9 @@
 // frame (from frameRandom, fresh every frame) and per stream (shadow and AO rays apart). ErdlssShadowAoBlueRayGen
 // draws them from blue-noise tiles instead (blue_noise.hlsli), so each frame's samples are spread evenly over the
 // screen: the shader can only use the game's bindings, so the tiles are a constant array rather than a texture.
+// ErdlssShadowAoTemporalRayGen animates the blue noise over frames instead of shuffling it: each pixel steps its
+// blue-noise value along the R2 sequence, so a pixel's successive samples cover the directions evenly (low discrepancy
+// in time, which Ray Reconstruction's accumulation converges on faster) while every frame stays spatially blue.
 
 #include "blue_noise.hlsli"
 // The bindings are the game's: the global root signature's g_sceneCB (b0), scene (t64) and output (u0), and the
@@ -32,6 +35,7 @@ cbuffer g_sceneCB : register(b0) {
   int4 g_debug;
   float4 g_clipToView[4];  // one register per view component (column_major float4x4 mtxInvProj)
   float g_frameRandom;
+  uint g_frameIndex;  // the game's padding (padd4); the add-on writes the frame number here for ErdlssShadowAoTemporalRayGen
 };
 
 cbuffer l_rayGenCB : register(b16) {
@@ -105,6 +109,15 @@ float2 PixelBlueNoise(uint2 pixel, uint stream) {
   const uint2 shift = uint2(seed & 0xFFFF, seed >> 16) % kBlueNoiseSize;
   const float2 rotation = float2(Pcg(seed) >> 8, Pcg(seed ^ 0x9E3779B9u) >> 8) / 16777216.0f;
   return frac(float2(BlueNoise(pixel + shift, 0), BlueNoise(pixel + shift, 1)) + rotation);
+}
+
+// Blue noise animated by frame: the pixel's blue-noise value plus frame * (R2's constants 0.7548776662, 0.5698402910),
+// modulo 1, in 32-bit fixed point so it stays exact for any frame number. Streams use the tiles at fixed offsets.
+float2 PixelTemporalBlueNoise(uint2 pixel, uint stream) {
+  const uint2 p = pixel + stream * uint2(32, 21);
+  const float2 base = float2(BlueNoise(p, stream & 1), BlueNoise(p, (stream + 1) & 1));
+  const uint2 step = g_frameIndex * uint2(3242174890u, 2447445414u);
+  return frac(base + float2(step >> 8) / 16777216.0f);
 }
 
 float RadicalInverse(uint i) {
@@ -239,4 +252,10 @@ void ErdlssShadowAoRayGen() {
 void ErdlssShadowAoBlueRayGen() {
   const Surface s = LoadSurface();
   Store(s, SunShadow(s, PixelBlueNoise(s.pixel, 0)), AmbientOcclusion(s, PixelBlueNoise(s.pixel, 1)));
+}
+
+[shader("raygeneration")]
+void ErdlssShadowAoTemporalRayGen() {
+  const Surface s = LoadSurface();
+  Store(s, SunShadow(s, PixelTemporalBlueNoise(s.pixel, 0)), AmbientOcclusion(s, PixelTemporalBlueNoise(s.pixel, 1)));
 }

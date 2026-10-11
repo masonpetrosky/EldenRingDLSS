@@ -22,6 +22,7 @@ enum class ShadowRayGen : int {
   kPort = 1,    // ErdlssShadowRayGen: the same shader, ported (should match the game's output)
   kPortAo = 2,  // ErdlssShadowAoRayGen: plus the AO at the render size in the output's 4th channel, PCG noise
   kPortAoBlue = 3,  // ErdlssShadowAoBlueRayGen: the same with blue noise
+  kPortAoTemporal = 4,  // ErdlssShadowAoTemporalRayGen: blue noise animated over frames (needs the frame index)
 };
 
 namespace rt_pipeline {

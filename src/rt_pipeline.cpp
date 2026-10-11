@@ -22,6 +22,7 @@ constexpr wchar_t kGameAoExport[] = L"GXRayGen_ao";
 constexpr wchar_t kPortExport[] = L"ErdlssShadowRayGen";
 constexpr wchar_t kPortAoExport[] = L"ErdlssShadowAoRayGen";
 constexpr wchar_t kPortAoBlueExport[] = L"ErdlssShadowAoBlueRayGen";
+constexpr wchar_t kPortAoTemporalExport[] = L"ErdlssShadowAoTemporalRayGen";
 // offsetof(ID3D12Device5Vtbl, CreateStateObject) / sizeof(void*) in the Windows SDK's C declaration of the interface
 // (COM vtable layouts never change).
 constexpr size_t kCreateStateObjectSlot = 62;
@@ -37,6 +38,7 @@ struct Identifiers {
   uint8_t port[kIdSize];
   uint8_t port_ao[kIdSize];
   uint8_t port_ao_blue[kIdSize];
+  uint8_t port_ao_temporal[kIdSize];
   uint8_t game_ao[kIdSize];
 };
 
@@ -67,13 +69,16 @@ void SaveIdentifiers(ID3D12StateObject* pipeline) {
   const void* port = properties->GetShaderIdentifier(kPortExport);
   const void* port_ao = properties->GetShaderIdentifier(kPortAoExport);
   const void* port_ao_blue = properties->GetShaderIdentifier(kPortAoBlueExport);
+  const void* port_ao_temporal = properties->GetShaderIdentifier(kPortAoTemporalExport);
   const void* game_ao = properties->GetShaderIdentifier(kGameAoExport);
-  if (game != nullptr && port != nullptr && port_ao != nullptr && port_ao_blue != nullptr && game_ao != nullptr) {
+  if (game != nullptr && port != nullptr && port_ao != nullptr && port_ao_blue != nullptr &&
+      port_ao_temporal != nullptr && game_ao != nullptr) {
     Identifiers ids;
     std::memcpy(ids.game, game, kIdSize);
     std::memcpy(ids.port, port, kIdSize);
     std::memcpy(ids.port_ao, port_ao, kIdSize);
     std::memcpy(ids.port_ao_blue, port_ao_blue, kIdSize);
+    std::memcpy(ids.port_ao_temporal, port_ao_temporal, kIdSize);
     std::memcpy(ids.game_ao, game_ao, kIdSize);
     std::lock_guard lock(g_mutex);
     if (g_pipelines.size() >= 8) g_pipelines.erase(g_pipelines.begin());
@@ -126,11 +131,12 @@ HRESULT STDMETHODCALLTYPE HookedCreateStateObject(ID3D12Device5* self, const D3D
   }
   D3D12_EXPORT_DESC exports[] = {{kPortExport, nullptr, D3D12_EXPORT_FLAG_NONE},
                                  {kPortAoExport, nullptr, D3D12_EXPORT_FLAG_NONE},
-                                 {kPortAoBlueExport, nullptr, D3D12_EXPORT_FLAG_NONE}};
-  const D3D12_DXIL_LIBRARY_DESC library = {{kRtRayGen, sizeof(kRtRayGen)}, 3, exports};
+                                 {kPortAoBlueExport, nullptr, D3D12_EXPORT_FLAG_NONE},
+                                 {kPortAoTemporalExport, nullptr, D3D12_EXPORT_FLAG_NONE}};
+  const D3D12_DXIL_LIBRARY_DESC library = {{kRtRayGen, sizeof(kRtRayGen)}, 4, exports};
   extended.push_back({D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &library});
-  LPCWSTR names[] = {kPortExport, kPortAoExport, kPortAoBlueExport};
-  associations.push_back({&extended[local_root_signature], 3, names});
+  LPCWSTR names[] = {kPortExport, kPortAoExport, kPortAoBlueExport, kPortAoTemporalExport};
+  associations.push_back({&extended[local_root_signature], 4, names});
   extended.push_back({D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, &associations.back()});
 
   const D3D12_STATE_OBJECT_DESC extended_desc = {desc->Type, static_cast<UINT>(extended.size()), extended.data()};
@@ -182,12 +188,14 @@ bool Replacement(const void* current, ShadowRayGen wanted, void* out) {
   std::lock_guard lock(g_mutex);
   for (const Identifiers& ids : g_pipelines) {
     if (std::memcmp(current, ids.game, kIdSize) != 0 && std::memcmp(current, ids.port, kIdSize) != 0 &&
-        std::memcmp(current, ids.port_ao, kIdSize) != 0 && std::memcmp(current, ids.port_ao_blue, kIdSize) != 0)
+        std::memcmp(current, ids.port_ao, kIdSize) != 0 && std::memcmp(current, ids.port_ao_blue, kIdSize) != 0 &&
+        std::memcmp(current, ids.port_ao_temporal, kIdSize) != 0)
       continue;
     const uint8_t* const want = wanted == ShadowRayGen::kPort         ? ids.port
                                 : wanted == ShadowRayGen::kPortAo     ? ids.port_ao
                                 : wanted == ShadowRayGen::kPortAoBlue ? ids.port_ao_blue
-                                                                      : ids.game;
+                                : wanted == ShadowRayGen::kPortAoTemporal ? ids.port_ao_temporal
+                                                                          : ids.game;
     if (std::memcmp(current, want, kIdSize) == 0) return false;
     std::memcpy(out, want, kIdSize);
     return true;
