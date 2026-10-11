@@ -23,12 +23,12 @@ the tonemapped image at the final composite.
 Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
-  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit a4ad1e0, installed 2026-10-10 late evening with the
+  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit 91d6b47, installed 2026-10-10 late evening with the
   user's OK: 50% with preset M (the user's choice; NVIDIA's default for Performance), DLSS jitter from the TAA
   filter's counter (the scene constants were a frame stale in 2-3% of frames, which made M and L judder), the
   distortion/sparks/grace-flame fixes, the distance-based ray tracing refits. Its ini: `Preset=13`,
   `RenderScale=0.50`, game sharpening off, game exposure on, chromatic aberration off, `WindMotion=1`, `WindMode=1`,
-  `WindTrees=1`. Backups in `build\everyday-backup\`: 30725e0 (58%, K), 5ccb6f2 (67%, K), 6e672fa (DLAA). Only
+  `WindTrees=1`. Backups in `build\everyday-backup\`: b2ac485 (58%, K), 7182d94 (67%, K), f0e8c12 (DLAA). Only
   update it with the user's explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
 - **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLLs including `nvngx_dlssd.dll`):
   test builds only. Latest build (2026-10-10 night): DLSS Ray Reconstruction (`RayReconstruction=1` in its ini, used
@@ -132,6 +132,6 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
 
 ## Recent commits
 
-See `git log`; the latest work (2026-10-10): DLSS jitter from the TAA filter's counter (a4ad1e0), list kinds
-decided at submission with GPU predicates (483dc7d, 30725e0), the fire and grace fixes (bca896f), Ray
-Reconstruction (98e203c and later), raw AO and rays-per-pixel switches (c641558, 657677a).
+See `git log`; the latest work (2026-10-10): DLSS jitter from the TAA filter's counter (91d6b47), list kinds
+decided at submission with GPU predicates (c42f3de, b2ac485), the fire and grace fixes (67f97f5), Ray
+Reconstruction (1219002 and later), raw AO and rays-per-pixel switches (2a6b4a6, 7b79d8d).

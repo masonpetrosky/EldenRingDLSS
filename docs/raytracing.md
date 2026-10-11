@@ -83,7 +83,7 @@ DLSS presets L and M cost what the size the feature is created for costs (DLSS p
 | Performance (1080p) | M | 2160p / 1080p | 5.87 / 2.15 ms |
 | Performance (1080p) | L | 1080p | 2.72 ms |
 
-Fixed in commit 3c76c9d: the feature is created for the engine's render size. NVIDIA's table for the same case
+Fixed in commit 41e83fa: the feature is created for the engine's render size. NVIDIA's table for the same case
 (Performance, 4K): RTX 5070 K 2.11 / M 2.98 ms, RTX 5080 K 1.31 / M 1.74 ms. M is meant for upscaling; at DLAA it is
 3.6x K. (Luma's Persona 5 Royal mod creates DLSS for the real render size, so its M cost there likely came from
 running at native resolution, where M is expensive.)
@@ -201,7 +201,7 @@ specular, sky defaults).
 
 ## Ray Reconstruction: the raw signal (2026-10-10, night)
 
-Findings from the session after "first in-game results" (dev build 657677a and later):
+Findings from the session after "first in-game results" (dev build 7b79d8d and later):
 
 - **The game's randomness is fine per frame.** Extracted the ray tracing shaders from the capture (DXIL libraries in
   `CreateStateObject`; `dxc -dumpbin`): ray generation `GXRayGen`, `GXRayGen_ao`, `GXRayGen_dirLightShadow`, miss
