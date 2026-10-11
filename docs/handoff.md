@@ -13,7 +13,7 @@ with DLSS. Full history and measurements are in `docs/recon.md`; this file is th
 | 3. Upscaling (render below native, DLSS upscales) | Works; in the everyday install at 50% with preset M |
 | Ray tracing cost (distance-based BLAS refits) | Done, in the everyday install (halves the RT cost on Maximum) |
 | DLSS Ray Reconstruction | Works in the dev install; image limited by the game's raw signal (see below) |
-| 4. Release | Source published on GitHub (2026-10-10, at the user's request); no binaries |
+| 4. Release | Source on GitHub (2026-10-10); release zip v0.1.0 (`tools/package.ps1`, tested in game 2026-10-11) |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -42,7 +42,9 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 - Ask the user to be at the PC before launching the game, and wait for "ready" (loaded in, controls released)
   before in-game tests. Never load into the world without them (their character could be attacked).
 - HDR: the vanilla game starts in SDR and switches to HDR at the first main-menu click. ReShade.log's output line
-  never sees the switch, so don't conclude HDR is off from it. RenderDoc sessions do save HDR off; remind the user to
+  never sees the switch, so don't conclude HDR is off from it. Remote `capture` shots carry the same stale tag (space 1
+  in the .txt while the image is HDR10 PQ, e.g. the 2026-10-11 showcase shots); if a converted shot looks flat and
+  grey, decode it as PQ (space 3). RenderDoc sessions do save HDR off; remind the user to
   turn it back on after one. A "Game output: 2560x1600 ... SDR" line means the monitor is off or the user is remote.
 - If a launch hangs before the game creates its device (no "Redirecting D3D12CreateDevice" in ReShade.log, process
   not responding) and a relaunch fails with "Steam is required", Steam still lists the game as running: the user

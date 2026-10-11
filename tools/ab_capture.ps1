@@ -24,9 +24,12 @@
 # screenshot and frame times; the same without the corrections; then DLAA (scale 1) and the game TAA.
 # -Round windport: the ported-shader path (WindMode=1): screenshots wind off/on, motion dumps with the game's time
 # step and with wind off, frame times with everything on, without the merge, and with wind off.
+# -Round showcase: README comparison: DLSS at render scale 0.50 and 0.67, DLAA and the game TAA, each a screenshot and
+# a 5 s frame-time log. Start the game with RenderScale=0.50 (upscaling needs a scale below 1 at startup); ends at 0.50.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
-               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe', 'upscale')][string]$Round = 'sharpen',
+               'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe', 'upscale',
+               'showcase')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -222,6 +225,12 @@ if ($Round -eq 'sharpen') {
   Send 'scale 1' 5.0; Send 'scale'; Send 'capture dlaa'; LogFrames 'dlaa'
   Send 'dlss off' 2.0; Send 'capture taa'; LogFrames 'taa'
   Send 'dlss on'; Send 'scale 0.67' 5.0; Send 'scale'; Send 'postinfo'
+} elseif ($Round -eq 'showcase') {
+  Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'; Send 'capture show_dlss50'; LogFrames 'show_dlss50'
+  Send 'scale 0.67' 5.0; Send 'scale'; Send 'capture show_dlss67'; LogFrames 'show_dlss67'
+  Send 'scale 1' 5.0; Send 'scale'; Send 'capture show_dlaa'; LogFrames 'show_dlaa'
+  Send 'dlss off' 2.0; Send 'capture show_taa'; LogFrames 'show_taa'
+  Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'
 } elseif ($Round -eq 'treecost') {
   # Where the trees' cost goes: grass and trees with and without the resolve draw, grass only.
   Send 'dlss on'; Send 'wind on'; Send 'windtrees on' 3.0; LogFrames 'tc_trees'

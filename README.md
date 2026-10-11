@@ -7,8 +7,18 @@ ray tracing cheaper and has an experimental DLSS Ray Reconstruction path.
 
 This is a personal research project, developed and tested on one machine (RTX 5070 Ti, 4K HDR, `eldenring.exe`
 file version 2.7.1.0, ReShade 6.8, [me3](https://github.com/garyttierney/me3) 0.13). It is published so that the
-reverse engineering and the lessons in `docs/` do not have to be repeated. There are no binary releases; you build it
-yourself and use it at your own risk, offline (me3 runs the game without Easy Anti-Cheat; do not take it online).
+reverse engineering and the lessons in `docs/` do not have to be repeated, and so that others can play with it: a
+ready-to-use zip is on the [Releases](https://github.com/masonpetrosky/EldenRingDLSS/releases) page. Use it at your
+own risk and offline only (me3 runs the game without Easy Anti-Cheat and keeps it off the matchmaking servers; do not
+take it online).
+
+![Game TAA, DLAA and DLSS at 50% render scale: 1:1 crops of grass, a wall and armor from 4K screenshots](docs/images/comparison.jpg)
+
+1:1 crops from 4K screenshots of the same view, taken seconds apart (HDR, tonemapped for the web; the grass sways
+between shots), with the GPU time per frame in that scene (RTX 5070 Ti, same game settings for all three; DLSS at 67%
+took 16.1 ms). The game's TAA sharpens its output, which reads as crisper in a still but is pixel noise that crawls in
+motion; DLSS drops that noise, and detail of 4 px and coarser is the same. `GameSharpening=1` puts the game's
+sharpening back on top of DLSS if you prefer that look.
 
 ## Features
 
@@ -50,6 +60,15 @@ pwsh build.ps1                    # configures and builds build/EldenRingDLSS.ad
 
 ## Installing
 
+Download `EldenRingDLSS-<version>.zip` from [Releases](https://github.com/masonpetrosky/EldenRingDLSS/releases) and
+follow its `INSTALL.txt`. In short: take `ReShade64.dll` from the installer of ReShade 6.8 or newer with full add-on
+support (the installer opens as a zip archive in 7-Zip), put it into the zip's `EldenRingDLSS` folder as
+`ReShade64.asi`, and double-click `EldenRingDLSS.me3` to start the game through me3. F9 toggles DLSS, the ReShade
+overlay (Home) has the settings. Nothing is written to the game folder.
+
+### From a build
+
+`tools/package.ps1` packs the release zip from a build (`dist\`). For development,
 `tools/deploy.ps1 -Target main` copies ReShade, the add-on and NVIDIA's release DLSS DLL(s) into an me3 natives folder
 and adds it to the `eldenring-default` profile; `-Target dev` makes a separate `eldenring-dlss-dev` profile with
 NVIDIA's developer DLLs (watermark, extra logging). Pass `-ReShadeDll <path>` with your ReShade 6.8 add-on DLL.
@@ -60,7 +79,8 @@ The game must be closed while installing (the add-on file is locked while it run
 
 ## Settings
 
-`EldenRingDLSS.ini` next to the add-on (most are also in the ReShade overlay):
+`EldenRingDLSS.ini` next to the add-on (most are also in the ReShade overlay). The defaults below are the add-on's; the
+release zip's ini (`package/EldenRingDLSS.ini`) starts with `Enabled=1` and `WindMotion=1` and documents each key.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
