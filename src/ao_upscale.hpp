@@ -15,6 +15,9 @@ namespace erdlss {
 struct AoUpscaleInputs {
   ID3D12Resource* depth = nullptr;  // full size, D32S8 (R32G8X24_TYPELESS)
   ID3D12Resource* src = nullptr;    // half size, R8G8B8A8_UNORM
+  // Instead of src: the render-size AO in the 4th channel of this texture (PSFull), in its own format.
+  ID3D12Resource* full = nullptr;
+  DXGI_FORMAT full_format = DXGI_FORMAT_UNKNOWN;
   D3D12_CPU_DESCRIPTOR_HANDLE target = {};  // the game pass's render target view (R8_UNORM)
   D3D12_VIEWPORT viewport = {};
   float depth_param[4] = {};  // cbSSAOParam g_vDepthComputeParam
@@ -36,6 +39,7 @@ class AoUpscale {
   ID3D12Device* device_ = nullptr;
   ID3D12RootSignature* rs_ = nullptr;
   ID3D12PipelineState* pso_ = nullptr;
+  ID3D12PipelineState* pso_full_ = nullptr;
   ID3D12DescriptorHeap* heap_ = nullptr;
   uint32_t increment_ = 0;
   uint32_t next_ = 0;

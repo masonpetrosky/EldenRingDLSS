@@ -18,6 +18,7 @@ namespace erdlss::rt_pipeline {
 namespace {
 
 constexpr wchar_t kGameExport[] = L"GXRayGen_dirLightShadow";
+constexpr wchar_t kGameAoExport[] = L"GXRayGen_ao";
 constexpr wchar_t kPortExport[] = L"ErdlssShadowRayGen";
 constexpr wchar_t kPortAoExport[] = L"ErdlssShadowAoRayGen";
 // offsetof(ID3D12Device5Vtbl, CreateStateObject) / sizeof(void*) in the Windows SDK's C declaration of the interface
@@ -34,6 +35,7 @@ struct Identifiers {
   uint8_t game[kIdSize];
   uint8_t port[kIdSize];
   uint8_t port_ao[kIdSize];
+  uint8_t game_ao[kIdSize];
 };
 
 std::mutex g_mutex;
@@ -62,11 +64,13 @@ void SaveIdentifiers(ID3D12StateObject* pipeline) {
   const void* game = properties->GetShaderIdentifier(kGameExport);
   const void* port = properties->GetShaderIdentifier(kPortExport);
   const void* port_ao = properties->GetShaderIdentifier(kPortAoExport);
-  if (game != nullptr && port != nullptr && port_ao != nullptr) {
+  const void* game_ao = properties->GetShaderIdentifier(kGameAoExport);
+  if (game != nullptr && port != nullptr && port_ao != nullptr && game_ao != nullptr) {
     Identifiers ids;
     std::memcpy(ids.game, game, kIdSize);
     std::memcpy(ids.port, port, kIdSize);
     std::memcpy(ids.port_ao, port_ao, kIdSize);
+    std::memcpy(ids.game_ao, game_ao, kIdSize);
     std::lock_guard lock(g_mutex);
     if (g_pipelines.size() >= 8) g_pipelines.erase(g_pipelines.begin());
     g_pipelines.push_back(ids);
@@ -182,6 +186,13 @@ bool Replacement(const void* current, ShadowRayGen wanted, void* out) {
     std::memcpy(out, want, kIdSize);
     return true;
   }
+  return false;
+}
+
+bool IsGameAo(const void* id) {
+  std::lock_guard lock(g_mutex);
+  for (const Identifiers& ids : g_pipelines)
+    if (std::memcmp(id, ids.game_ao, kIdSize) == 0) return true;
   return false;
 }
 

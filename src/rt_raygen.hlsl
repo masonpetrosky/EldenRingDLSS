@@ -2,6 +2,10 @@
 // ErdlssShadowRayGen is a port of the game's GXRayGen_dirLightShadow (sun shadows at the render size, from the DXIL
 // disassembly of capture er117_rtmax_scale50_f9082); ErdlssShadowAoRayGen also traces the AO at the render size
 // (the game's GXRayGen_ao runs at half size) and writes it to the output's 4th channel, which the game leaves at 0.
+// ErdlssShadowAoRayGen also replaces the game's random numbers. Its hash, sin(dot(pixel / size + frameRandom, k)),
+// forms diagonal bands that the per-frame offset sweeps across the screen; the game's denoisers blur them away, but
+// Ray Reconstruction keeps them as a moving "mirage" in distant grass. PCG gives independent numbers per pixel, per
+// frame (from frameRandom, fresh every frame) and per stream (shadow and AO rays apart).
 // The bindings are the game's: the global root signature's g_sceneCB (b0), scene (t64) and output (u0), and the
 // ray generation record's local root signature: l_rayGenCB (b16), G-buffer normal (t67) and depth (t68).
 
@@ -71,6 +75,20 @@ float Hash(float2 pixel, float2 size) {
   return frac(frac(sin(dot(p, float2(kHashX, kHashY))) * kHashMul1) * kHashMul2);
 }
 
+// PCG hash (Jarzynski and Olano, 2020), as in ao_upscale.hlsl.
+uint Pcg(uint v) {
+  const uint state = v * 747796405u + 2891336453u;
+  const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+// Two uniform numbers in [0, 1) for this pixel, frame and stream.
+float2 PixelRandom(uint2 pixel, uint stream) {
+  const uint seed = Pcg(pixel.x ^ Pcg(pixel.y ^ Pcg(asuint(g_frameRandom) + stream)));
+  const uint a = Pcg(seed), b = Pcg(a);
+  return float2(a >> 8, b >> 8) / 16777216.0f;
+}
+
 float RadicalInverse(uint i) {
   float result = 0.0f, bit = 0.5f;
   for (; i != 0; i >>= 1) {
@@ -104,7 +122,7 @@ struct Surface {
   float3 world;
   float viewZ;
   float3 normal;  // decoded but not normalized, as the game's shadow shader uses it
-  float random1, random2;
+  float random1, random2;  // the game's hash
 };
 
 Surface LoadSurface() {
@@ -127,7 +145,7 @@ Surface LoadSurface() {
 }
 
 // GXRayGen_dirLightShadow: rays toward the sun inside a cone, the fraction that reaches the sky.
-float SunShadow(Surface s) {
+float SunShadow(Surface s, float2 random) {
   const float offset = s.viewZ * kOffsetPerMeter;
   const float tmin = l_shadowRayLengthRange.x + offset;
   const float tmax = l_shadowRayLengthRange.y + offset;
@@ -145,8 +163,8 @@ float SunShadow(Surface s) {
   Basis(g_lightDir, t, b);
   float lit = 0.0f;
   for (uint i = 0; i < count; ++i) {
-    const float u = (float(i) + s.random1) / float(count);
-    float v = RadicalInverse(i) + s.random2;
+    const float u = (float(i) + random.x) / float(count);
+    float v = RadicalInverse(i) + random.y;
     if (v > 1.0f) v -= 1.0f;
     const float r = sqrt(u) * cone;
     const float phi = v * kTwoPi;
@@ -158,7 +176,7 @@ float SunShadow(Surface s) {
 
 // GXRayGen_ao's sampling (cosine-weighted hemisphere around the normal) at the render size; the fraction of rays
 // that leave unoccluded, through the game's scale and offset.
-float AmbientOcclusion(Surface s) {
+float AmbientOcclusion(Surface s, float2 random) {
   float open = 1.0f;
   if (s.viewZ < l_aoMaxDist && l_aoSampleCount != 0) {
     const float3 n = normalize(s.normal);
@@ -167,8 +185,8 @@ float AmbientOcclusion(Surface s) {
     Basis(n, t, b);
     float unoccluded = 0.0f;
     for (uint i = 0; i < l_aoSampleCount; ++i) {
-      const float u = (float(i) + s.random1) / float(l_aoSampleCount);
-      float v = RadicalInverse(i) + s.random2;
+      const float u = (float(i) + random.x) / float(l_aoSampleCount);
+      float v = RadicalInverse(i) + random.y;
       if (v > 1.0f) v -= 1.0f;
       const float r = sqrt(u);
       const float phi = v * kTwoPi;
@@ -190,11 +208,11 @@ void Store(Surface s, float shadow, float ao) {
 [shader("raygeneration")]
 void ErdlssShadowRayGen() {
   const Surface s = LoadSurface();
-  Store(s, SunShadow(s), 0.0f);
+  Store(s, SunShadow(s, float2(s.random1, s.random2)), 0.0f);
 }
 
 [shader("raygeneration")]
 void ErdlssShadowAoRayGen() {
   const Surface s = LoadSurface();
-  Store(s, SunShadow(s), AmbientOcclusion(s));
+  Store(s, SunShadow(s, PixelRandom(s.pixel, 0)), AmbientOcclusion(s, PixelRandom(s.pixel, 1)));
 }

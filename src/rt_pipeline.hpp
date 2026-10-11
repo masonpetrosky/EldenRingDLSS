@@ -20,7 +20,7 @@ namespace erdlss {
 enum class ShadowRayGen : int {
   kGame = 0,    // the game's GXRayGen_dirLightShadow
   kPort = 1,    // ErdlssShadowRayGen: the same shader, ported (should match the game's output)
-  kPortAo = 2,  // ErdlssShadowAoRayGen: plus the AO at the render size in the output's 4th channel
+  kPortAo = 2,  // ErdlssShadowAoRayGen: plus the AO at the render size in the output's 4th channel, PCG noise
 };
 
 namespace rt_pipeline {
@@ -33,6 +33,9 @@ void RemoveHook();
 // Writes to `out` the 32-byte shader identifier to put over a ray generation record's `current` one; false when the
 // record is not the sun shadow dispatch or already runs `wanted`.
 bool Replacement(const void* current, ShadowRayGen wanted, void* out);
+
+// True when the 32-byte shader identifier is the game's AO ray generation shader (GXRayGen_ao, half size).
+bool IsGameAo(const void* id);
 
 std::string Status();
 

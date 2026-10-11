@@ -271,13 +271,28 @@ shaders share local root signature 6723 (`l_rayGenCB` b16, normal t67, depth t68
 - Our AO in the 4th channel does not change the image (alternating shots within frame-to-frame noise): the
   shadow denoiser and the composite do not visibly read it.
 
+**Render-size AO into Ray Reconstruction** (same day, later):
+- `rtgen 2` while RR runs (`OurAoActive`): our shader traces 1 AO ray per pixel at the render size (the game's
+  `l_rayGenCB.aoSampleCount` set to 1 unless `rtsamples` says otherwise; the game's AO ray count was 4 at half size,
+  the same number of rays), the game's half-size AO dispatch is skipped (its record holds `GXRayGen_ao`'s
+  identifier), the render-size region of the shadow output (the dispatch's u0, found through the compute root
+  signature's tables: 3840x2160 R8G8B8A8_UNORM) is copied right after our dispatch, and the AO upscale pass draws
+  the copy's 4th channel into the game's AO target (`ao_upscale.hlsl` PSFull) instead of upscaling. Without RR,
+  mode 2 acts as mode 1 (the game's AO path needs its own denoiser input).
+- Cost: slightly less than the game's AO path: 15.74 vs 16.00 ms and 12.97 vs 13.17 ms GPU at two spots (4K, 50%,
+  M, RR, ray tracing Maximum). Counters per frame: skipped = copied = drawn, no failures.
+- First look (user): "the grass blades that used to be dark are darker now" (per-pixel contact occlusion the
+  half-size AO blurred away), and a "mirage" wave in distant grass. Cause: the game's random numbers, sin(dot(pixel
+  / size + frameRandom, (26.439, 48.236))) hashed, form diagonal bands that the per-frame offset sweeps across the
+  screen; the game's denoisers hid them, RR kept them. With the game's AO the wave was gone. Mode 2 now uses PCG
+  (per pixel, per frame from `frameRandom`, separate streams for shadow and AO rays); the exact port (mode 1) keeps
+  the game's hash. User: "Yeah I think it looks great." Dev install default: `RtShadowRayGen=2`.
+
 **Next:**
-1. AO rays per pixel as a setting (1 at the render size = the game's ray count; what RR expects) and skip the
-   game's half-size AO dispatch while ours runs.
-2. Feed it to RR: the AO upscale replacement (`ao_upscale.hlsl`) reads the 4th channel of the shadow output instead
-   of upscaling the half-size AO. Needs the shadow output texture (the UAV bound to the shadow dispatch, or the
-   shadow denoiser's input) and a check that the 4th channel survives the denoiser pass-through and the copy back.
-3. Better samples in our shader: blue noise instead of the sin hash, per-frame decorrelation for RR.
+1. Blue noise or a low-discrepancy sequence per pixel instead of white noise (RR handles white noise; blue noise
+   converges faster at 1 ray per pixel).
+2. More sun shadow rays only where the cone is wide (penumbrae), or 1 ray with RR as for the AO; measure.
+3. Without RR: a denoiser for our AO, or keep the game's path (current).
 4. ReSTIR-style reuse matters once there are many lights to choose from (the local lights, e.g. torches, or GI);
    for the sun and AO, RR's own temporal accumulation does the reuse. The pipeline already has radiance miss and
    closest-hit shaders (`GXMiss_radiance`, `GXClosestHit_radiance`, `GXRayGen`), useful for reflections or GI.

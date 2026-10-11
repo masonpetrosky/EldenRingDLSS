@@ -4,6 +4,8 @@
 // weights but picks one sample per pixel and frame at random, with probability weight / total: the same expected
 // value, with noise that is independent per pixel and per frame. Inputs as the game's pass binds them: the full-size
 // depth and the half-size AO (x = AO, yzw = linear depth packed as the game reads it).
+// PSFull instead copies the AO our shadow ray generation shader traced at the render size (rt_raygen.hlsl), from the
+// 4th channel of the shadow output's copy bound at t1; no upscale needed.
 // SPDX-License-Identifier: MIT
 
 Texture2D<float> g_depth : register(t0);
@@ -28,6 +30,10 @@ uint Hash(uint v) {
   const uint state = v * 747796405u + 2891336453u;
   const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
   return (word >> 22u) ^ word;
+}
+
+float PSFull(float4 position : SV_Position) : SV_Target {
+  return g_src.Load(int3(position.xy, 0)).w;
 }
 
 float PSMain(float4 position : SV_Position) : SV_Target {

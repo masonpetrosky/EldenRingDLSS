@@ -6,6 +6,7 @@
 
 #include "d3d12_util.hpp"
 #include "kAoUpscalePs.h"
+#include "kAoUpscalePsFull.h"
 #include "kAoUpscaleVs.h"
 
 namespace erdlss {
@@ -42,7 +43,10 @@ bool AoUpscale::Init(ID3D12Device* device) {
   pso.RTVFormats[0] = DXGI_FORMAT_R8_UNORM;
   const D3D12_DESCRIPTOR_HEAP_DESC heap = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSlots * 2,
                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_full = pso;
+  pso_full.PS = {kAoUpscalePsFull, sizeof(kAoUpscalePsFull)};
   if (rs_ == nullptr || FAILED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&pso_))) ||
+      FAILED(device->CreateGraphicsPipelineState(&pso_full, IID_PPV_ARGS(&pso_full_))) ||
       FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&heap_)))) {
     status_ = "root signature, pipeline or descriptor heap creation failed";
     Shutdown();
@@ -55,14 +59,16 @@ bool AoUpscale::Init(ID3D12Device* device) {
 
 void AoUpscale::Shutdown() {
   Release(pso_);
+  Release(pso_full_);
   Release(heap_);
   Release(rs_);
   device_ = nullptr;
 }
 
 bool AoUpscale::Run(ID3D12GraphicsCommandList* cmd, const AoUpscaleInputs& in) {
-  if (pso_ == nullptr || in.depth == nullptr || in.src == nullptr || in.target.ptr == 0 || in.viewport.Width <= 0 ||
-      in.viewport.Height <= 0)
+  const bool full = in.full != nullptr;
+  if (pso_ == nullptr || in.depth == nullptr || (in.src == nullptr && !full) || in.target.ptr == 0 ||
+      in.viewport.Width <= 0 || in.viewport.Height <= 0)
     return false;
   const uint32_t base = (next_++ % kSlots) * 2;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_->GetCPUDescriptorHandleForHeapStart();
@@ -77,13 +83,13 @@ bool AoUpscale::Run(ID3D12GraphicsCommandList* cmd, const AoUpscaleInputs& in) {
   device_->CreateShaderResourceView(in.depth, &sv, cpu);
   D3D12_CPU_DESCRIPTOR_HANDLE second = cpu;
   second.ptr += increment_;
-  sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  device_->CreateShaderResourceView(in.src, &sv, second);
+  sv.Format = full ? in.full_format : DXGI_FORMAT_R8G8B8A8_UNORM;
+  device_->CreateShaderResourceView(full ? in.full : in.src, &sv, second);
 
   cmd->OMSetRenderTargets(1, &in.target, FALSE, nullptr);
   cmd->SetDescriptorHeaps(1, &heap_);
   cmd->SetGraphicsRootSignature(rs_);
-  cmd->SetPipelineState(pso_);
+  cmd->SetPipelineState(full ? pso_full_ : pso_);
   cmd->SetGraphicsRootDescriptorTable(0, gpu);
   struct {
     float depth_param[4];

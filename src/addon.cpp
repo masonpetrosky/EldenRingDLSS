@@ -489,6 +489,13 @@ void Log(reshade::log::level level, const std::string& message) {
 // plus the AO at the render size. Ini RtShadowRayGen (read only), remote "rtgen".
 std::atomic<int> g_rt_shadow_raygen{0};
 
+// Mode 2's AO (1 ray per pixel at the render size, unless rtsamples says otherwise) replaces the game's half-size AO
+// only while Ray Reconstruction runs, which denoises it; otherwise the game's AO path stays and mode 2 acts as 1.
+bool OurAoActive() { return g_rt_shadow_raygen.load() == 2 && g_rr_active.load(); }
+std::mutex g_rt_ao_mutex;
+resource g_rt_ao_copy = {0};                  // the shadow output copied after our dispatch, under g_rt_ao_mutex
+std::atomic<uint64_t> g_rt_ao_copy_frame{0};  // frame of the last copy + 1 (0: none)
+
 // --- Configuration -----------------------------------------------------------------------------------------
 
 int ReadInt(const wchar_t* key, int fallback) {
@@ -1809,6 +1816,11 @@ void OnDestroyDevice(device* dev) {
   g_exposure = g_exposure_upload = {0};
   g_exposure_mapped = nullptr;
   DestroyRayGenRing(dev);
+  {
+    std::lock_guard ao_lock(g_rt_ao_mutex);
+    if (g_rt_ao_copy != 0) dev->destroy_resource(g_rt_ao_copy);
+    g_rt_ao_copy = {0};
+  }
   DestroyMask(dev);
   if (g_mask_pipeline != 0) dev->destroy_pipeline(g_mask_pipeline);
   if (g_mask_layout != 0) dev->destroy_pipeline_layout(g_mask_layout);
@@ -3262,6 +3274,13 @@ bool StochasticAoUpscale(command_list* cmd_list, CmdData& data) {
     return false;
   });
   in.frame = static_cast<uint32_t>(g_frame.load());
+  if (OurAoActive()) {
+    std::lock_guard lock(g_rt_ao_mutex);
+    if (g_rt_ao_copy == 0 || g_rt_ao_copy_frame.load() != g_frame.load() + 1) return false;
+    in.full = reinterpret_cast<ID3D12Resource*>(g_rt_ao_copy.handle);
+    in.full_format =
+        static_cast<DXGI_FORMAT>(format_to_default_typed(dev->get_resource_desc(g_rt_ao_copy).texture.format));
+  }
   if (!ok || in.screen[2] == 0.0f || dev->get_resource_desc(dev->get_resource_from_view(state->render_targets[0]))
                                           .texture.format != format::r8_unorm)
     return false;
@@ -3285,7 +3304,8 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
       v[0] = 0.0f;  // g_vPrevFrameStrengh.x: no history
       return true;
     });
-  if (data->pass == Pass::kAoUpscale && RawMode() == 2 && StochasticAoUpscale(cmd_list, *data)) return true;
+  if (data->pass == Pass::kAoUpscale && (RawMode() == 2 || OurAoActive()) && StochasticAoUpscale(cmd_list, *data))
+    return true;
   if (data->pass == Pass::kMotionPrep) {
     data->depth = BoundResource(cmd_list, shader_stage::pixel, 0);       // g_StencilTexForCopy
     data->depth_copy = BoundResource(cmd_list, shader_stage::pixel, 2);  // g_DepthTex
@@ -3620,7 +3640,9 @@ void EditRayGenSamples(device* dev, resource raygen, uint64_t raygen_offset, uin
   const size_t count = (std::min)(static_cast<size_t>((raygen_size - 32) / 8), size_t{4});
   std::memcpy(args, static_cast<const uint8_t*>(record) + 32, count * 8);
   dev->unmap_buffer_region(raygen);
-  const uint32_t ao = g_rt_ao_samples.load(), shadow = g_rt_shadow_samples.load();
+  const uint32_t shadow = g_rt_shadow_samples.load();
+  uint32_t ao = g_rt_ao_samples.load();
+  if (ao == 0 && OurAoActive()) ao = 1;  // the game's half-size AO dispatch is skipped then: the count is ours alone
   static std::atomic<bool> logged{false};
   const bool log_now = !logged.exchange(true);
   std::string log_text;
@@ -3735,15 +3757,80 @@ void DestroyRayGenRing(device* dev) {
   g_raygen_ring_mapped = nullptr;
 }
 
-// True when the dispatch was issued with our ray generation shader (the caller then skips the game's).
-bool RedirectShadowRayGen(command_list* cmd_list, resource raygen, uint64_t raygen_offset, uint64_t raygen_size,
-                          resource miss, uint64_t miss_offset, uint64_t miss_size, uint64_t miss_stride, resource hit,
-                          uint64_t hit_offset, uint64_t hit_size, uint64_t hit_stride, resource callable,
-                          uint64_t callable_offset, uint64_t callable_size, uint64_t callable_stride, uint32_t width,
-                          uint32_t height, uint32_t depth) {
-  const auto wanted = static_cast<erdlss::ShadowRayGen>(g_rt_shadow_raygen.load());
-  if (wanted == erdlss::ShadowRayGen::kGame || raygen_size < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES ||
-      raygen_size > kRayGenSlotBytes)
+// The UAV bound at compute register u<reg> (ray tracing dispatches use the compute root signature), or 0.
+resource BoundComputeUav(command_list* cmd_list, uint32_t reg) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr) return {0};
+  auto it = state->descriptor_tables.find(shader_stage::all_compute);
+  if (it == state->descriptor_tables.end())
+    it = std::find_if(state->descriptor_tables.begin(), state->descriptor_tables.end(),
+                      [](const auto& entry) { return (entry.first & shader_stage::compute) != 0; });
+  if (it == state->descriptor_tables.end()) return {0};
+  descriptor_heap heap = {0};
+  uint32_t slot = 0;
+  if (!descriptors->Find(dev, it->second.first, it->second.second, shader_stage::compute,
+                         RegisterKind::kUnorderedAccess, reg, 0, &heap, &slot))
+    return {0};
+  const resource_view view = descriptors->View(heap, slot);
+  return view == 0 ? resource{0} : dev->get_resource_from_view(view);
+}
+
+// Mode 2's AO leaves the shadow dispatch in the 4th channel of its output; the game's shadow denoiser writes that
+// output again later, so the render-size region is copied right after our dispatch (into g_rt_ao_copy, declared with
+// OurAoActive) and the AO upscale reads the copy.
+std::atomic<uint64_t> g_rt_ao_skipped{0}, g_rt_ao_copies{0}, g_rt_ao_copy_failed{0};
+
+void CopyShadowOutput(command_list* cmd_list, uint32_t width, uint32_t height) {
+  device* const dev = cmd_list->get_device();
+  const resource output = BoundComputeUav(cmd_list, 0);
+  if (output == 0) {
+    ++g_rt_ao_copy_failed;
+    return;
+  }
+  const resource_desc desc = dev->get_resource_desc(output);
+  std::lock_guard lock(g_rt_ao_mutex);
+  if (g_rt_ao_copy != 0) {
+    const resource_desc have = dev->get_resource_desc(g_rt_ao_copy);
+    if (have.texture.width != desc.texture.width || have.texture.height != desc.texture.height ||
+        have.texture.format != desc.texture.format) {
+      std::lock_guard retire(g_dlss_mutex);
+      g_retired.push_back({g_rt_ao_copy, g_frame.load()});
+      g_rt_ao_copy = {0};
+    }
+  }
+  if (g_rt_ao_copy == 0) {
+    const resource_desc copy(desc.texture.width, desc.texture.height, 1, 1, desc.texture.format, 1,
+                             memory_heap::default_, resource_usage::copy_dest | resource_usage::shader_resource);
+    if (desc.type != resource_type::texture_2d ||
+        !dev->create_resource(copy, nullptr, resource_usage::shader_resource, &g_rt_ao_copy)) {
+      g_rt_ao_copy = {0};
+      ++g_rt_ao_copy_failed;
+      return;
+    }
+    dev->set_resource_name(g_rt_ao_copy, "EldenRingDLSS render-size AO");
+    Log(reshade::log::level::info, "Render-size AO from the shadow output: " + Describe(dev, output) + ".");
+  }
+  const resource resources[2] = {output, g_rt_ao_copy};
+  const resource_usage before[2] = {resource_usage::unordered_access, resource_usage::shader_resource};
+  const resource_usage during[2] = {resource_usage::copy_source, resource_usage::copy_dest};
+  cmd_list->barrier(2, resources, before, during);
+  const subresource_box box = {0, 0, 0, width, height, 1};
+  cmd_list->copy_texture_region(output, 0, &box, g_rt_ao_copy, 0, &box);
+  cmd_list->barrier(2, resources, during, before);
+  g_rt_ao_copy_frame = g_frame.load() + 1;
+  ++g_rt_ao_copies;
+}
+
+// Routes the game's ray generation dispatches while rtgen is 1 or 2. True when the game's dispatch is to be skipped:
+// the sun shadows ran with our shader instead, or the game's half-size AO is not needed (OurAoActive).
+bool RouteRayGen(command_list* cmd_list, resource raygen, uint64_t raygen_offset, uint64_t raygen_size, resource miss,
+                 uint64_t miss_offset, uint64_t miss_size, uint64_t miss_stride, resource hit, uint64_t hit_offset,
+                 uint64_t hit_size, uint64_t hit_stride, resource callable, uint64_t callable_offset,
+                 uint64_t callable_size, uint64_t callable_stride, uint32_t width, uint32_t height, uint32_t depth) {
+  const int mode = g_rt_shadow_raygen.load();
+  if (mode == 0 || raygen_size < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES || raygen_size > kRayGenSlotBytes)
     return false;
   device* const dev = cmd_list->get_device();
   resource buffer = raygen;
@@ -3757,6 +3844,13 @@ bool RedirectShadowRayGen(command_list* cmd_list, resource raygen, uint64_t rayg
   uint8_t record[kRayGenSlotBytes];
   std::memcpy(record, mapped, static_cast<size_t>(raygen_size));
   dev->unmap_buffer_region(buffer);
+  const bool our_ao = OurAoActive();
+  if (erdlss::rt_pipeline::IsGameAo(record)) {
+    if (!our_ao) return false;
+    ++g_rt_ao_skipped;
+    return true;
+  }
+  const auto wanted = our_ao ? erdlss::ShadowRayGen::kPortAo : erdlss::ShadowRayGen::kPort;
   uint8_t id[D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES];
   if (!erdlss::rt_pipeline::Replacement(record, wanted, id) || !EnsureRayGenRing(dev)) return false;
   std::memcpy(record, id, sizeof(id));  // the local root arguments after the identifier stay the game's
@@ -3766,6 +3860,7 @@ bool RedirectShadowRayGen(command_list* cmd_list, resource raygen, uint64_t rayg
                           hit_size, hit_stride, callable, callable_offset, callable_size, callable_stride, width,
                           height, depth);
   ++g_rt_raygen_redirects;
+  if (our_ao) CopyShadowOutput(cmd_list, width, height);
   return true;
 }
 
@@ -3807,9 +3902,9 @@ bool OnDispatchRays(command_list* cmd_list, resource raygen, uint64_t raygen_off
     }
   }
   if ((g_rt_skip.load() & 4) != 0) return true;
-  return RedirectShadowRayGen(cmd_list, raygen, raygen_offset, raygen_size, miss, miss_offset, miss_size, miss_stride,
-                              hit, hit_offset, hit_size, hit_stride, callable, callable_offset, callable_size,
-                              callable_stride, width, height, depth);
+  return RouteRayGen(cmd_list, raygen, raygen_offset, raygen_size, miss, miss_offset, miss_size, miss_stride, hit,
+                     hit_offset, hit_size, hit_stride, callable, callable_offset, callable_size, callable_stride, width,
+                     height, depth);
 }
 
 bool KeyPressed(int vk) {
@@ -4295,7 +4390,10 @@ void OnReshadePresent(effect_runtime* runtime) {
     if (!arg.empty()) g_rt_shadow_raygen = std::clamp(std::atoi(arg.c_str()), 0, 2);
     result = "shadow ray generation " + std::to_string(g_rt_shadow_raygen.load()) + "; " +
              erdlss::rt_pipeline::Status() + "; redirected " + std::to_string(g_rt_raygen_redirects.load()) + ", unmapped " +
-             std::to_string(g_rt_raygen_unmapped.load());
+             std::to_string(g_rt_raygen_unmapped.load()) + "; our AO " + (OurAoActive() ? "on" : "off") +
+             ": game AO dispatches skipped " + std::to_string(g_rt_ao_skipped.load()) + ", copies " +
+             std::to_string(g_rt_ao_copies.load()) + " (failed " + std::to_string(g_rt_ao_copy_failed.load()) +
+             "), drawn " + std::to_string(g_ao_upscales.load());
   } else if (command == "rtsamples") {
     if (!arg.empty()) {
       g_rt_ao_samples = static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 0, 16));
