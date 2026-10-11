@@ -17,6 +17,8 @@ constexpr uint32_t kHold = 0x8;      // byte: the per-frame settings copy is ski
 constexpr uint32_t kEnabled = 0x9;   // byte
 constexpr uint32_t kMode = 0xC;      // int: 4 = TAA
 constexpr uint32_t kPhases = 0x64;   // int: jitter cycle length
+constexpr uint32_t kCounter = 0x124;  // int: position in the cycle (the jitter is Halton(counter + 1) - 0.5)
+constexpr uint32_t kDoubled = 0x10;   // byte: each position held for two frames (counter / 2)
 constexpr size_t kMaxFilters = 16;
 
 bool GuardedCopy(void* dst, const void* src, size_t size) {
@@ -113,6 +115,19 @@ void TaaJitter::Apply(uint32_t phases) {
   }
   held_ = false;
   phases_ = 0;
+}
+
+bool TaaJitter::ReadCounter(uint32_t* counter, uint32_t* phases, bool* doubled) const {
+  const uintptr_t vtable = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + kVtableRva;
+  std::lock_guard lock(mutex_);
+  for (const uintptr_t f : filters_) {
+    if (!IsTaaFilter(f, vtable)) continue;
+    uint8_t flag = 0;
+    return GuardedCopy(counter, reinterpret_cast<const void*>(f + kCounter), sizeof(*counter)) &&
+           GuardedCopy(phases, reinterpret_cast<const void*>(f + kPhases), sizeof(*phases)) &&
+           GuardedCopy(&flag, reinterpret_cast<const void*>(f + kDoubled), 1) && (*doubled = flag != 0, true);
+  }
+  return false;
 }
 
 std::string TaaJitter::status() const {

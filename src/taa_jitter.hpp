@@ -24,6 +24,8 @@ class TaaJitter {
   // background search for the filters the first time it is needed (and again if they disappear).
   void Apply(uint32_t phases);
   std::string status() const;
+  // The first TAA filter's jitter counter (+0x124), cycle length (+0x64) and its two-frames-per-position flag (+0x10).
+  bool ReadCounter(uint32_t* counter, uint32_t* phases, bool* doubled) const;
 
  private:
   void Search();

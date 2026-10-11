@@ -926,6 +926,75 @@ uint32_t EngineRenderSize(uint32_t size, float scale) {
   return std::min(size, 4 * static_cast<uint32_t>(std::floor(size * scale / 4.0f + 0.5f)));
 }
 
+// The jitter in the scene constants comes from the latest scene draw, recorded in another command list, and was the
+// previous frame's in 2-3% of frames at a busy spot (a site of grace): presets M and L showed it as the whole world
+// jumping, K smoothed over it. The game computes the jitter from the TAA filter's counter, Halton(counter + 1, 2 and
+// 3) - 0.5 render pixels (0x141AD7470), and the counter has already advanced when the TAA draw is recorded, so this
+// frame's jitter is the "previous" position. CheckJitter compares the two every frame and gives DLSS the counter's
+// value (the combination that matched most often, once it matched 60 times; remote "jittersrc scene" switches back).
+float Halton(uint32_t index, uint32_t base) {
+  float f = 1.0f, r = 0.0f;
+  while (index > 0) {
+    f /= static_cast<float>(base);
+    r += f * static_cast<float>(index % base);
+    index /= base;
+  }
+  return r;
+}
+
+std::atomic<int> g_jitter_source{1};  // remote "jittersrc scene|counter"
+std::mutex g_jitter_stats_mutex;
+uint64_t g_jitter_matches[12] = {};   // (counter offset next/current/previous, flip x, flip y) that matched
+uint64_t g_jitter_mismatches = 0, g_jitter_unread = 0;
+std::vector<std::string> g_jitter_samples;  // the first mismatches
+
+void CheckJitter(float scene_x, float scene_y, float* out_x, float* out_y) {
+  uint32_t counter = 0, phases = 0;
+  bool doubled = false;
+  if (!g_taa_jitter.ReadCounter(&counter, &phases, &doubled) || phases == 0 || phases > 256) {
+    std::lock_guard lock(g_jitter_stats_mutex);
+    ++g_jitter_unread;
+    return;
+  }
+  const uint32_t wrap = doubled ? phases * 2 : phases;
+  float cand[12][2];
+  for (int k = 0; k < 3; ++k) {  // 0 next (counter + 1), 1 current, 2 previous (counter - 1)
+    const uint32_t c = (counter % wrap + wrap + 1 - static_cast<uint32_t>(k)) % wrap;
+    const uint32_t index = (doubled ? c >> 1 : c) + 1;
+    const float hx = Halton(index, 2) - 0.5f, hy = Halton(index, 3) - 0.5f;
+    for (int fx = 0; fx < 2; ++fx)
+      for (int fy = 0; fy < 2; ++fy) {
+        const int i = k * 4 + fx * 2 + fy;
+        cand[i][0] = fx ? -hx : hx;
+        cand[i][1] = fy ? -hy : hy;
+      }
+  }
+  std::lock_guard lock(g_jitter_stats_mutex);
+  int matched = -1;
+  for (int i = 0; i < 12 && matched < 0; ++i)
+    if (std::fabs(cand[i][0] - scene_x) < 0.002f && std::fabs(cand[i][1] - scene_y) < 0.002f) matched = i;
+  if (matched >= 0) {
+    ++g_jitter_matches[matched];
+  } else {
+    ++g_jitter_mismatches;
+    if (g_jitter_samples.size() < 8) {
+      char text[200];
+      std::snprintf(text, sizeof(text), "frame %llu: scene %+.4f %+.4f, counter %u of %u%s: current %+.4f %+.4f, "
+                    "previous %+.4f %+.4f", static_cast<unsigned long long>(g_frame.load()), scene_x, scene_y,
+                    counter, phases, doubled ? " (doubled)" : "", cand[4][0], cand[4][1], cand[8][0], cand[8][1]);
+      g_jitter_samples.push_back(text);
+    }
+  }
+  if (g_jitter_source.load() != 1) return;
+  // The counter's value with the combination that matched most often.
+  int best = 0;
+  for (int i = 1; i < 12; ++i)
+    if (g_jitter_matches[i] > g_jitter_matches[best]) best = i;
+  if (g_jitter_matches[best] < 60) return;
+  *out_x = (g_config.flip_jitter_x ? -1.0f : 1.0f) * cand[best][0];
+  *out_y = (g_config.flip_jitter_y ? -1.0f : 1.0f) * cand[best][1];
+}
+
 // Upscaling: replaces the TAA draw by a copy of its input into its target (the next frame's history, and whatever
 // else reads it, gets the current image) and records the DLSS inputs for FinishUpscale. Under g_dlss_mutex.
 bool PassThroughTaa(command_list* cmd_list, CmdData& data, resource color, resource target, resource motion,
@@ -1405,6 +1474,8 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   // Projection offset in render pixels with x right and y down (the viewport maps NDC onto the render size).
   in.jitter_x = (g_config.flip_jitter_x ? -1.0f : 1.0f) * scene.jitter_ndc_x * 0.5f * in_width;
   in.jitter_y = (g_config.flip_jitter_y ? -1.0f : 1.0f) * -scene.jitter_ndc_y * 0.5f * in_height;
+  CheckJitter(scene.jitter_ndc_x * 0.5f * in_width, -scene.jitter_ndc_y * 0.5f * in_height, &in.jitter_x,
+              &in.jitter_y);
   // The game stores (current - previous) UV with x scaled by the aspect ratio, i.e. both axes in screen
   // heights; DLSS wants previous - current in render pixels.
   const float mv_scale =
@@ -3795,6 +3866,18 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "passlog") {
     g_passlog_frame = g_frame.load() + 1;
     result = "logging the next frame's named draws to shots/passlog.txt";
+  } else if (command == "jitterinfo" || command == "jittersrc") {
+    if (command == "jittersrc" && !arg.empty()) g_jitter_source = arg == "counter" ? 1 : 0;
+    std::lock_guard lock(g_jitter_stats_mutex);
+    std::string text = std::string("source ") + (g_jitter_source.load() == 1 ? "counter" : "scene") + "; matches";
+    static const char* const kNames[12] = {"next", "next-y", "next-x", "next-xy", "cur", "cur-y",
+                                           "cur-x", "cur-xy", "prev", "prev-y", "prev-x", "prev-xy"};
+    for (int i = 0; i < 12; ++i)
+      if (g_jitter_matches[i] != 0) text += std::string(" ") + kNames[i] + "=" + std::to_string(g_jitter_matches[i]);
+    text += "; mismatches " + std::to_string(g_jitter_mismatches) + ", counter unread " +
+            std::to_string(g_jitter_unread);
+    for (const std::string& sample : g_jitter_samples) Log(reshade::log::level::info, "Jitter mismatch " + sample);
+    result = text;
   } else if (command == "sceneinfo") {
     result = "scene constants from other cameras rejected: " + std::to_string(g_scene_rejected.load());
   } else if (command == "dualinfo" || command == "dual") {
