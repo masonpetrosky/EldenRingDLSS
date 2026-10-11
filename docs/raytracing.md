@@ -304,11 +304,13 @@ shaders share local root signature 6723 (`l_rayGenCB` b16, normal t67, depth t68
   accumulation). NVIDIA's RR guide (SDK 310.9.1, 3.13) recommends the default preset (F) for all modes; its
   responsivity mask (preset F only; negative values favor stability over responsiveness) is a lever for that grass.
 
+- Sun shadows at 1 ray per pixel while our AO feeds RR (`dirLightShadowSampleCount` set to 1 like the AO count;
+  `rtsamples 0 2` forces the game's 2): 56.5 fps / 17.7 ms vs 52.3 fps / 19.1 ms with 2 rays (4K, 50%, RR, ray
+  tracing Maximum, daylight). User: "No noticeable difference but I'll take the performance win."
+
 **Next:**
-1. Sun shadow rays: 1 per pixel with RR, as for the AO (the game uses 2 on Maximum), or more only in wide
-   penumbrae; measure and look.
-2. RR's responsivity mask on vegetation (negative: steadier grass at 50%).
-3. Without RR: a denoiser for our AO, or keep the game's path (current).
+1. RR's responsivity mask on vegetation (negative: steadier grass at 50%).
+2. Without RR: a denoiser for our AO, or keep the game's path (current).
 4. ReSTIR-style reuse matters once there are many lights to choose from (the local lights, e.g. torches, or GI);
    for the sun and AO, RR's own temporal accumulation does the reuse. The pipeline already has radiance miss and
    closest-hit shaders (`GXMiss_radiance`, `GXClosestHit_radiance`, `GXRayGen`), useful for reflections or GI.

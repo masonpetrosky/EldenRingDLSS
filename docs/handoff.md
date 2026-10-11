@@ -130,7 +130,8 @@ How it works (`RenderScale` in the ini, overlay slider, remote `scale`; dev inst
    runs them for the sun shadow dispatch (remote `rtgen 0|1|2`). The port matches the game's shadows at the same
    cost. Modes 2 and 3 feed RR 1 AO ray per pixel at the render size instead of the game's half-size AO, slightly
    cheaper; the user: "looks great". Mode 3 (blue noise; the dev install's default, `RtShadowRayGen=3`) is "a little
-   less noisy" than 2 (PCG). Next: sun shadow ray counts (docs/raytracing.md, "Our own shadow ray generation
+   less noisy" than 2 (PCG). The sun shadows use 1 ray per pixel in these modes too (+4 fps, no visible change).
+   Next: RR's responsivity mask for the grass at 50% (docs/raytracing.md, "Our own shadow ray generation
    shader").
 3. Hear how the everyday install at 67% plays over longer sessions and other areas.
 4. Performance: the stretch passes and the full-size post-processing cost about 1 ms; check what is worth saving.

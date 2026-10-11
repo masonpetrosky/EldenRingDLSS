@@ -3642,9 +3642,12 @@ void EditRayGenSamples(device* dev, resource raygen, uint64_t raygen_offset, uin
   const size_t count = (std::min)(static_cast<size_t>((raygen_size - 32) / 8), size_t{4});
   std::memcpy(args, static_cast<const uint8_t*>(record) + 32, count * 8);
   dev->unmap_buffer_region(raygen);
-  const uint32_t shadow = g_rt_shadow_samples.load();
+  uint32_t shadow = g_rt_shadow_samples.load();
   uint32_t ao = g_rt_ao_samples.load();
-  if (ao == 0 && OurAoActive()) ao = 1;  // the game's half-size AO dispatch is skipped then: the count is ours alone
+  // While our AO feeds Ray Reconstruction, our shader traces both at 1 ray per pixel and RR denoises them (the game
+  // uses 2 shadow rays on Maximum); the game's half-size AO dispatch is skipped then, so the AO count is ours alone.
+  if (ao == 0 && OurAoActive()) ao = 1;
+  if (shadow == 0 && OurAoActive()) shadow = 1;
   static std::atomic<bool> logged{false};
   const bool log_now = !logged.exchange(true);
   std::string log_text;
