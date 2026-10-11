@@ -664,3 +664,11 @@ Other notes from this session:
 - The rest camera at that grace looked toward the (then displaced) flame; check again once the flame is right, and
   compare with DLSS off.
 - Changing ray tracing between Low and Maximum applies at once; only off <-> on needs a return to the title screen.
+
+Resolved later the same evening: the judder followed the DLSS preset, not the add-on's corrections: M and L judder
+at the grace (also with the 8-phase jitter, less often), K does not. The user chose K at Balanced (58%), NVIDIA's
+default preset for that mode. 58% first looped (DLSS recreated every frame: the engine rounds the width to 8 pixels
+in some cases, 2224 instead of the estimated 2228; 0x141A54AA0 uses 8 when FUN_141c1ede0 returns true, apparently
+with ray tracing on); fixed with a 16-pixel tolerance. The grace flame then flashed in the wrong place every few
+seconds (its list's 64-frame history fell back to "before"); list kinds seen on both sides now stay decided at
+submission.
