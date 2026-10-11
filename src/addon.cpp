@@ -3344,8 +3344,9 @@ std::atomic<bool> g_rt_raw{false};
 // the render size, the AO at half of it and upscaled afterwards, so raw AO reaches RR as 2x2 blocks of noise, which RR
 // cannot tell from detail; "shadows" keeps the game's AO denoiser (the half-size pass and the a-trous filters). "all"
 // also turns off the AO chain's own temporal pass (ScreenSpaceAO2_SeparatedReProj: g_vPrevFrameStrengh.x, the
-// history weight, at cbSSAOParam2 byte 240) and replaces its upscale with a stochastic one (ao_upscale.hlsl).
-std::atomic<int> g_rr_raw_mode{1};
+// history weight, at cbSSAOParam2 byte 240) and replaces its upscale with a stochastic one (ao_upscale.hlsl): as
+// quiet as "shadows" in game, with a little more AO definition, and RR does all the denoising. The default.
+std::atomic<int> g_rr_raw_mode{2};
 int RawMode() { return g_rt_raw.load() ? 2 : g_rr_active.load() ? g_rr_raw_mode.load() : 0; }
 bool RawDenoise() { return RawMode() != 0; }
 std::atomic<uint64_t> g_rt_anim{0}, g_rt_refits{0}, g_rt_skipped{0}, g_rt_rays{0}, g_rt_tlas{0}, g_rt_edits{0};
