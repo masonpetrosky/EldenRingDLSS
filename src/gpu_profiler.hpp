@@ -45,9 +45,12 @@ class GpuProfiler {
   bool TakeForced(ID3D12GraphicsCommandList* cmd);
   void Force(ID3D12GraphicsCommandList* cmd);
 
-  // After the capture (frames past end): resolve on `cmd` (a direct list the caller executes and waits for) ...
-  void RecordResolve(ID3D12GraphicsCommandList* cmd);
-  // ... then write the CSV into `dir` and disarm. Returns a status line.
+  // After the capture (frames past end): the caller resolves timestamps [0, used()) of heap() into readback() on a
+  // direct list and waits for it ...
+  ID3D12QueryHeap* heap() const { return heap_; }
+  ID3D12Resource* readback() const { return readback_; }
+  uint32_t used();
+  // ... then writes the CSV into `dir` and disarms. Returns a status line.
   std::string Write(const std::filesystem::path& dir);
 
  private:

@@ -4614,8 +4614,11 @@ void OnReshadePresent(effect_runtime* runtime) {
       command_queue* const queue = runtime->get_command_queue();
       queue->wait_idle();
       erdlss::g_marker_hook = nullptr;
-      g_profiler.RecordResolve(
-          reinterpret_cast<ID3D12GraphicsCommandList*>(queue->get_immediate_command_list()->get_native()));
+      // Through ReShade's API: the immediate list is only submitted when ReShade recorded something into it.
+      if (const uint32_t used = g_profiler.used(); used != 0)
+        queue->get_immediate_command_list()->copy_query_heap_results(
+            {reinterpret_cast<uint64_t>(g_profiler.heap())}, query_type::timestamp, 0, used,
+            {reinterpret_cast<uint64_t>(g_profiler.readback())}, 0, sizeof(uint64_t));
       queue->flush_immediate_command_list();
       queue->wait_idle();
       FinishRemote(profile_request, g_profiler.Write(g_addon_dir / L"shots"));

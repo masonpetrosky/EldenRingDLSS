@@ -108,10 +108,9 @@ void GpuProfiler::Force(ID3D12GraphicsCommandList* cmd) {
   lists_[cmd].forced = true;
 }
 
-void GpuProfiler::RecordResolve(ID3D12GraphicsCommandList* cmd) {
+uint32_t GpuProfiler::used() {
   std::lock_guard lock(mutex_);
-  if (heap_ == nullptr || used_ == 0) return;
-  cmd->ResolveQueryData(heap_, D3D12_QUERY_TYPE_TIMESTAMP, 0, used_, readback_, 0);
+  return heap_ == nullptr ? 0 : used_;
 }
 
 std::string GpuProfiler::Write(const std::filesystem::path& dir) {
