@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include "d3d12_util.hpp"
+#include "dred.hpp"
 #include "kWindPatchCs.h"
 #include "kWindResolveArgsCs.h"
 #include "kWindResolvePs.h"
@@ -240,12 +241,14 @@ void WindMotion::RecordSetup(ID3D12GraphicsCommandList* cmd) {
   cmd->ResourceBarrier(1, &back);
 }
 
-// The game's layout with the vertex stage's b8, b9 and b13 (space 0) taken out of their descriptor tables (the other
-// descriptors keep their offsets) and given root CBVs at the end, plus permission for stream output.
-bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layout, Root* root) {
+// The game's layout with the vertex stage's b8, b9 and b13 (space 0), and for skinned pipelines b5, taken out of their
+// descriptor tables (the other descriptors keep their offsets) and given root CBVs at the end, plus permission for
+// stream output.
+bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layout, bool skin, Root* root) {
+  const uint64_t key = layout_key | (skin ? 1 : 0);  // root signatures are pointers: the low bit is free
   {
     std::shared_lock lock(pipelines_mutex_);
-    const auto it = roots_.find(layout_key);
+    const auto it = roots_.find(key);
     if (it != roots_.end()) {
       *root = it->second;
       return root->signature != nullptr;
@@ -253,8 +256,9 @@ bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layo
   }
   std::vector<std::vector<D3D12_DESCRIPTOR_RANGE>> ranges(layout.size());
   std::vector<D3D12_ROOT_PARAMETER> params(layout.size());
-  static const uint32_t kMoved[3] = {8, 9, 13};
-  bool moved[3] = {false, false, false};
+  static const uint32_t kMoved[4] = {8, 9, 13, 5};
+  const int moved_count = skin ? 4 : 3;
+  bool moved[4] = {false, false, false, false};
   for (size_t i = 0; i < layout.size(); ++i) {
     const RootParam& p = layout[i];
     D3D12_ROOT_PARAMETER& out = params[i];
@@ -272,9 +276,9 @@ bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layo
       const bool vertex_cbv = r.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV && r.RegisterSpace == 0 &&
                               p.visibility == D3D12_SHADER_VISIBILITY_VERTEX;
       bool covers = false;
-      for (const uint32_t reg : kMoved)
-        covers |= vertex_cbv && r.BaseShaderRegister <= reg &&
-                  (r.NumDescriptors == UINT_MAX || r.BaseShaderRegister + r.NumDescriptors > reg);
+      for (int k = 0; k < moved_count; ++k)
+        covers |= vertex_cbv && r.BaseShaderRegister <= kMoved[k] &&
+                  (r.NumDescriptors == UINT_MAX || r.BaseShaderRegister + r.NumDescriptors > kMoved[k]);
       if (!covers) {
         ranges[i].push_back(r);
         continue;
@@ -286,7 +290,7 @@ bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layo
       const uint32_t end = r.BaseShaderRegister + r.NumDescriptors;
       for (uint32_t reg = r.BaseShaderRegister; reg <= end; ++reg) {
         int which = -1;
-        for (int k = 0; k < 3; ++k)
+        for (int k = 0; k < moved_count; ++k)
           if (reg != end && reg == kMoved[k]) which = k;
         if (reg != end && which < 0) continue;
         if (reg > start)
@@ -298,13 +302,14 @@ bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layo
     }
     out.DescriptorTable = {static_cast<UINT>(ranges[i].size()), ranges[i].data()};
   }
-  if (!moved[0] || !moved[1]) return false;
+  if (!moved[0] || !moved[1] || (skin && !moved[3])) return false;
   Root made;
   made.scene_param = static_cast<UINT>(params.size());
   made.frame_param = made.scene_param + 1;
-  for (int k = 0; k < 3; ++k) {
+  for (int k = 0; k < moved_count; ++k) {
     if (!moved[k]) continue;
     if (k == 2) made.wind_param = static_cast<UINT>(params.size());
+    if (k == 3) made.bones_param = static_cast<UINT>(params.size());
     D3D12_ROOT_PARAMETER cbv = {};
     cbv.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     cbv.Descriptor = {kMoved[k], 0};
@@ -316,7 +321,7 @@ bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layo
       D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT};
   made.signature = CreateRootSignature(device_, desc);
   std::unique_lock lock(pipelines_mutex_);
-  Root& stored = roots_[layout_key];
+  Root& stored = roots_[key];
   if (stored.signature == nullptr) stored = made;
   else Release(made.signature);  // another thread was faster
   *root = stored;
@@ -324,16 +329,18 @@ bool WindMotion::RootFor(uint64_t layout_key, const std::vector<RootParam>& layo
 }
 
 bool WindMotion::AddPipeline(uint64_t pipeline, const std::string& name, uint64_t layout_key,
-                             const std::vector<RootParam>& layout, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+                             const std::vector<RootParam>& layout, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+                             bool skin) {
   if (device_ == nullptr) return false;
   Root root;
-  if (!RootFor(layout_key, layout, &root)) {
+  if (!RootFor(layout_key, layout, skin, &root)) {
     status_ = "unsupported root layout for " + name;
     return false;
   }
   const UINT strides[2] = {kStride, kStride};
   StreamPipelines psos;
   psos.root = root;
+  psos.skin = skin;
 
   // Vertex-only passes: no rasterization, so only the vertex shader and input layout matter.
   D3D12_GRAPHICS_PIPELINE_STATE_DESC vs_only = {};
@@ -392,6 +399,12 @@ bool WindMotion::IsWindPipeline(uint64_t pipeline) const {
   return pipelines_.count(pipeline) != 0;
 }
 
+bool WindMotion::IsSkinPipeline(uint64_t pipeline) const {
+  std::shared_lock lock(pipelines_mutex_);
+  const auto it = pipelines_.find(pipeline);
+  return it != pipelines_.end() && it->second.skin;
+}
+
 ID3D12RootSignature* WindMotion::root_signature(uint64_t pipeline) const {
   std::shared_lock lock(pipelines_mutex_);
   const auto it = pipelines_.find(pipeline);
@@ -401,6 +414,12 @@ ID3D12RootSignature* WindMotion::root_signature(uint64_t pipeline) const {
 size_t WindMotion::pipeline_count() const {
   std::shared_lock lock(pipelines_mutex_);
   return pipelines_.size();
+}
+
+size_t WindMotion::skin_pipeline_count() const {
+  std::shared_lock lock(pipelines_mutex_);
+  return static_cast<size_t>(std::count_if(pipelines_.begin(), pipelines_.end(),
+                                           [](const auto& entry) { return entry.second.skin; }));
 }
 
 size_t WindMotion::full_pipeline_count() const {
@@ -414,6 +433,7 @@ D3D12_GPU_VIRTUAL_ADDRESS WindMotion::RecordPrevious(ID3D12GraphicsCommandList* 
   const uint64_t index = ring_next_.fetch_add(1) % kRingSlots;
   last_slot_ = index;
   const D3D12_GPU_VIRTUAL_ADDRESS slot = ring_->GetGPUVirtualAddress() + index * kRingSlot;
+  Marker(cmd, L"ERDLSS previous constants");
   const D3D12_RESOURCE_BARRIER to =
       Transition(ring_, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   cmd->ResourceBarrier(1, &to);
@@ -442,6 +462,7 @@ D3D12_GPU_VIRTUAL_ADDRESS WindMotion::RecordTreeWind(ID3D12GraphicsCommandList* 
   uint64_t offset = tree_ring_next_.fetch_add(size);
   if (offset % kTreeRingSize + size > kTreeRingSize) offset = tree_ring_next_.fetch_add(size);  // skip the wrap
   const D3D12_GPU_VIRTUAL_ADDRESS copy = tree_ring_->GetGPUVirtualAddress() + offset % kTreeRingSize;
+  Marker(cmd, L"ERDLSS tree wind");
   // Buffers start every command list in the common state and are promoted implicitly on their first use, so the ring
   // only needs to be taken out of the constant-buffer state after an earlier patch of the same list.
   if (!first_in_list) {
@@ -471,6 +492,7 @@ D3D12_GPU_VIRTUAL_ADDRESS WindMotion::RecordTreeWind(ID3D12GraphicsCommandList* 
 }
 
 void WindMotion::RecordFrameEnd(ID3D12GraphicsCommandList* cmd) {
+  Marker(cmd, L"ERDLSS tree frame end");
   D3D12_RESOURCE_BARRIER uav = {};
   uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   uav.UAV.pResource = tree_table_;
@@ -506,7 +528,8 @@ bool WindMotion::RecordStreams(ID3D12GraphicsCommandList* cmd, uint64_t pipeline
                                D3D12_GPU_VIRTUAL_ADDRESS frame, D3D12_GPU_VIRTUAL_ADDRESS prev_scene,
                                D3D12_GPU_VIRTUAL_ADDRESS prev_frame, D3D12_GPU_VIRTUAL_ADDRESS wind,
                                D3D12_GPU_VIRTUAL_ADDRESS prev_wind, uint32_t index_count, uint32_t instance_count,
-                               uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
+                               uint32_t first_index, int32_t vertex_offset, uint32_t first_instance,
+                               D3D12_GPU_VIRTUAL_ADDRESS bones, D3D12_GPU_VIRTUAL_ADDRESS prev_bones) {
   StreamPipelines psos;
   {
     std::shared_lock lock(pipelines_mutex_);
@@ -514,19 +537,26 @@ bool WindMotion::RecordStreams(ID3D12GraphicsCommandList* cmd, uint64_t pipeline
     if (it == pipelines_.end()) return false;
     psos = it->second;
   }
+  const bool bones_bound = psos.root.bones_param != UINT32_MAX;
+  if (bones_bound && (bones == 0 || prev_bones == 0)) return false;  // a skinned pipeline needs both poses
+  Marker(cmd, psos.skin ? L"ERDLSS npc stream previous" : L"ERDLSS wind stream previous");
   cmd->SetPipelineState(psos.prev);
   cmd->SetGraphicsRootConstantBufferView(psos.root.scene_param, prev_scene);
   cmd->SetGraphicsRootConstantBufferView(psos.root.frame_param, prev_frame);
   const bool wind_bound = psos.root.wind_param != UINT32_MAX && wind != 0;
   if (wind_bound) cmd->SetGraphicsRootConstantBufferView(psos.root.wind_param, prev_wind != 0 ? prev_wind : wind);
+  if (bones_bound) cmd->SetGraphicsRootConstantBufferView(psos.root.bones_param, prev_bones);
   cmd->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
   const bool full = psos.full != nullptr && full_draw_.load();
+  Marker(cmd, psos.skin ? L"ERDLSS npc stream current" : L"ERDLSS wind stream current");
   cmd->SetPipelineState(full ? psos.full : psos.cur);
   cmd->SetGraphicsRootConstantBufferView(psos.root.scene_param, scene);
   cmd->SetGraphicsRootConstantBufferView(psos.root.frame_param, frame);
   if (wind_bound) cmd->SetGraphicsRootConstantBufferView(psos.root.wind_param, wind);
+  if (bones_bound) cmd->SetGraphicsRootConstantBufferView(psos.root.bones_param, bones);
   cmd->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
   ++streamed_draws_;
+  if (psos.skin) ++skin_draws_;
   if (full) ++replaced_draws_;
   streamed_vertices_ += static_cast<uint64_t>(index_count) * instance_count;
   return full;
@@ -576,6 +606,7 @@ bool WindMotion::Resolve(ID3D12GraphicsCommandList* cmd, ID3D12Resource* motion,
   }
   ID3D12PipelineState* const pso = ResolvePipeline(dsv_format);
   if (pso == nullptr) return false;
+  Marker(cmd, L"ERDLSS stream resolve");
 
   const uint32_t slot = resolve_count_++ % kResolveSlots;
   D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};

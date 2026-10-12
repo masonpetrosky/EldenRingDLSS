@@ -43,11 +43,14 @@ class WindMotion {
   // (without root signature and stream output); `layout` is its root layout, identified by `layout_key`. The copies
   // use the same layout with the vertex stage's cbSceneParam (b8), cbPerFrame (b9) and, where the table has it,
   // cbSpeedTreeWind (b13) moved to root CBVs, and allow stream output. Without a pixel shader in `desc` (or if the full copy fails) the current positions come from a
-  // vertex-only pass instead of the game's draw.
+  // vertex-only pass instead of the game's draw. `skin`: a skinned character's pipeline (skin_motion.hpp), whose
+  // copies also take cbObjMatrix (b5) as a root CBV.
   bool AddPipeline(uint64_t pipeline, const std::string& name, uint64_t layout_key,
-                   const std::vector<RootParam>& layout, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc);
+                   const std::vector<RootParam>& layout, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+                   bool skin = false);
   void RemovePipeline(uint64_t pipeline);
-  bool IsWindPipeline(uint64_t pipeline) const;
+  bool IsWindPipeline(uint64_t pipeline) const;  // any pipeline with stream-output copies, skinned ones included
+  bool IsSkinPipeline(uint64_t pipeline) const;
   // The root signature of `pipeline`'s copies. Bind the game's descriptor tables to it at their own parameter
   // indices before RecordStreams.
   ID3D12RootSignature* root_signature(uint64_t pipeline) const;
@@ -79,14 +82,16 @@ class WindMotion {
   void BindStreams(ID3D12GraphicsCommandList* cmd);
 
   // Records the previous-position pass and the current-position pass for an indexed draw. `wind` and `prev_wind`
-  // are cbSpeedTreeWind for the two passes (0: none; only bound if the copies' layout has b13). Returns true when the
-  // current pass was the game's own draw (the caller skips the original), false when it only streamed positions.
-  // Leaves a stream-output pipeline bound; the caller restores the game's root signature, tables and pipeline.
+  // are cbSpeedTreeWind for the two passes (0: none; only bound if the copies' layout has b13), `bones` and
+  // `prev_bones` cbObjMatrix (skinned pipelines only). Returns true when the current pass was the game's own draw
+  // (the caller skips the original), false when it only streamed positions. Leaves a stream-output pipeline bound;
+  // the caller restores the game's root signature, tables and pipeline.
   bool RecordStreams(ID3D12GraphicsCommandList* cmd, uint64_t pipeline, D3D12_GPU_VIRTUAL_ADDRESS scene,
                      D3D12_GPU_VIRTUAL_ADDRESS frame, D3D12_GPU_VIRTUAL_ADDRESS prev_scene,
                      D3D12_GPU_VIRTUAL_ADDRESS prev_frame, D3D12_GPU_VIRTUAL_ADDRESS wind,
                      D3D12_GPU_VIRTUAL_ADDRESS prev_wind, uint32_t index_count, uint32_t instance_count,
-                     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance);
+                     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance,
+                     D3D12_GPU_VIRTUAL_ADDRESS bones = 0, D3D12_GPU_VIRTUAL_ADDRESS prev_bones = 0);
 
   // Rasterizes the frame's streamed vegetation into `motion` (R16G16_FLOAT, in the all-shader-resource state) where its
   // depth matches `depth` (D32_FLOAT_S8X24 or D32_FLOAT, in the all-shader-resource state), then resets the streams.
@@ -107,27 +112,31 @@ class WindMotion {
   std::string DebugText();  // the GPU must be done with the captured frame
 
   uint64_t streamed_draws() const { return streamed_draws_.load(); }
+  uint64_t skin_draws() const { return skin_draws_.load(); }
   uint64_t replaced_draws() const { return replaced_draws_.load(); }
   uint64_t patches() const { return patches_.load(); }
   uint64_t tree_patches() const { return tree_patches_.load(); }
   uint64_t streamed_vertices() const { return streamed_vertices_.load(); }
   size_t pipeline_count() const;
   size_t full_pipeline_count() const;
+  size_t skin_pipeline_count() const;
 
  private:
   struct Root {
     ID3D12RootSignature* signature = nullptr;
     UINT scene_param = 0, frame_param = 0;  // root CBVs for the vertex stage's b8 / b9
     UINT wind_param = UINT32_MAX;           // root CBV for its b13 (cbSpeedTreeWind), if its table covers it
+    UINT bones_param = UINT32_MAX;          // root CBV for its b5 (cbObjMatrix), skinned pipelines only
   };
   struct StreamPipelines {
     ID3D12PipelineState* prev = nullptr;  // vertex only, writes slot 0
     ID3D12PipelineState* cur = nullptr;   // vertex only, writes slot 1
     ID3D12PipelineState* full = nullptr;  // the game's pipeline that also writes slot 1 (may be null)
     Root root;
+    bool skin = false;
   };
 
-  bool RootFor(uint64_t layout_key, const std::vector<RootParam>& layout, Root* root);
+  bool RootFor(uint64_t layout_key, const std::vector<RootParam>& layout, bool skin, Root* root);
   ID3D12PipelineState* ResolvePipeline(DXGI_FORMAT dsv_format);
 
   ID3D12Device* device_ = nullptr;
@@ -175,11 +184,12 @@ class WindMotion {
   uint32_t resolve_count_ = 0;
 
   mutable std::shared_mutex pipelines_mutex_;
-  std::unordered_map<uint64_t, Root> roots_;                  // game layout -> its copy with root CBVs
+  std::unordered_map<uint64_t, Root> roots_;  // game layout (| 1 for skinned pipelines) -> its copy with root CBVs
   std::unordered_map<uint64_t, StreamPipelines> pipelines_;  // game pipeline -> stream-output copies
   std::vector<ID3D12PipelineState*> retired_;
 
   std::atomic<uint64_t> streamed_draws_{0};
+  std::atomic<uint64_t> skin_draws_{0};
   std::atomic<uint64_t> replaced_draws_{0};
   std::atomic<uint64_t> streamed_vertices_{0};
   std::atomic<uint64_t> patches_{0};

@@ -703,3 +703,75 @@ cloth-cancel matrices with their previous copies; the NPC draws bind only the cu
 instances through `cbInstanceData`/`cbInstanceIdxParam`), so no previous pose exists for them. With the game's
 motion blur set to High, a new dump showed the same: still no motion on the soldier and the sheep. The plan is in
 `docs/handoff.md`, next steps 1 and 2.
+
+### How the skinned draws are laid out (2026-10-11, `tools/rdc_skin.py` on the same capture)
+
+`captures/npcs/skin.txt` lists every skinned draw with its instancing. What the NPC motion vectors build on:
+
+- **One draw per character and mesh part.** Every skinned G-buffer draw has one instance. The "6x" and "5x" draws
+  are the same mesh part drawn once per character: the five sheep's `C[Fur]_Gbuf_Skin` draws 112519-112547 share
+  index range and vertex buffer, and differ only in `cbInstanceIdxParam` (`VC_InstanceIdxOffset` 0-4), which picks
+  the character's entry in `g_InstanceIndexBuffer` (t25) and from there its `PerInstanceData` in `cbInstanceData`.
+- **One bone pool per model and frame.** All characters of a model share one `cbObjMatrix` window (soldiers 64 KB,
+  sheep 24 KB) in the game's 160 MB constant ring; each `PerInstanceData` (13 float4s) holds `mWorld` (translation in
+  `.w` of its three rows, equal to bone 0) and `matricesData`, the first bone of that character in the pool (soldiers
+  at 0, 178, 356; sheep at 0, 75, 150, 225, 300). The vertex shader reads bone `matricesData + BLENDINDICES` from
+  `cbObjMatrix` (b5) and the same entry from `cbClothCancelObjMatrix` (b12, identity for these NPCs), then projects
+  `world - SC_CameraPos` with `VC_MatrixViewProj`. The other ints behind `matricesData` (`cmMatricesOffset`,
+  `ccMatricesOffset`, `prevMatricesOffset`) hold leftover memory for NPCs and the player alike; nothing uses them.
+- **The player's velocity shader** (`C[DetailBlend]_Velo_Skin`) reads the previous pose from `cbPrevObjMatrix` (b6)
+  and `cbPrevClothCancelObjMatrix` (b13) at the same `matricesData` offset, and projects it with `SC_PrevCameraPos`
+  and `VC_PrevMatrixViewProj`. So a previous pose only needs last frame's bones at the current character's offset.
+- **Identifying the player's parts.** The velocity draws use the same index buffer, first index and index count as
+  the player's G-buffer draws (e.g. 111819 and 124316: `ib=74776+0`, first 0, 18684 indices).
+- NPC materials seen: `C[DetailBlend]_Gbuf_Skin` (+ `[S2]`, `_cloth_`, `_FurBlur_`), `C[AMSN]`, `C[Fur]`,
+  `C[Shell]_FurBlur`, `C[c4190]_*`, and skinned map objects `M[AMSN_V][Ov_AN]_Skin_Gbuf`. None has a velocity
+  variant drawn; their shadow (`_Dpt_Skin`) and fur-direction (`_FurDir_Skin`, 1920x1080) draws do not matter here.
+
+Plan taken: like the trees' wind, stream out each NPC G-buffer draw twice with the game's own vertex shader, once
+with last frame's camera and bones, and rasterize the difference at the TAA (`src/skin_motion.hlsl`). Characters are
+matched to last frame's by mesh part and nearest position, since their pool order and offsets can change.
+
+## Enemy and animal motion vectors: working (2026-10-11)
+
+`NpcMotion=1` (overlay checkbox "Enemy and animal motion vectors", dev remote `npc on|off`) runs every skinned
+G-buffer draw the game gives no velocity draw (all but the player's, learned from the velocity pass by mesh part)
+through the stream-output path (`wind.cpp`) with a copy of the pipeline that takes `cbObjMatrix` (b5) as a root CBV.
+For the previous pose it binds a window that `skin_motion.hlsl` fills with each character's bones from last frame:
+two GPU tables (this frame's, last frame's) hold, per mesh part and character, its position and where its bones were
+copied (a 32 MB store ring); a character takes last frame's nearest entry of the same part within 2 m. The game
+creates about 1190 skinned G-buffer pipelines; the copies take no noticeable time at startup.
+
+What went wrong on the way, each found in game:
+
+- **GPU hang on loading in.** `cond ? storeLoad : boneLoad` in HLSL evaluates both loads, and without a match the store
+  offset was 0xFFFFFFFF, 4 GB past a root UAV that has no bounds checks. Every load now uses a valid address and the
+  results are selected afterwards. `tree_wind.hlsl` had the same pattern; its unused load happened to land inside the
+  table (offset +32 wraps), so it never faulted.
+- **Nothing reached the screen below full size.** The stream resolve drew with the motion texture's size as viewport,
+  but at render scales below 1 the scene fills only the top-left render-size part of the full-size targets, so every
+  streamed triangle landed at twice its position and failed the depth test. The resolve now uses the scene's size
+  (`FC_ScreenSize`). This also broke the **trees' motion vectors at 50%** since upscaling went into the everyday
+  install (2026-10-10; trees were verified at DLAA on 2026-10-09). A motion dump after the fix shows the canopy moving
+  again.
+- **1.8 ms for 80 character draws.** Each patch was a compute dispatch with barriers in the middle of the G-buffer
+  pass, stalling the GPU 80 times a frame. The draws now only plan their patches; when the game executes the list,
+  `SkinMotion::SubmitJobs` runs all of them in a command list of the add-on's own on the same queue just before it.
+
+Tests (dev remote): `npctest 0.3` shifts every previous pose 0.3 m along x, so everything the path draws lights up in
+an `mv` dump; `npcstage 1|2|3` (streams with current bones / patch without using it / full) separates the costs; `npc`
+reports draws, matches and why draws were skipped. Limgrave, soldiers with torches and animals, 4K at 50%, preset M,
+RR on:
+
+| | frame time |
+| --- | --- |
+| NPC motion off | 17.6 ms, later view 20.7 ms |
+| per-draw patches (first version) | 19.4 ms (+1.8) |
+| streams only, no patch (`npcstage 1`) | 17.65 ms |
+| patches before the list (current) | 20.9-21.0 ms in the later view (+0.2-0.3) |
+
+With `npctest 0.3` all soldiers and animals in view light up; without it the walking soldiers carry their real motion
+(the game's own data had them at exactly 0). The user toggled it while watching a torch-carrying soldier walk: "a
+noticeable improvement when it's on". Not covered: a part shared with the player's equipment keeps no motion (it is
+in the velocity set), two identical characters within 2 m can swap previous poses, cloth simulated on the CPU only
+gets the camera's motion.

@@ -17,7 +17,8 @@ for picking up.
 | DLSS Ray Reconstruction | Dev install; with our own ray generation shaders (below) |
 | Own ray generation shaders (render-size AO, 1 ray, blue noise) | Dev install default (`RtShadowRayGen=3`) |
 | 4. Release | v0.1.0 on GitHub (release zip) and Nexus Mods (2026-10-11) |
-| Motion vectors for enemies and animals | **Open**: only the player writes them (next step 1) |
+| Motion vectors for enemies and animals | Dev install (`NpcMotion=1`), working, +0.2-0.3 ms (2026-10-11) |
+| Tree motion vectors at 50% | Were lost since 2026-10-10 (resolve viewport); fixed in the dev build |
 | Object-only motion blur | **Wanted** by the user (next step 2) |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
@@ -83,6 +84,9 @@ pwsh -NoProfile -File tools/package.ps1               # release zip in dist\ (ve
   `mv N name` (TAA input dumps), `capture`, `scale <x>`, the wind and upscaling switches, and for ray tracing
   `rtgen [0-4]` (sun shadow ray generation: game's, port, port + render-size AO with PCG, blue noise, temporal blue
   noise), `rtsamples <ao> <shadow>` (0 = game's/default), `rr`, `rrraw none|shadows|all`, `rrpreset`, `rtinfo`.
+- NPC motion (dev remote): `npc` (stats; `npc on|off` switches and saves), `npcstage 1|2|3`, `npctest <m>` (shifts
+  every previous pose so everything the path draws shows motion), `npcdist`, `npcbones`. `Dred=1` in the ini turns on
+  D3D12 crash breadcrumbs; after a GPU hang the report is in the log and `shots/dred.txt`.
 - `tools/mem.py` reads, searches and writes the running game's memory from outside; works under RenderDoc too.
 - Analysis scripts in `tools/` (Python venv at `.tools\venv`): `mv_check.py` (motion dumps), `shots.py`,
   `wind_check.py`, `tree_check.py`, `prepass_check.py`, `blue_noise.py` (regenerates `src/blue_noise.hlsli`).
@@ -125,25 +129,17 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
-1. **Motion vectors for enemies and animals** (docs/recon.md, "Other characters have no motion vectors"). Only the
-   player's meshes get velocity draws: in `er117_npcs_f978.rdc` all 36 velocity draws (events 124272-124637) match
-   the player's G-buffer draws (111520-111830); the NPC G-buffer draws (112034 on: soldier-size meshes 6x each,
-   `C[Fur]` sheep 5x, more fur and shell meshes 3x) have none. The player's `*_Velo_Skin` vertex shaders bind
-   `cbObjMatrix` and `cbPrevObjMatrix` (3 KB bone palettes) plus `cbClothCancelObjMatrix` and its previous copy; the
-   NPC draws bind only the current `cbObjMatrix` (64 KB, several instances, picked through `cbInstanceData` /
-   `cbInstanceIdxParam`), so the game keeps no previous pose for them. Turning the game's motion blur on does not
-   add NPC velocity (tested 2026-10-11). Plan: keep a GPU copy of each NPC draw's bone palette every frame (keyed by
-   vertex/index buffer, index range and instance; check that instance order is stable across frames), and draw
-   their velocity with the game's own `C[...]_Velo_Skin` pipelines (captured at creation by shader debug name) with
-   the current palette and our previous copy, depth-tested into the TAA's motion texture like the wind merge. Watch
-   alpha-tested `[A]` variants and the cloth-cancel matrices. Alternative: find the per-character switch for
-   velocity in the code (Ghidra) and turn it on for everyone.
+1. **Enemy and animal motion vectors into the everyday install** (with the tree fix at 50%), with the user's OK and
+   the game closed: the dev build has `NpcMotion=1`; the everyday ini would need it too. Details and measurements in
+   docs/recon.md, "Enemy and animal motion vectors: working". Open edges: parts shared with the player's equipment,
+   identical characters within 2 m, CPU cloth.
 2. **Object-only motion blur.** The user likes object motion blur but not camera motion blur; today the game's
    object blur only covers the player (no NPC velocity), and turning motion blur on blurs camera motion too. Plan: a
    capture with motion blur on to find the blur passes, then remove the camera part of the motion they read (the
    camera motion is what `MotionBlurWriteCMBVelocityPS` writes from depth and the matrices) or give them an
    object-only velocity. Check that our wind motion vectors (merged into the same motion texture) do not get grass
-   blurred. Depends on step 1 for enemies.
+   blurred. Our NPC and tree motion is written at the TAA (the stream resolve); check whether the game's blur passes
+   read the motion texture before that, in which case the resolve has to move earlier for the blur to see it.
 3. RR's responsivity mask on vegetation (preset F only; negative values favor stability) for the grass at 50%.
 4. Ray Reconstruction with our shaders in the everyday install: measure it side by side with the current DLSS M
    setup first; the user decides.

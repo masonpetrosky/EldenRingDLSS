@@ -86,9 +86,13 @@ void Patch(uint3 id : SV_DispatchThreadID) {
   Insert(TableBase(frame), h, key, idx);
   const uint previous = Find(TableBase(frame + 1), h, key);
   const uint dest = idx * kEntry;
-  for (uint k = 0; k < 17; ++k)
-    g_Out.Store4(dest + k * 16,
-                 previous != kNone ? g_Table.Load4(previous + 32 + k * 16) : asuint(g_Wind[idx * 17 + k]));
+  // ?: evaluates both sides: the table load needs a valid address even when there is no previous entry.
+  const uint source = previous != kNone ? previous : TableBase(frame);
+  for (uint k = 0; k < 17; ++k) {
+    const uint4 stored = g_Table.Load4(source + 32 + k * 16);
+    const uint4 current = asuint(g_Wind[idx * 17 + k]);
+    g_Out.Store4(dest + k * 16, previous != kNone ? stored : current);
+  }
 }
 
 // Once per frame after its last tree draw: empties the next frame's table (one thread per slot) ...

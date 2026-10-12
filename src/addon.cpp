@@ -29,9 +29,11 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "descriptors.hpp"
+#include "dred.hpp"
 #include "drs_probe.hpp"
 #include "dlss.hpp"
 #include "engine_resolution.hpp"
@@ -39,6 +41,7 @@
 #include "render_scale.hpp"
 #include "rr_guides.hpp"
 #include "rt_pipeline.hpp"
+#include "skin_motion.hpp"
 #include "ao_upscale.hpp"
 #include "state_tracking.hpp"
 #include "stretch.hpp"
@@ -131,6 +134,8 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   uint64_t wind_scene = 0, wind_frame = 0, wind_prev = 0;
   bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
   bool tree_wind_patched = false;   // a tree wind copy was written in this command list
+  std::vector<erdlss::SkinMotion::Job> skin_jobs;  // NPC patches, run right before this list is executed
+  uint64_t index_va = 0;            // GPU address of the bound index buffer view (identifies NPC mesh parts)
   uint32_t rt_group = 0;  // ray tracing: refits recorded so far in this list (the animation dispatches before one belong to it)
   bool rt_group_keep = false;  // the current group animates a skinned character: refit it every frame
 };
@@ -174,6 +179,9 @@ struct Config {
   // themselves instead of drawing the batch a second time (wind_prepass.hlsl). Works, but costs more than the second
   // draw: the wind math runs for every prepass fragment, overdraw included (docs/recon.md).
   bool wind_prepass = false;
+  // Motion vectors for enemies and animals (skin_motion.hpp), through the wind's stream-output path.
+  bool npc_motion = false;
+  bool dred = false;  // development: D3D12 crash breadcrumbs (dred.hpp), read at startup
   bool flip_jitter_x = false;
   bool flip_jitter_y = false;
   bool flip_motion = false;
@@ -214,6 +222,17 @@ std::atomic<bool> g_wind_ready{false};
 std::atomic<bool> g_port_ready{false};
 std::atomic<bool> g_wind_failed{false};
 std::atomic<bool> g_trees_failed{false};
+erdlss::SkinMotion g_skin;  // NPC motion vectors: previous-pose bones for the stream-output path
+std::atomic<bool> g_skin_failed{false};
+std::atomic<int> g_npc_stage{3};  // development (ini NpcStage, remote "npcstage"): see StreamSkinDraw
+// Development counts of skinned main-camera draws: seen, left to the game (velocity), and where the others stopped.
+struct NpcCounts {
+  std::atomic<uint64_t> seen{0}, velocity{0}, prepare{0}, inputs{0}, patch{0}, streamed{0}, replaced{0};
+};
+NpcCounts g_npc_counts;
+// Mesh parts (PartKey) that the game draws velocity for (the player's): left to the game.
+std::shared_mutex g_velocity_mutex;
+std::unordered_set<uint32_t> g_velocity_parts;
 std::atomic<uint64_t> g_wind_errors{0};
 std::atomic<uint64_t> g_wind_resolves{0};
 std::string g_wind_error;  // first error, under g_wind_mutex
@@ -538,6 +557,9 @@ void LoadConfig() {
   g_config.wind_mode = ReadInt(L"WindMode", 1) == 0 ? 0 : 1;
   g_config.wind_prepass = ReadInt(L"WindPrepass", 0) != 0;
   g_config.wind_trees = ReadInt(L"WindTrees", 1) != 0;
+  g_config.npc_motion = ReadInt(L"NpcMotion", 0) != 0;
+  g_npc_stage = std::clamp(ReadInt(L"NpcStage", 3), 1, 3);
+  g_config.dred = ReadInt(L"Dred", 0) != 0;
   g_config.ray_reconstruction = ReadInt(L"RayReconstruction", 0) != 0;
   g_rt_shadow_raygen = std::clamp(ReadInt(L"RtShadowRayGen", 0), 0, 4);
   g_config.wind_tree_capacity = std::max(1, std::min(ReadInt(L"WindTreeCapacity", 4), 16));
@@ -563,6 +585,7 @@ void SaveConfig() {
   WriteInt(L"WindMode", g_config.wind_mode);
   WriteInt(L"WindPrepass", g_config.wind_prepass);
   WriteInt(L"WindTrees", g_config.wind_trees);
+  WriteInt(L"NpcMotion", g_config.npc_motion);
   WriteInt(L"RayReconstruction", g_config.ray_reconstruction);
   WriteInt(L"WindTreeCapacity", g_config.wind_tree_capacity);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
@@ -1834,6 +1857,7 @@ void OnDestroyDevice(device* dev) {
     g_wind.Shutdown();
     g_port_ready = false;
     g_wind_port.Shutdown();
+    g_skin.Shutdown();
   }
   g_tree_end = 0;
   g_tree_dump.Shutdown();
@@ -1882,10 +1906,31 @@ bool IsWindMaterial(const std::string& name) {
   return false;
 }
 
+// Skinned G-buffer shaders (characters, and skinned map objects such as banners). The game draws velocity only for the
+// player's; the others get theirs from the stream-output path with last frame's bones (skin_motion.hpp).
+bool IsSkinMaterial(const std::string& name) {
+  return name.find("_Gbuf_Skin@") != std::string::npos || name.find("_Skin_Gbuf@") != std::string::npos;
+}
+
+// A mesh part across frames: its index buffer view's address, first index and index count.
+uint32_t PartKey(uint64_t index_va, uint32_t first_index, uint32_t index_count) {
+  uint64_t h = index_va * 0x9E3779B97F4A7C15ull;
+  h ^= ((static_cast<uint64_t>(first_index) << 32) | index_count) * 0xC2B2AE3D27D4EB4Full;
+  h ^= h >> 31;
+  return static_cast<uint32_t>(h ^ (h >> 32)) | 1;
+}
+
 // SpeedTree G-buffer shaders whose trees sway (billboards are flat far-away stand-ins without wind).
 bool IsTreeMaterial(const std::string& name) {
   return name.rfind("SpeedTree_", 0) == 0 && name.find("_Gbuf@") != std::string::npos &&
          name.find("billboard") == std::string::npos;
+}
+
+// Whether a remembered pipeline gets stream-output copies once that path runs: all animated vegetation with the
+// stream-output path for everything (wind mode 0), else SpeedTree; characters while NPC motion is on.
+bool WantsStreamCopies(const std::string& name) {
+  if (IsSkinMaterial(name)) return g_config.npc_motion;
+  return g_config.wind_mode == 0 || IsTreeMaterial(name);
 }
 
 void SetWindError(const std::string& error) {
@@ -2082,6 +2127,11 @@ void AddPortPipeline(uint64_t pipeline, WindSource& source) {
 
 // Builds the stream-output copies of a remembered pipeline. Called with g_wind_mutex held.
 void AddWindPipeline(uint64_t pipeline, WindSource& source) {
+  // The vertex-only copies drop hull, domain and geometry stages and assume triangle lists, which the game's draw
+  // must match; characters drawn otherwise keep the game's draw (vegetation never is).
+  if (IsSkinMaterial(source.name) &&
+      (source.other_stages || source.topology != primitive_topology::triangle_list))
+    return;
   auto* const descriptors = g_device != nullptr ? g_device->get_private_data<erdlss::Descriptors>() : nullptr;
   std::vector<erdlss::WindMotion::RootParam> layout;
   if (descriptors == nullptr || !ToRootParams(descriptors->Params(source.layout), &layout)) {
@@ -2090,7 +2140,8 @@ void AddWindPipeline(uint64_t pipeline, WindSource& source) {
   }
   std::vector<D3D12_INPUT_ELEMENT_DESC> input_layout;
   const D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = ToPipelineDesc(source, &input_layout);
-  if (!g_wind.AddPipeline(pipeline, source.name, source.layout.handle, layout, desc)) SetWindError(g_wind.status());
+  if (!g_wind.AddPipeline(pipeline, source.name, source.layout.handle, layout, desc, IsSkinMaterial(source.name)))
+    SetWindError(g_wind.status());
 }
 
 void RememberWindPipeline(device* dev, pipeline_layout layout, uint32_t count, const pipeline_subobject* subobjects,
@@ -2159,16 +2210,16 @@ void RememberWindPipeline(device* dev, pipeline_layout layout, uint32_t count, c
     logged.push_back(material);
     char text[256];
     std::snprintf(text, sizeof(text),
-                  "Wind material %s: depth test %d, write %d, func %u, stencil %d, cull %u, PS %zu B",
-                  material.c_str(), source.depth_stencil.depth_enable, source.depth_stencil.depth_write_mask,
+                  "%s material %s: depth test %d, write %d, func %u, stencil %d, cull %u, PS %zu B, topology %u%s",
+                  IsSkinMaterial(name) ? "Skinned" : "Wind", material.c_str(), source.depth_stencil.depth_enable, source.depth_stencil.depth_write_mask,
                   static_cast<uint32_t>(source.depth_stencil.depth_func), source.depth_stencil.stencil_enable,
-                  static_cast<uint32_t>(source.rasterizer.cull_mode), source.ps.size());
+                  static_cast<uint32_t>(source.rasterizer.cull_mode), source.ps.size(),
+                  static_cast<uint32_t>(source.topology), source.other_stages ? ", other stages" : "");
     Log(reshade::log::level::info, text);
   }
   WindSource& stored = g_wind_sources[p.handle];
   stored = std::move(source);
-  if (g_wind_ready.load() && (g_config.wind_mode == 0 || IsTreeMaterial(stored.name)))
-    AddWindPipeline(p.handle, stored);
+  if (g_wind_ready.load() && WantsStreamCopies(stored.name)) AddWindPipeline(p.handle, stored);
   if (g_port_ready.load()) AddPortPipeline(p.handle, stored);
 }
 
@@ -2181,7 +2232,7 @@ void OnInitPipeline(device* dev, pipeline_layout layout, uint32_t count, const p
     std::string name = MaterialName(vs);
     if (name.empty()) break;
     material = true;
-    if (IsWindMaterial(name)) RememberWindPipeline(dev, layout, count, subobjects, p, vs, name);
+    if (IsWindMaterial(name) || IsSkinMaterial(name)) RememberWindPipeline(dev, layout, count, subobjects, p, vs, name);
     std::unique_lock lock(g_material_mutex);
     g_material_vs[p.handle] = {std::move(name), layout, Contains(vs, "FC_GlobalTime"), Contains(vs, "g_forceParam")};
     break;
@@ -2228,6 +2279,13 @@ void OnDestroyPipeline(device*, pipeline p) {
   }
   std::unique_lock lock(g_pipeline_mutex);
   g_pipelines.erase(p.handle);
+}
+
+void OnBindIndexBuffer(command_list* cmd_list, resource buffer, uint64_t offset, uint32_t) {
+  auto* const data = cmd_list->get_private_data<CmdData>();
+  if (data == nullptr) return;
+  data->index_va =
+      buffer != 0 ? reinterpret_cast<ID3D12Resource*>(buffer.handle)->GetGPUVirtualAddress() + offset : 0;
 }
 
 void OnBindPipeline(command_list* cmd_list, pipeline_stage, pipeline p) {
@@ -2366,6 +2424,42 @@ void RestoreCompute(command_list* cmd_list) {
   }
 }
 
+// GPU addresses and sizes (bytes) of the views bound to four registers at the current draw (constant buffers and
+// buffer SRVs; constant buffers at most 64 KB).
+struct InputSource {
+  shader_stage stage;
+  RegisterKind kind;
+  uint32_t reg;
+};
+bool FindInputs(device* dev, pipeline_layout layout, const std::vector<descriptor_table>& tables,
+                const InputSource (&sources)[4], D3D12_GPU_VIRTUAL_ADDRESS (&va)[4], uint64_t (&sizes)[4]) {
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (descriptors == nullptr) return false;
+  for (int i = 0; i < 4; ++i) {
+    descriptor_heap heap = {0};
+    uint32_t offset = 0;
+    if (!descriptors->Find(dev, layout, tables, sources[i].stage, sources[i].kind, sources[i].reg, 0, &heap, &offset))
+      return false;
+    if (sources[i].kind == RegisterKind::kConstantBuffer) {
+      const buffer_range range = descriptors->Buffer(heap, offset);
+      if (range.buffer == 0) return false;
+      va[i] = reinterpret_cast<ID3D12Resource*>(range.buffer.handle)->GetGPUVirtualAddress() + range.offset;
+      sizes[i] = std::min<uint64_t>(range.size, 65536);
+    } else {
+      const resource_view view = descriptors->View(heap, offset);
+      const resource buffer = view != 0 ? dev->get_resource_from_view(view) : resource{0};
+      // A texture left in the slot has no GPU address to read through a root view.
+      if (buffer == 0 || dev->get_resource_desc(buffer).type != resource_type::buffer) return false;
+      const resource_view_desc desc = dev->get_resource_view_desc(view);
+      const uint64_t total = dev->get_resource_desc(buffer).buffer.size;
+      if (desc.buffer.offset >= total) return false;
+      va[i] = reinterpret_cast<ID3D12Resource*>(buffer.handle)->GetGPUVirtualAddress() + desc.buffer.offset;
+      sizes[i] = std::min(desc.buffer.size, total - desc.buffer.offset);
+    }
+  }
+  return true;
+}
+
 // GPU addresses of a SpeedTree draw's wind inputs: cbSpeedTreeWind (vertex b13, and its size), cbInstanceData (pixel
 // b4), cbInstanceIdxParam (vertex b10) and g_InstanceIndexBuffer (vertex t25).
 struct TreeInputs {
@@ -2374,38 +2468,41 @@ struct TreeInputs {
 };
 bool FindTreeInputs(device* dev, pipeline_layout layout, const std::vector<descriptor_table>& tables,
                     TreeInputs* out) {
-  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
-  if (descriptors == nullptr) return false;
-  struct Source {
-    shader_stage stage;
-    RegisterKind kind;
-    uint32_t reg;
-  };
-  static const Source kSources[4] = {{shader_stage::vertex, RegisterKind::kConstantBuffer, 13},
-                                     {shader_stage::pixel, RegisterKind::kConstantBuffer, 4},
-                                     {shader_stage::vertex, RegisterKind::kConstantBuffer, 10},
-                                     {shader_stage::vertex, RegisterKind::kShaderResource, 25}};
+  static const InputSource kSources[4] = {{shader_stage::vertex, RegisterKind::kConstantBuffer, 13},
+                                          {shader_stage::pixel, RegisterKind::kConstantBuffer, 4},
+                                          {shader_stage::vertex, RegisterKind::kConstantBuffer, 10},
+                                          {shader_stage::vertex, RegisterKind::kShaderResource, 25}};
   D3D12_GPU_VIRTUAL_ADDRESS va[4] = {};
-  for (int i = 0; i < 4; ++i) {
-    descriptor_heap heap = {0};
-    uint32_t offset = 0;
-    if (!descriptors->Find(dev, layout, tables, kSources[i].stage, kSources[i].kind, kSources[i].reg, 0, &heap,
-                           &offset))
-      return false;
-    if (kSources[i].kind == RegisterKind::kConstantBuffer) {
-      const buffer_range range = descriptors->Buffer(heap, offset);
-      if (range.buffer == 0) return false;
-      va[i] = reinterpret_cast<ID3D12Resource*>(range.buffer.handle)->GetGPUVirtualAddress() + range.offset;
-      if (i == 0) out->wind_size = static_cast<uint32_t>(std::min<uint64_t>(range.size, 65536));
-    } else {
-      const resource_view view = descriptors->View(heap, offset);
-      const resource buffer = view != 0 ? dev->get_resource_from_view(view) : resource{0};
-      if (buffer == 0) return false;
-      va[i] = reinterpret_cast<ID3D12Resource*>(buffer.handle)->GetGPUVirtualAddress() +
-              dev->get_resource_view_desc(view).buffer.offset;
-    }
-  }
+  uint64_t sizes[4] = {};
+  if (!FindInputs(dev, layout, tables, kSources, va, sizes)) return false;
+  out->wind_size = static_cast<uint32_t>(sizes[0]);
   out->wind = va[0];
+  out->instances = va[1];
+  out->idx_param = va[2];
+  out->index_buffer = va[3];
+  return true;
+}
+
+// GPU addresses of a skinned draw's bone inputs: cbObjMatrix (vertex b5, and its size), cbInstanceData (vertex b4),
+// cbInstanceIdxParam (vertex b10) and g_InstanceIndexBuffer (vertex t25).
+struct SkinInputs {
+  D3D12_GPU_VIRTUAL_ADDRESS bones = 0, instances = 0, idx_param = 0, index_buffer = 0;
+  uint32_t bones_size = 0, instances_size = 0;
+  uint64_t index_size = 0;
+};
+bool FindSkinInputs(device* dev, pipeline_layout layout, const std::vector<descriptor_table>& tables,
+                    SkinInputs* out) {
+  static const InputSource kSources[4] = {{shader_stage::vertex, RegisterKind::kConstantBuffer, 5},
+                                          {shader_stage::vertex, RegisterKind::kConstantBuffer, 4},
+                                          {shader_stage::vertex, RegisterKind::kConstantBuffer, 10},
+                                          {shader_stage::vertex, RegisterKind::kShaderResource, 25}};
+  D3D12_GPU_VIRTUAL_ADDRESS va[4] = {};
+  uint64_t sizes[4] = {};
+  if (!FindInputs(dev, layout, tables, kSources, va, sizes)) return false;
+  out->bones_size = static_cast<uint32_t>(sizes[0]);
+  out->instances_size = static_cast<uint32_t>(sizes[1]);
+  out->index_size = sizes[3];
+  out->bones = va[0];
   out->instances = va[1];
   out->idx_param = va[2];
   out->index_buffer = va[3];
@@ -2426,10 +2523,16 @@ D3D12_GPU_VIRTUAL_ADDRESS FindWind(device* dev, pipeline_layout layout, const st
   return reinterpret_cast<ID3D12Resource*>(range.buffer.handle)->GetGPUVirtualAddress() + range.offset;
 }
 
-// Returns true when the game's draw was recorded here (with the stream-output copy of its pipeline), so the caller
-// skips the original.
-bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count, uint32_t instance_count,
-                    uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
+// What both stream-output paths (vegetation and characters) need at a main-camera G-buffer draw: its root layout and
+// tables, the root signature of its pipeline's copies, and its cbSceneParam and cbPerFrame with the previous frame's
+// copies (patched once per command list and pair of buffers).
+struct StreamDraw {
+  pipeline_layout layout = {0};
+  std::vector<descriptor_table> tables;
+  ID3D12RootSignature* stream_rs = nullptr;
+  D3D12_GPU_VIRTUAL_ADDRESS scene = 0, frame = 0, prev_scene = 0, prev_frame = 0;
+};
+bool PrepareStreamDraw(command_list* cmd_list, CmdData& data, const char* what, StreamDraw* out) {
   device* const dev = cmd_list->get_device();
   auto* const state = cmd_list->get_private_data<state_tracking>();
   auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
@@ -2439,10 +2542,10 @@ bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
   if (rt0 == 0 || (width != 0 && dev->get_resource_desc(rt0).texture.width != width)) return false;
   const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
   if (it == state->descriptor_tables.end() || it->second.second.size() < 7) return false;
-  ID3D12RootSignature* const stream_rs = g_wind.root_signature(data.current.handle);
-  if (stream_rs == nullptr) return false;
-  const pipeline_layout layout = it->second.first;
-  const std::vector<descriptor_table> tables = it->second.second;
+  out->stream_rs = g_wind.root_signature(data.current.handle);
+  if (out->stream_rs == nullptr) return false;
+  out->layout = it->second.first;
+  out->tables = it->second.second;
 
   // cbSceneParam (b8) and cbPerFrame (b9) of this draw.
   D3D12_GPU_VIRTUAL_ADDRESS va[2];
@@ -2450,23 +2553,65 @@ bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
     descriptor_heap heap = {0};
     uint32_t offset = 0;
     buffer_range range = {};
-    if (!descriptors->Find(dev, layout, tables, shader_stage::vertex, RegisterKind::kConstantBuffer, 8 + i, 0, &heap,
-                           &offset) ||
+    if (!descriptors->Find(dev, out->layout, out->tables, shader_stage::vertex, RegisterKind::kConstantBuffer, 8 + i,
+                           0, &heap, &offset) ||
         (range = descriptors->Buffer(heap, offset)).buffer == 0 || range.size < (i == 0 ? 2016u : 448u)) {
       std::lock_guard lock(g_wind_mutex);
-      SetWindError(std::string("no usable ") + (i == 0 ? "cbSceneParam" : "cbPerFrame") + " at a vegetation draw");
+      SetWindError(std::string("no usable ") + (i == 0 ? "cbSceneParam" : "cbPerFrame") + " at a " + what + " draw");
       return false;
     }
     va[i] = reinterpret_cast<ID3D12Resource*>(range.buffer.handle)->GetGPUVirtualAddress() + range.offset;
   }
-  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
   if (data.wind_scene != va[0] || data.wind_frame != va[1] || data.wind_prev == 0) {
-    data.wind_prev = g_wind.RecordPrevious(native, va[0], va[1]);
+    data.wind_prev = g_wind.RecordPrevious(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()),
+                                           va[0], va[1]);
     data.wind_scene = va[0];
     data.wind_frame = va[1];
     RestoreCompute(cmd_list);  // the patch replaced the compute root signature and its arguments
   }
-  const D3D12_GPU_VIRTUAL_ADDRESS prev[2] = {data.wind_prev, data.wind_prev + erdlss::WindMotion::kPrevFrameOffset};
+  out->scene = va[0];
+  out->frame = va[1];
+  out->prev_scene = data.wind_prev;
+  out->prev_frame = data.wind_prev + erdlss::WindMotion::kPrevFrameOffset;
+  return true;
+}
+
+// Records the previous-pose pass and the draw with its stream-output copies. Returns true when the game's draw was
+// recorded here, so the caller skips the original.
+bool RecordStreamDraw(command_list* cmd_list, CmdData& data, const StreamDraw& draw, D3D12_GPU_VIRTUAL_ADDRESS wind,
+                      D3D12_GPU_VIRTUAL_ADDRESS prev_wind, D3D12_GPU_VIRTUAL_ADDRESS bones,
+                      D3D12_GPU_VIRTUAL_ADDRESS prev_bones, uint32_t index_count, uint32_t instance_count,
+                      uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  // The copies' root signature has the game's parameters at the same indices (b8/b9/b13, for characters b5, come as
+  // root CBVs on top).
+  const pipeline_layout stream_layout = {reinterpret_cast<uint64_t>(draw.stream_rs)};
+  for (uint32_t i = 0; i < draw.tables.size(); ++i)
+    if (draw.tables[i] != 0)
+      cmd_list->bind_descriptor_tables(shader_stage::all_graphics, stream_layout, i, 1, &draw.tables[i]);
+  if (!data.wind_streams_bound) {
+    g_wind.BindStreams(native);
+    data.wind_streams_bound = true;
+  }
+  const bool replaced = g_wind.RecordStreams(native, data.current.handle, draw.scene, draw.frame, draw.prev_scene,
+                                             draw.prev_frame, wind, prev_wind, index_count, instance_count,
+                                             first_index, vertex_offset, first_instance, bones, prev_bones);
+  // Changing the root signature dropped every root argument; put the game's back, then its pipeline.
+  for (uint32_t i = 0; i < draw.tables.size(); ++i)
+    if (draw.tables[i] != 0)
+      cmd_list->bind_descriptor_tables(shader_stage::all_graphics, draw.layout, i, 1, &draw.tables[i]);
+  cmd_list->bind_pipeline(pipeline_stage::all, data.current);
+  return replaced;
+}
+
+// Returns true when the game's draw was recorded here (with the stream-output copy of its pipeline), so the caller
+// skips the original.
+bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count, uint32_t instance_count,
+                    uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
+  StreamDraw draw;
+  if (!PrepareStreamDraw(cmd_list, data, "vegetation", &draw)) return false;
+  device* const dev = cmd_list->get_device();
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
 
   // SpeedTree: a copy of the draw's wind with every tree's wind from the previous frame, for the previous pose.
   std::string name;
@@ -2477,7 +2622,7 @@ bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
   }
   D3D12_GPU_VIRTUAL_ADDRESS wind = 0, prev_wind = 0;
   TreeInputs tree;
-  if (IsTreeMaterial(name) && FindTreeInputs(dev, layout, tables, &tree)) {
+  if (IsTreeMaterial(name) && FindTreeInputs(dev, draw.layout, draw.tables, &tree)) {
     wind = tree.wind;
     prev_wind = g_wind.RecordTreeWind(native, tree.wind, tree.wind_size, tree.instances, tree.idx_param,
                                       tree.index_buffer, instance_count,
@@ -2485,25 +2630,99 @@ bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
     data.tree_wind_patched = true;
     RestoreCompute(cmd_list);
   } else {
-    wind = FindWind(dev, layout, tables);  // other shaders may still read b13, which the copies take out of the table
+    // Other shaders may still read b13, which the copies take out of the table.
+    wind = FindWind(dev, draw.layout, draw.tables);
   }
+  return RecordStreamDraw(cmd_list, data, draw, wind, prev_wind, 0, 0, index_count, instance_count, first_index,
+                          vertex_offset, first_instance);
+}
 
-  // The copies' root signature has the game's parameters at the same indices (b8/b9/b13 come as root CBVs on top).
-  const pipeline_layout stream_layout = {reinterpret_cast<uint64_t>(stream_rs)};
-  for (uint32_t i = 0; i < tables.size(); ++i)
-    if (tables[i] != 0) cmd_list->bind_descriptor_tables(shader_stage::all_graphics, stream_layout, i, 1, &tables[i]);
-  if (!data.wind_streams_bound) {
-    g_wind.BindStreams(native);
-    data.wind_streams_bound = true;
+// The game draws velocity for these mesh parts itself (the player's), seen at its velocity pass.
+void NoteVelocityPart(uint32_t part) {
+  {
+    std::shared_lock lock(g_velocity_mutex);
+    if (g_velocity_parts.count(part) != 0) return;
   }
-  const bool replaced = g_wind.RecordStreams(native, data.current.handle, va[0], va[1], prev[0], prev[1], wind,
-                                             prev_wind, index_count, instance_count, first_index, vertex_offset,
-                                             first_instance);
-  // Changing the root signature dropped every root argument; put the game's back, then its pipeline.
-  for (uint32_t i = 0; i < tables.size(); ++i)
-    if (tables[i] != 0) cmd_list->bind_descriptor_tables(shader_stage::all_graphics, layout, i, 1, &tables[i]);
-  cmd_list->bind_pipeline(pipeline_stage::all, data.current);
+  std::unique_lock lock(g_velocity_mutex);
+  if (g_velocity_parts.size() > 4096) g_velocity_parts.clear();  // new equipment over a long session
+  g_velocity_parts.insert(part);
+}
+
+// An enemy's or animal's G-buffer draw: its previous pose from last frame's bones (skin_motion.hpp) and camera.
+// Returns true when the game's draw was recorded here, so the caller skips the original.
+bool StreamSkinDraw(command_list* cmd_list, CmdData& data, uint32_t index_count, uint32_t instance_count,
+                    uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
+  ++g_npc_counts.seen;
+  if (data.index_va == 0) {
+    ++g_npc_counts.inputs;
+    return false;
+  }
+  const uint32_t part = PartKey(data.index_va, first_index, index_count);
+  {
+    std::shared_lock lock(g_velocity_mutex);
+    if (g_velocity_parts.count(part) != 0) {
+      ++g_npc_counts.velocity;
+      return false;
+    }
+  }
+  StreamDraw draw;
+  if (!PrepareStreamDraw(cmd_list, data, "character", &draw)) {
+    ++g_npc_counts.prepare;  // includes draws of other cameras (shadows, reflections)
+    return false;
+  }
+  device* const dev = cmd_list->get_device();
+  SkinInputs skin;
+  if (!FindSkinInputs(dev, draw.layout, draw.tables, &skin)) {
+    ++g_npc_counts.inputs;
+    return false;
+  }
+  // Development stages (remote "npcstage"): 1 streams both poses with the current bones (no patch), 2 also runs
+  // the patch but still streams the current bones, 3 uses the patched bones.
+  const int stage = g_npc_stage.load();
+  D3D12_GPU_VIRTUAL_ADDRESS prev_bones = skin.bones;
+  if (stage >= 2) {
+    erdlss::SkinMotion::Job job;
+    if (!g_skin.PrepareJob(skin.bones, skin.bones_size, skin.instances, skin.instances_size, skin.idx_param,
+                           skin.index_buffer, skin.index_size, instance_count, part, g_frame.load(), &job)) {
+      ++g_npc_counts.patch;
+      return false;
+    }
+    data.skin_jobs.push_back(job);  // runs when the list is executed (OnExecuteCommandList)
+    if (stage >= 3) prev_bones = job.prev;
+  }
+  ++g_npc_counts.streamed;
+  const bool replaced = RecordStreamDraw(cmd_list, data, draw, FindWind(dev, draw.layout, draw.tables), 0, skin.bones,
+                                         prev_bones, index_count, instance_count, first_index, vertex_offset,
+                                         first_instance);
+  if (replaced) ++g_npc_counts.replaced;
   return replaced;
+}
+
+// Development: the draw counts per frame since the last call, and the skinned pipelines without stream copies.
+std::string NpcDrawStats() {
+  static uint64_t last_frame = 0, last[7] = {};
+  const uint64_t frame = g_frame.load();
+  const uint64_t now[7] = {g_npc_counts.seen.load(),  g_npc_counts.velocity.load(), g_npc_counts.prepare.load(),
+                           g_npc_counts.inputs.load(), g_npc_counts.patch.load(),  g_npc_counts.streamed.load(),
+                           g_npc_counts.replaced.load()};
+  const double frames = static_cast<double>(std::max<uint64_t>(1, frame - last_frame));
+  double d[7];
+  for (int i = 0; i < 7; ++i) d[i] = (now[i] - last[i]) / frames;
+  size_t without = 0;
+  {
+    std::lock_guard lock(g_wind_mutex);
+    for (const auto& [pipeline, source] : g_wind_sources)
+      if (IsSkinMaterial(source.name) && !g_wind.IsWindPipeline(pipeline)) ++without;
+  }
+  char text[320];
+  std::snprintf(text, sizeof(text),
+                "skinned draws per frame: %.1f seen, %.1f the game's (velocity), %.1f other cameras or no copy, %.1f "
+                "without inputs, %.1f patch refused, %.1f streamed (%.1f replaced); %zu skinned pipelines without "
+                "copies",
+                d[0], d[1], d[2], d[3], d[4], d[5], d[6], without);
+  last_frame = frame;
+  std::copy(now, now + 7, last);
+  return text;
 }
 
 // Draws an animated grass-family draw of the main camera's G-buffer pass and then its motion with the ported shader.
@@ -2655,10 +2874,18 @@ void ResolveWind(command_list* cmd_list, const CmdData& data) {
   }
   auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
   g_wind.RecordFrameEnd(native);  // the tree wind table counts frames here, whether or not trees are drawn
-  if (g_config.wind_mode == 0 || g_config.wind_trees) {
+  if (g_skin.ready()) g_skin.RecordFrameEnd(native);  // so does the NPC table
+  // Below full size the scene fills the top-left render-size part of the full-size motion and depth textures; the
+  // streamed clip positions map onto that part, not the whole texture.
+  uint32_t width = md.texture.width, height = md.texture.height;
+  if (scene.width >= 1.0f && scene.height >= 1.0f) {
+    width = std::min(width, static_cast<uint32_t>(scene.width));
+    height = std::min(height, static_cast<uint32_t>(scene.height));
+  }
+  if ((g_config.wind_motion && (g_config.wind_mode == 0 || g_config.wind_trees)) || g_config.npc_motion) {
     if (g_wind.Resolve(native, reinterpret_cast<ID3D12Resource*>(motion.handle),
-                       reinterpret_cast<ID3D12Resource*>(depth.handle), md.texture.width, md.texture.height,
-                       scene.velocity_scale, scene.velocity_bias)) {
+                       reinterpret_cast<ID3D12Resource*>(depth.handle), width, height, scene.velocity_scale,
+                       scene.velocity_bias)) {
       ++g_wind_resolves;
     } else {
       std::lock_guard lock(g_wind_mutex);
@@ -2705,7 +2932,8 @@ void StartWind(effect_runtime* runtime) {
   g_wind.RecordSetup(reinterpret_cast<ID3D12GraphicsCommandList*>(queue->get_immediate_command_list()->get_native()));
   queue->flush_immediate_command_list();
   queue->wait_idle();
-  for (auto& [pipeline, source] : g_wind_sources) AddWindPipeline(pipeline, source);
+  for (auto& [pipeline, source] : g_wind_sources)
+    if (WantsStreamCopies(source.name)) AddWindPipeline(pipeline, source);
   g_wind.MarkReady();
   g_wind_ready = true;
   Log(reshade::log::level::info, "Wind motion vectors on: " + std::to_string(g_wind.pipeline_count()) + " of " +
@@ -2713,8 +2941,8 @@ void StartWind(effect_runtime* runtime) {
                                      std::to_string(capacity) + " vertices per frame.");
 }
 
-// Trees next to the ported grass path: the stream-output path for SpeedTree only, started the first time trees are
-// on (so it takes no video memory while they are off).
+// Trees next to the ported grass path, and enemies and animals: the stream-output path for SpeedTree and skinned
+// characters only, started the first time trees or NPC motion are on (so it takes no video memory while they are off).
 void StartTrees(effect_runtime* runtime) {
   std::lock_guard lock(g_wind_mutex);
   if (g_device == nullptr) return;
@@ -2730,12 +2958,30 @@ void StartTrees(effect_runtime* runtime) {
   queue->flush_immediate_command_list();
   queue->wait_idle();
   for (auto& [pipeline, source] : g_wind_sources)
-    if (IsTreeMaterial(source.name)) AddWindPipeline(pipeline, source);
+    if (WantsStreamCopies(source.name)) AddWindPipeline(pipeline, source);
   g_wind.MarkReady();
   g_wind_ready = true;
-  Log(reshade::log::level::info, "Tree motion vectors on: " + std::to_string(g_wind.pipeline_count()) +
-                                     " SpeedTree pipelines, room for " + std::to_string(capacity) +
+  Log(reshade::log::level::info, "Stream-output motion vectors on: " +
+                                     std::to_string(g_wind.pipeline_count() - g_wind.skin_pipeline_count()) +
+                                     " SpeedTree and " + std::to_string(g_wind.skin_pipeline_count()) +
+                                     " character pipelines, room for " + std::to_string(capacity) +
                                      " vertices per frame.");
+}
+
+// NPC motion vectors on top of the stream-output path: the previous-pose tables and rings (about 64 MB).
+void StartSkin() {
+  std::lock_guard lock(g_wind_mutex);
+  if (g_device == nullptr) return;
+  if (!g_skin.Init(reinterpret_cast<ID3D12Device*>(g_device->get_native()))) {
+    Log(reshade::log::level::error, "NPC motion vectors unavailable: " + g_skin.status());
+    g_skin_failed = true;
+    return;
+  }
+  // Characters' pipelines get their stream-output copies only while NPC motion is on.
+  for (auto& [pipeline, source] : g_wind_sources)
+    if (IsSkinMaterial(source.name) && !g_wind.IsWindPipeline(pipeline)) AddWindPipeline(pipeline, source);
+  Log(reshade::log::level::info, "NPC motion vectors on: " + std::to_string(g_wind.skin_pipeline_count()) +
+                                     " character pipelines.");
 }
 
 std::string PortStats() {
@@ -2910,9 +3156,13 @@ void LearnListKindsLocked();
 
 // Command lists in GPU order: every list submitted after the one holding the TAA, until the UI composite, is
 // post-processing.
-void OnExecuteCommandList(command_queue*, command_list* cmd_list) {
-  if (g_config.render_scale >= 1.0f) return;
+void OnExecuteCommandList(command_queue* queue, command_list* cmd_list) {
   auto* const data = cmd_list->get_private_data<CmdData>();
+  // The previous poses its NPC draws read, written just before them on the same queue.
+  if (data != nullptr && !data->skin_jobs.empty() && g_skin.ready() &&
+      !g_skin.SubmitJobs(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()), data->skin_jobs))
+    ++g_npc_counts.patch;
+  if (g_config.render_scale >= 1.0f) return;
   if (data == nullptr || !data->signed_) return;
   std::lock_guard lock(g_kinds_mutex);
   if (!data->dual && data->post_fix != g_frame_taa_submitted && !data->has_taa && !data->has_ui)
@@ -3083,10 +3333,18 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
     return true;
   if (data->pass == Pass::kBlendUi) return false;
   if (g_tree_end.load() != 0) TreeDumpDraw(cmd_list, *data, instance_count);
-  if (g_config.wind_motion && g_wind_ready.load() && (g_config.wind_mode == 0 || g_config.wind_trees) &&
-      g_wind.IsWindPipeline(data->current.handle) &&
-      StreamWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance))
-    return true;  // drawn by the stream-output copy of the game's pipeline
+  if ((g_config.wind_motion || g_config.npc_motion) && g_wind_ready.load() &&
+      g_wind.IsWindPipeline(data->current.handle)) {
+    if (g_wind.IsSkinPipeline(data->current.handle)) {
+      if (g_config.npc_motion && g_skin.ready() &&
+          StreamSkinDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance))
+        return true;  // drawn by the stream-output copy of the game's pipeline, after the previous pose
+    } else if (g_config.wind_motion && (g_config.wind_mode == 0 || g_config.wind_trees) &&
+               StreamWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset,
+                              first_instance)) {
+      return true;  // drawn by the stream-output copy of the game's pipeline
+    }
+  }
   if (g_config.wind_motion && g_config.wind_prepass && g_port_ready.load() &&
       g_wind_port.IsReplaceable(data->current.handle) &&
       ReplaceWindDraw(cmd_list, *data, index_count, instance_count, first_index, vertex_offset, first_instance))
@@ -3099,6 +3357,9 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
     if (!g_config.chromatic_aberration) RemoveChromaticAberration(cmd_list);
     return false;
   }
+  // The velocity pass (the player's parts): their G-buffer draws keep the game's motion.
+  if (data->pass == Pass::kScene && g_config.npc_motion && data->index_va != 0)
+    NoteVelocityPart(PartKey(data->index_va, first_index, index_count));
   if (data->pass != Pass::kScene || data->scene_valid || data->scene_attempts >= 8) return false;
   ++data->scene_attempts;
   SceneParams scene;
@@ -3334,7 +3595,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     if (g_passlog_frame.load() != 0) LogPass(cmd_list, *data);
     float screen[2] = {1, 1};
     ObserveTaaResolution(cmd_list, screen);
-    if (g_config.wind_motion && g_wind_ready.load()) ResolveWind(cmd_list, *data);
+    if ((g_config.wind_motion || g_config.npc_motion) && g_wind_ready.load()) ResolveWind(cmd_list, *data);
     if (g_config.wind_motion && g_port_ready.load()) MergeWind(cmd_list, *data);
     if (g_dump_remaining.load() > 0) DumpTaaInputs(cmd_list);
     return ReplaceTaa(cmd_list, *data, screen);
@@ -4003,8 +4264,22 @@ void ApplyRenderScale() {
   if (g_render_scale.Set(scale)) g_render_scale_set = scale < 1.0f;
 }
 
+// With DRED on, describes the first device removal in the log and in shots/dred.txt.
+void CheckDeviceRemoved() {
+  static std::atomic<bool> reported{false};
+  if (!g_config.dred || g_device == nullptr || reported.load()) return;
+  const std::string report = erdlss::DredReport(reinterpret_cast<ID3D12Device*>(g_device->get_native()));
+  if (report.empty() || reported.exchange(true)) return;
+  Log(reshade::log::level::error, "DRED report:\n" + report);
+  const fs::path dir = g_addon_dir / L"shots";
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  std::ofstream(dir / L"dred.txt", std::ios::app) << "== frame " << g_frame.load() << "\n" << report;
+}
+
 void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
   const uint64_t frame = ++g_frame;
+  CheckDeviceRemoved();
   if (sc != nullptr) LogOutputMode(sc);
   static LARGE_INTEGER frequency = {}, last = {};
   LARGE_INTEGER now;
@@ -4112,11 +4387,16 @@ void OnReshadePresent(effect_runtime* runtime) {
     std::lock_guard lock(g_drs_mutex);
     if (g_drs_forcing) g_engine_res.Write(g_drs_offset, g_drs_values, sizeof(g_drs_values));
   }
-  if (g_config.wind_motion && !g_wind_ready.load() && !g_port_ready.load() && !g_wind_failed.load())
+  // The ported grass path (mode 1) or the stream-output path for everything (mode 0); then the stream-output path for
+  // trees (mode 1) or characters, if the full one is not running.
+  if (g_config.wind_motion && !(g_config.wind_mode == 1 ? g_port_ready.load() : g_wind_ready.load()) &&
+      !g_wind_failed.load())
     StartWind(runtime);
-  if (g_config.wind_motion && g_config.wind_mode == 1 && g_config.wind_trees && g_port_ready.load() &&
-      !g_wind_ready.load() && !g_trees_failed.load())
+  const bool trees = g_config.wind_motion && g_config.wind_mode == 1 && g_config.wind_trees && g_port_ready.load();
+  if ((trees || g_config.npc_motion) && !(g_config.wind_motion && g_config.wind_mode == 0) && !g_wind_ready.load() &&
+      !g_trees_failed.load())
     StartTrees(runtime);
+  if (g_config.npc_motion && g_wind_ready.load() && !g_skin.ready() && !g_skin_failed.load()) StartSkin();
   static std::string dump_request;  // the pending "mv" command, answered once its frames are saved
   static std::string stats_request;  // the pending "vegstats" command
   static int stats_frames = 0;
@@ -4329,6 +4609,25 @@ void OnReshadePresent(effect_runtime* runtime) {
                     g_drs_values[0], g_drs_values[1], g_drs_values[2], g_drs_values[3]);
       result = text;
     }
+  } else if (command == "npc") {  // "npc" alone reports; "npc on|off" switches (and saves)
+    if (!arg.empty()) {
+      g_config.npc_motion = arg == "on";
+      SaveConfig();
+    }
+    runtime->get_command_queue()->wait_idle();
+    result = std::string(g_config.npc_motion ? "on" : "off") + ", " +
+             (g_skin.ready() ? g_skin.Stats(g_frame.load()) : "not running: " + g_skin.status()) + "; " +
+             std::to_string(g_wind.skin_pipeline_count()) + " character pipelines, " +
+             std::to_string(g_wind.skin_draws()) + " streamed draws so far; " + NpcDrawStats();
+  } else if (command == "npcstage") {
+    if (!arg.empty()) g_npc_stage = std::clamp(std::atoi(arg.c_str()), 1, 3);
+    result = "stage " + std::to_string(g_npc_stage.load());
+  } else if (command == "npctest") {  // "npctest <m>": shift every previous pose (0 = off)
+    g_skin.set_test_offset(std::strtof(arg.c_str(), nullptr));
+  } else if (command == "npcdist") {
+    g_skin.set_max_distance(std::strtof(arg.c_str(), nullptr));
+  } else if (command == "npcbones") {
+    g_skin.set_max_bones(static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 1, 1365)));
   } else if (command == "windtrees") {
     g_config.wind_trees = arg != "off";
   } else if (command == "windprepass") {
@@ -4581,6 +4880,11 @@ void OnOverlay(effect_runtime*) {
                           g_config.wind_tree_capacity * 32 + 13);
     ImGui::Unindent();
   }
+  if (ImGui::Checkbox("Enemy and animal motion vectors (experimental)", &g_config.npc_motion)) SaveConfig();
+  ImGui::SetItemTooltip("The game only gives the player's character motion vectors, so DLSS smears moving enemies and "
+                        "animals. This gives them motion from last frame's pose. Uses about 64 MB of video memory "
+                        "plus the tree path's stream buffers.");
+  if (g_config.npc_motion && g_skin_failed.load()) ImGui::Text("  unavailable: %s", g_skin.status().c_str());
   if (g_config.wind_motion) {
     std::unique_lock lock(g_wind_mutex, std::try_to_lock);
     if (lock.owns_lock()) {
@@ -4648,6 +4952,19 @@ void Initialize(HMODULE module) {
   Log(reshade::log::level::info, text);
 }
 
+// DRED has to be on before the device exists, and its debug interface cannot be loaded from DllMain.
+bool OnCreateDevice(device_api api, uint32_t&) {
+  static bool tried = false;
+  if (api == device_api::d3d12 && g_config.dred && !tried) {
+    tried = true;
+    const bool on = erdlss::EnableDred();
+    Log(on ? reshade::log::level::info : reshade::log::level::warning,
+        on ? "DRED on: breadcrumbs and page faults are reported if the GPU stops."
+           : "DRED unavailable (no D3D12 debug interface).");
+  }
+  return false;  // the API version stays as it is
+}
+
 }  // namespace
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
@@ -4657,6 +4974,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       Initialize(module);
       erdlss::Descriptors::RegisterEvents();
       state_tracking::register_events();
+      reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
@@ -4666,6 +4984,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
       reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindPipeline);
+      reshade::register_event<reshade::addon_event::bind_index_buffer>(OnBindIndexBuffer);
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
       reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
