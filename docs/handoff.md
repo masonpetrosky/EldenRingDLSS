@@ -20,7 +20,7 @@ for picking up.
 | Motion vectors for enemies and animals | Everyday and dev installs (`NpcMotion=1`), +0.2-0.3 ms (2026-10-11) |
 | Tree motion vectors at 50% | Were lost from 2026-10-10 (resolve viewport); fixed, everyday install updated |
 | Object-only motion blur | Everyday and dev installs (`ObjectBlur=1`), in daily use with the game's blur on (2026-10-12) |
-| NVIDIA Reflex (injected at the present) | Dev install: sleeps 8-9 ms/frame, GPU queue 8 ms shorter, user feels it; ~3% fps |
+| NVIDIA Reflex (injected at the present) | Everyday and dev installs: GPU queue 8 ms shorter, user feels it; ~3% fps |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -30,17 +30,18 @@ the tonemapped image at the final composite.
 Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
-  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit bba1275, installed 2026-10-12 after midnight with the
+  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit d0f03f5, installed 2026-10-12 after midnight with the
   user's OK: 50% with preset M, enemy and animal motion vectors (`NpcMotion=1`) and the trees' motion at 50% fixed,
   object-only motion blur (`ObjectBlur=1`) with the game's Motion Blur on: the user tried it in this install and
-  keeps it ("It seems great"),
+  keeps it ("It seems great"), NVIDIA Reflex injected at the present (`Reflex=1`; the user noticed an improvement),
   on top of the jitter, distortion/sparks/grace-flame fixes and distance-based ray tracing refits. Ray
   Reconstruction on with our ray generation shaders (`RayReconstruction=1`, `RtShadowRayGen=3`, release
   `nvngx_dlssd.dll` 310.9.1), the dev install's setup, turned on the same night at the user's request: measured +1.9
   ms over DLSS M in its first version, about 1.6 ms of that recovered since (render-size AO, 1 sun shadow ray).
   Its ini: `Preset=13`, `RenderScale=0.50`, game sharpening off, game exposure on, chromatic aberration off,
   `WindMotion=1`, `WindMode=1`, `WindTrees=1`, `NpcMotion=1`, `RayReconstruction=1`, `RtShadowRayGen=3`,
-  `ObjectBlur=1`. Backups in `build\everyday-backup\`: ff56979 (the previous everyday build, with RR), ff56979-noRR
+  `ObjectBlur=1`, `Reflex=1`. Backups in `build\everyday-backup\`: bba1275 (the previous everyday build, before
+  Reflex), ff56979 (with RR), ff56979-noRR
   (its ini before RR), 91d6b47 (the previous everyday build, 50%, M),
   b2ac485 (58%, K), 7182d94 (67%, K), f0e8c12 (DLAA). Only update it with the user's
   explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
@@ -140,8 +141,8 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 1. **Reflex** (docs/recon.md, "NVIDIA Reflex, injected at the present"): the sleep works (8-9 ms per frame, the frame's
    GPU work queued 8 ms less) and the user noticed an improvement. Open: whether the game reads input after the sleep
-   (hook its input call and timestamp it against the markers), the everyday install (user's OK, game closed), and a
-   hook at the game's own frame start if the input timing shows the sleep is too late.
+   (hook its input call and timestamp it against the markers), and a hook at the game's own frame start if the input
+   timing shows the sleep is too late. In the everyday install since 2026-10-12.
 2. Object-only blur, open edges: idle with the game's Motion Blur off is untested by measurement (bba1275 gates it on
    the blur pass; with the blur on the user tested this build in the everyday install). Watch for a pixel of blur on
    silhouettes while strafing and on swaying grass and trees (docs/recon.md, "Object-only motion blur").
