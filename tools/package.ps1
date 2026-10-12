@@ -26,8 +26,7 @@ Copy-Item (Join-Path $root 'LICENSE') (Join-Path $licenses 'LICENSE.txt')
 Copy-Item (Join-Path $root 'third_party\dlss\LICENSE.txt') (Join-Path $licenses 'NVIDIA-RTX-SDKs-LICENSE.txt')
 Copy-Item (Join-Path $root 'third_party\reshade\LICENSE.md') (Join-Path $licenses 'ReShade-LICENSE.md')
 Copy-Item (Join-Path $root 'third_party\imgui\LICENSE.txt') (Join-Path $licenses 'ImGui-LICENSE.txt')
-Copy-Item (Join-Path $root 'third_party
-vapi\License.txt') (Join-Path $licenses 'NVAPI-LICENSE.txt')
+Copy-Item (Join-Path $root 'third_party\nvapi\License.txt') (Join-Path $licenses 'NVAPI-LICENSE.txt')
 
 $zip = Join-Path $root "dist\$name.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
