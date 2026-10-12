@@ -21,7 +21,7 @@ for picking up.
 | Tree motion vectors at 50% | Were lost from 2026-10-10 (resolve viewport); fixed, everyday install updated |
 | Object-only motion blur | Everyday and dev installs (`ObjectBlur=1`), in daily use with the game's blur on (2026-10-12) |
 | NVIDIA Reflex (injected at the present) | Everyday and dev installs: GPU queue 8 ms shorter, user feels it; ~3% fps |
-| Fast travel left the game at full size (grain under RR) | Fixed (6c124ae) in the dev install; **the everyday install still has it** |
+| Fast travel left the game at full size (grain under RR) | Fixed (6c124ae), everyday and dev installs (2026-10-12) |
 | GPU profile (5 places) | Done (2026-10-12): `docs/raytracing.md`, "GPU profile: where the frame goes" |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
@@ -32,8 +32,8 @@ the tonemapped image at the final composite.
 Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
-  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit d0f03f5, installed 2026-10-12 after midnight with the
-  user's OK: 50% with preset M, enemy and animal motion vectors (`NpcMotion=1`) and the trees' motion at 50% fixed,
+  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit 6c124ae, installed 2026-10-12 morning with the user's
+  OK: d0f03f5 (installed after midnight) plus the fast-travel fix and the dev-only GPU profiler. 50% with preset M, enemy and animal motion vectors (`NpcMotion=1`) and the trees' motion at 50% fixed,
   object-only motion blur (`ObjectBlur=1`) with the game's Motion Blur on: the user tried it in this install and
   keeps it ("It seems great"), NVIDIA Reflex injected at the present (`Reflex=1`; the user noticed an improvement),
   on top of the jitter, distortion/sparks/grace-flame fixes and distance-based ray tracing refits. Ray
@@ -42,8 +42,8 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
   ms over DLSS M in its first version, about 1.6 ms of that recovered since (render-size AO, 1 sun shadow ray).
   Its ini: `Preset=13`, `RenderScale=0.50`, game sharpening off, game exposure on, chromatic aberration off,
   `WindMotion=1`, `WindMode=1`, `WindTrees=1`, `NpcMotion=1`, `RayReconstruction=1`, `RtShadowRayGen=3`,
-  `ObjectBlur=1`, `Reflex=1`. Backups in `build\everyday-backup\`: bba1275 (the previous everyday build, before
-  Reflex), ff56979 (with RR), ff56979-noRR
+  `ObjectBlur=1`, `Reflex=1`. Backups in `build\everyday-backup\`: d0f03f5 (the previous everyday build, before
+  the fast-travel fix), bba1275 (before Reflex), ff56979 (with RR), ff56979-noRR
   (its ini before RR), 91d6b47 (the previous everyday build, 50%, M),
   b2ac485 (58%, K), 7182d94 (67%, K), f0e8c12 (DLAA). Only update it with the user's
   explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
@@ -142,11 +142,11 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
-1. **Everyday install update** (with the user's OK, game closed): 6c124ae fixes a bug the everyday build has: after
-   any loading screen (fast travel) the engine stayed at full size, DLSS and RR stopped, and the game's denoiser got
-   our 1-ray AO and shadows (grain on the character, walls and ground). The user saw it in the dev install; tested
-   fixed there (two fast travels, back at 50% within about 150 ms). Recovery without the fix: restart the game, or
-   in the dev install remote `preset 13` (recreates the feature).
+1. **Fast-travel fix in everyday play** (6c124ae, in the everyday install since 2026-10-12): before it, after any
+   loading screen the engine stayed at full size, DLSS and RR stopped, and the game's denoiser got our 1-ray AO and
+   shadows (grain on the character, walls and ground). Tested in the dev install (two fast travels, back at 50% within
+   about 150 ms), not yet in the everyday one. If grain shows after a load, the log's last `Scene: screen percentage`
+   line tells whether the scale came back (0.500); in the dev install remote `preset 13` recovers it.
 2. **Savings from the GPU profile** (`docs/raytracing.md`, "GPU profile: where the frame goes"): no 3-5 ms of
    redundant work; RR is a fixed 4.1 ms. In order: our rays in the forest (1.1 -> 4.5 ms; likely alpha-tested
    leaves: shorter AO rays or opaque foliage for AO), acceleration-structure builds in fights (up to 2.9 ms), the
