@@ -23,7 +23,7 @@ for picking up.
 | NVIDIA Reflex (injected at the present) | Everyday and dev installs: GPU queue 8 ms shorter, user feels it; ~3% fps |
 | Fast travel left the game at full size (grain under RR) | Fixed (6c124ae), everyday and dev installs (2026-10-12) |
 | GPU profile (5 places) | Done (2026-10-12): `docs/raytracing.md`, "GPU profile: where the frame goes" |
-| Foliage cost in our rays; leaf-shadow popping; a flicker | **Open**, dev install only (83545fe, untested in game): see Next steps 1 |
+| Foliage cost in our rays; leaf-shadow popping; a flicker | **Open**, dev install only (83545fe, untested in game): see Next steps 0 |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
