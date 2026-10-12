@@ -773,5 +773,8 @@ RR on:
 With `npctest 0.3` all soldiers and animals in view light up; without it the walking soldiers carry their real motion
 (the game's own data had them at exactly 0). The user toggled it while watching a torch-carrying soldier walk: "a
 noticeable improvement when it's on". Not covered: a part shared with the player's equipment keeps no motion (it is
-in the velocity set), two identical characters within 2 m can swap previous poses, cloth simulated on the CPU only
-gets the camera's motion.
+in the velocity set), two identical characters can swap previous poses if they cross within a frame's movement of
+each other (one frame of wrong motion). Cloth is not a gap for enemies as far as the capture shows: their `_cloth_`
+draws read all vertex streams from the model's own buffer (bone-driven, e.g. 105277 and 106085: vb0-2 in 110289 and
+99931), so the bone matching covers them; only the player's cape uses per-frame cloth buffers (111712: vb0 76484,
+vb2 76485), and the game draws the player's velocity itself.

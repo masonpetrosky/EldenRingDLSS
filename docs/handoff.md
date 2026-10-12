@@ -143,8 +143,9 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
    read the motion texture before that, in which case the resolve has to move earlier for the blur to see it.
 2. RR's responsivity mask on vegetation (preset F only; negative values favor stability) for the grass at 50%.
 3. The outreach drafts above, one at a time with the user.
-4. NPC motion edges: parts shared with the player's equipment, identical characters within 2 m, CPU cloth
-   (docs/recon.md, "Enemy and animal motion vectors: working").
+4. NPC motion edge: an enemy part shared with the player's equipment gets no motion (excluded with the player's
+   parts by mesh key). Check first whether it happens: `npc` reports draws left to the game per frame, which should
+   equal the player's part count; fighting soldiers in the player's armor would show more.
 5. Older items: robustness (scale changes at runtime need a restart for the stretch; resolution changes; the first
    frame of a new command-list kind), performance of the stretch and full-size post-processing (about 1 ms), and
    removing dead experiments (`drs_probe.*`, `engine_resolution.*`, `hw_breakpoints.*`).
