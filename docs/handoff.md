@@ -19,7 +19,7 @@ for picking up.
 | 4. Release | v0.1.0 on GitHub (release zip) and Nexus Mods (2026-10-11) |
 | Motion vectors for enemies and animals | Everyday and dev installs (`NpcMotion=1`), +0.2-0.3 ms (2026-10-11) |
 | Tree motion vectors at 50% | Were lost from 2026-10-10 (resolve viewport); fixed, everyday install updated |
-| Object-only motion blur | Everyday and dev installs (`ObjectBlur=1`; idle while the game's blur is off), works (2026-10-12) |
+| Object-only motion blur | Everyday and dev installs (`ObjectBlur=1`), in daily use with the game's blur on (2026-10-12) |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -31,7 +31,8 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
   `natives\EldenRingDLSS` (release DLSS DLL). Build of commit bba1275, installed 2026-10-12 after midnight with the
   user's OK: 50% with preset M, enemy and animal motion vectors (`NpcMotion=1`) and the trees' motion at 50% fixed,
-  object-only motion blur (`ObjectBlur=1`; the user keeps the game's Motion Blur off, which makes it idle),
+  object-only motion blur (`ObjectBlur=1`) with the game's Motion Blur on: the user tried it in this install and
+  keeps it ("It seems great"),
   on top of the jitter, distortion/sparks/grace-flame fixes and distance-based ray tracing refits. Ray
   Reconstruction on with our ray generation shaders (`RayReconstruction=1`, `RtShadowRayGen=3`, release
   `nvngx_dlssd.dll` 310.9.1), the dev install's setup, turned on the same night at the user's request: measured +1.9
@@ -136,8 +137,9 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
-1. Check in game that object-only blur stays idle with the game's Motion Blur off and starts within a frame when it is
-   turned on (bba1275 gates it on the blur pass; the blur itself was tested with ff56979+63c015a).
+1. Object-only blur, open edges: idle with the game's Motion Blur off is untested by measurement (bba1275 gates it on
+   the blur pass; with the blur on the user tested this build in the everyday install). Watch for a pixel of blur on
+   silhouettes while strafing and on swaying grass and trees (docs/recon.md, "Object-only motion blur").
 2. RR's responsivity mask on vegetation (preset F only; negative values favor stability) for the grass at 50%.
 3. The outreach drafts above, one at a time with the user.
 4. NPC motion edge: an enemy part shared with the player's equipment gets no motion (excluded with the player's
