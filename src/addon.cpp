@@ -73,6 +73,7 @@ enum class Pass : uint8_t {
   kAoReproj,      // the AO chain's temporal pass (half size)
   kAoUpscale,     // the AO chain's bilateral upscale to full size
   kCameraMotion,  // MotionBlurWriteCMBVelocity: the camera's motion from depth, under the velocity draws
+  kMotionBlur,    // the motion blur's first pass after the TAA (runs only with the game's motion blur on)
 };
 
 // cbSceneParam, bound at vertex shader register b8 by the scene shaders. Offsets are in floats.
@@ -241,6 +242,7 @@ std::shared_mutex g_velocity_mutex;
 std::unordered_map<uint32_t, uint64_t> g_velocity_parts;
 erdlss::ObjectBlur g_object_blur;
 std::atomic<bool> g_object_blur_failed{false};
+std::atomic<uint64_t> g_blur_frame{0};  // g_frame of the game's last motion blur (0: not seen)
 std::atomic<uint64_t> g_wind_errors{0};
 std::atomic<uint64_t> g_wind_resolves{0};
 std::string g_wind_error;  // first error, under g_wind_mutex
@@ -632,6 +634,7 @@ Pass Classify(uint32_t count, const pipeline_subobject* subobjects) {
   if (Contains(ps, "ScreenSpaceAO2_SeparatedReProj")) return Pass::kAoReproj;
   if (Contains(ps, "ScreenSpaceAO2_BilateralUpScale")) return Pass::kAoUpscale;
   if (Contains(ps, "MotionBlurWriteCMBVelocity")) return Pass::kCameraMotion;
+  if (Contains(ps, "MotionBlur_WriteVelocityAndDepthPack_DownScale")) return Pass::kMotionBlur;
   if (Contains(vs, "_Velo")) return Pass::kScene;
   return Pass::kOther;
 }
@@ -3573,6 +3576,12 @@ bool StochasticAoUpscale(command_list* cmd_list, CmdData& data) {
   return true;
 }
 
+// The game's motion blur ran in the last second (the first frame after it is turned on keeps the camera's motion).
+bool BlurRunning() {
+  const uint64_t last = g_blur_frame.load();
+  return last != 0 && g_frame.load() - last < 60;
+}
+
 // Object-only motion blur: the camera pass's output, copied right after it draws (it draws here, then the copy).
 bool CameraMotionDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
                       uint32_t first_instance) {
@@ -3628,7 +3637,9 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
-  if (data->pass == Pass::kCameraMotion && g_config.object_blur &&
+  // Object-only motion blur only while the game's motion blur runs (its passes are skipped when it is off).
+  if (data->pass == Pass::kMotionBlur) g_blur_frame = g_frame.load();
+  if (data->pass == Pass::kCameraMotion && g_config.object_blur && BlurRunning() &&
       CameraMotionDraw(cmd_list, vertex_count, instance_count, first_vertex, first_instance))
     return true;
   if (data->pass == Pass::kLightDir && g_config.enabled && g_config.ray_reconstruction && g_dlss.rr_available() &&
@@ -3670,7 +3681,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     ObserveTaaResolution(cmd_list, screen);
     if ((g_config.wind_motion || g_config.npc_motion) && g_wind_ready.load()) ResolveWind(cmd_list, *data);
     if (g_config.wind_motion && g_port_ready.load()) MergeWind(cmd_list, *data);
-    if (g_config.object_blur) ObjectBlurTransform(cmd_list, *data);  // before the stretch in ReplaceTaa
+    if (g_config.object_blur && BlurRunning()) ObjectBlurTransform(cmd_list, *data);  // before ReplaceTaa's stretch
     if (g_dump_remaining.load() > 0) DumpTaaInputs(cmd_list);
     return ReplaceTaa(cmd_list, *data, screen);
   }
