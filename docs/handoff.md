@@ -1,4 +1,4 @@
-# Handoff: Elden Ring DLSS, state on 2026-10-11
+# Handoff: Elden Ring DLSS, state on 2026-10-12
 
 A ReShade 6.8 add-on (`src/`, built as `EldenRingDLSS.addon64`) loaded through me3 that replaces Elden Ring's TAA
 with DLSS. Full history and measurements are in `docs/recon.md` (rendering, upscaling, motion vectors) and
@@ -21,6 +21,8 @@ for picking up.
 | Tree motion vectors at 50% | Were lost from 2026-10-10 (resolve viewport); fixed, everyday install updated |
 | Object-only motion blur | Everyday and dev installs (`ObjectBlur=1`), in daily use with the game's blur on (2026-10-12) |
 | NVIDIA Reflex (injected at the present) | Everyday and dev installs: GPU queue 8 ms shorter, user feels it; ~3% fps |
+| Fast travel left the game at full size (grain under RR) | Fixed (6c124ae) in the dev install; **the everyday install still has it** |
+| GPU profile (5 places) | Done (2026-10-12): `docs/raytracing.md`, "GPU profile: where the frame goes" |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -46,7 +48,8 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
   b2ac485 (58%, K), 7182d94 (67%, K), f0e8c12 (DLAA). Only update it with the user's
   explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
 - **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLLs including `nvngx_dlssd.dll`):
-  test builds only. Latest build (2026-10-11, commit 56dbb23 and later): Ray Reconstruction (`RayReconstruction=1`,
+  test builds only. Latest build: 6c124ae (2026-10-12: the GPU profiler and the fast-travel fix on top of the
+  everyday build's features). Since 56dbb23: Ray Reconstruction (`RayReconstruction=1`,
   used only while the game's ray tracing runs) fed by our own sun shadow ray generation shader with render-size AO
   (`RtShadowRayGen=3`: blue noise, 1 AO and 1 shadow ray per pixel). Ini: `RenderScale=0.50`, `Preset=13` (M),
   `GameExposure=1`. F9 toggles DLSS and saves `Enabled` to the ini: check `Enabled=1` (and the "Loaded. DLSS on" log
@@ -139,29 +142,35 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
-1. **GPU profile session** (goal: free 3-5 ms for ray-traced reflections and GI): dev profile, the user stands still
-   at 3-4 places (open field with grass, forest, castle interior, a fight); at each, remote `gpuprofile 60 <place>`,
-   then `.tools\venv\Scripts\python.exe tools\gpu_profile.py <shots>\gpuprofile_<place>.csv`. The profiler (fe36062) is
-   untested in game. Look first for work ray tracing makes redundant (rasterized sun shadow maps, SSAO, SSR), the
-   resolution-independent scene refits, and full-size post-processing (depth of field, bloom).
-2. **Reflex** (docs/recon.md, "NVIDIA Reflex, injected at the present"): the sleep works (8-9 ms per frame, the frame's
+1. **Everyday install update** (with the user's OK, game closed): 6c124ae fixes a bug the everyday build has: after
+   any loading screen (fast travel) the engine stayed at full size, DLSS and RR stopped, and the game's denoiser got
+   our 1-ray AO and shadows (grain on the character, walls and ground). The user saw it in the dev install; tested
+   fixed there (two fast travels, back at 50% within about 150 ms). Recovery without the fix: restart the game, or
+   in the dev install remote `preset 13` (recreates the feature).
+2. **Savings from the GPU profile** (`docs/raytracing.md`, "GPU profile: where the frame goes"): no 3-5 ms of
+   redundant work; RR is a fixed 4.1 ms. In order: our rays in the forest (1.1 -> 4.5 ms; likely alpha-tested
+   leaves: shorter AO rays or opaque foliage for AO), acceleration-structure builds in fights (up to 2.9 ms), the
+   game's shadow denoiser still running under RR (0.17 ms), `SharpenFilter` with sharpening off (0.07 ms), the
+   stretch (0.5 ms). Profile again with `gpuprofile 60 <place>` and `gpu_profile.py --compare`.
+3. **Reflex** (docs/recon.md, "NVIDIA Reflex, injected at the present"): the sleep works (8-9 ms per frame, the frame's
    GPU work queued 8 ms less) and the user noticed an improvement. Open: whether the game reads input after the sleep
    (hook its input call and timestamp it against the markers), and a hook at the game's own frame start if the input
    timing shows the sleep is too late. In the everyday install since 2026-10-12.
-3. Object-only blur, open edges: idle with the game's Motion Blur off is untested by measurement (bba1275 gates it on
+4. Object-only blur, open edges: idle with the game's Motion Blur off is untested by measurement (bba1275 gates it on
    the blur pass; with the blur on the user tested this build in the everyday install). Watch for a pixel of blur on
    silhouettes while strafing and on swaying grass and trees (docs/recon.md, "Object-only motion blur").
-4. RR's responsivity mask on vegetation (preset F only; negative values favor stability) for the grass at 50%.
-5. The outreach drafts above, one at a time with the user.
-6. NPC motion edge: an enemy part shared with the player's equipment gets no motion (excluded with the player's
+5. RR's responsivity mask on vegetation (preset F only; negative values favor stability) for the grass at 50%.
+6. The outreach drafts above, one at a time with the user.
+7. NPC motion edge: an enemy part shared with the player's equipment gets no motion (excluded with the player's
    parts by mesh key). Check first whether it happens: `npc` reports draws left to the game per frame, which should
    equal the player's part count; fighting soldiers in the player's armor would show more.
-7. Older items: robustness (scale changes at runtime need a restart for the stretch; resolution changes; the first
+8. Older items: robustness (scale changes at runtime need a restart for the stretch; resolution changes; the first
    frame of a new command-list kind), performance of the stretch and full-size post-processing (about 1 ms), and
    removing dead experiments (`drs_probe.*`, `engine_resolution.*`, `hw_breakpoints.*`).
 
 ## Recent commits
 
-See `git log`. 2026-10-11: release packaging and README (bf33a45, d20a54c, 28007e3, 3962d3e); our ray generation
+See `git log`. 2026-10-12: GPU profiler (fe36062, resolve fixed in 7f1dee1), fast-travel fix
+(6c124ae). 2026-10-11: release packaging and README (bf33a45, d20a54c, 28007e3, 3962d3e); our ray generation
 shaders in the game's pipeline (6d7c0b1), render-size AO into RR and PCG noise (9c60c29), blue noise (23b8223),
 temporal blue noise option (9ffc216), 1 sun shadow ray (56dbb23), the NPC motion vector finding (7883869).

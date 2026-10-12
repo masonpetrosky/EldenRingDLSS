@@ -314,3 +314,37 @@ shaders share local root signature 6723 (`l_rayGenCB` b16, normal t67, depth t68
 4. ReSTIR-style reuse matters once there are many lights to choose from (the local lights, e.g. torches, or GI);
    for the sun and AO, RR's own temporal accumulation does the reuse. The pipeline already has radiance miss and
    closest-hit shaders (`GXMiss_radiance`, `GXClosestHit_radiance`, `GXRayGen`), useful for reflections or GI.
+
+## GPU profile: where the frame goes (2026-10-12)
+
+Goal: find 3-5 ms for ray-traced reflections or GI. Dev remote `gpuprofile 60 <place>` (GPU timestamps at every
+pass boundary for 60 frames, `tools/gpu_profile.py` sums them; fe36062, its resolve fixed in 7f1dee1), 4K output at
+50% with RR, ray tracing Maximum, our ray generation (`RtShadowRayGen=3`), daylight, the user standing still (the
+fights: three captures 15 s apart while fighting). CSVs in `captures/gpuprofile/` (local). Milliseconds per frame:
+
+| | Field | Forest | Castle gate | Castle interior | Fight (3) |
+| --- | --- | --- | --- | --- | --- |
+| GPU busy (union of all queues) | 15.3 | 21.4 | 12.3 | 11.4 | 14.4-16.3 |
+| DLSS RR (`ERDLSS DLSS`) | 4.1 | 4.1 | 4.0 | 4.0 | 4.1 |
+| G-buffer (5 targets) | 3.8 | 4.4 | 1.0 | 0.8 | 1.6-3.1 |
+| Acceleration-structure builds | 1.6 | 2.4 | 1.4 | 1.4 | 2.2-2.9 |
+| Our rays (`DispatchRays`) | 1.1 | 4.5 | 1.4 | 0.7 | 1.1-1.6 |
+| Depth only (shadow maps, prepasses) | 0.4 | 1.1 | 0.8 | 1.0 | 0.6-0.7 |
+| Full-screen passes (lighting, post) | 2.0 | 2.1 | 2.0 | 1.9 | 1.9 |
+| Animation compute (SpeedTree, skin) | 0.4 | 0.5 | 0.3 | 0.3 | 0.5-0.7 |
+| Add-on: stretch | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 |
+
+- Little that ray tracing makes redundant: SSR (`GXSsrTexBlur2`) 0.03 ms, the game's AO pass
+  (`GXLightDeferredAO`) 0.04, the rasterized shadow maps 0.4-1.1 ms (indoors with the local lights' 6144x4096 atlas;
+  the sun's are also read by the volumetric fog, `GXVolumetricFog_DirLightShadowReproj`).
+- RR is a fixed 4.1 ms, 27-36% of the GPU's time. Of the two `DispatchRays` per frame, the first (the game's
+  half-size AO, skipped by our AO) takes nothing; the second (ours: 1 AO + 1 sun shadow ray per pixel at the render
+  size) quadruples in the forest. Likely the alpha-tested leaves (any-hit shader invocations on the canopy); lever:
+  shorter AO rays, or opaque foliage for AO.
+- Small items: the game's shadow denoiser still runs under RR (`GXRtPost_VarianceGuidedShadow` +
+  `DenoiseATrousFilter`, 0.17 ms), `SharpenFilter` runs with game sharpening off (0.07 ms), the stretch 0.5 ms.
+- The castle gate was first profiled stuck at full size after a fast travel (no DLSS, the game's TAA and denoiser
+  on our 1-ray signals: grain, fixed in 6c124ae): our rays 5.46 ms at 3840x2160 vs 1.35 ms at 1920x1080, linear in
+  pixels; GPU busy 15.7 vs 12.3 ms.
+- Realistic savings: 1.5-2.5 ms in ordinary scenes (forest rays, builds in fights, the small items), more in forests.
+  Reflections or GI would cost frame rate rather than replace existing work.
