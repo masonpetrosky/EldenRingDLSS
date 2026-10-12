@@ -140,6 +140,7 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
   bool tree_wind_patched = false;   // a tree wind copy was written in this command list
   std::vector<erdlss::SkinMotion::Job> skin_jobs;  // NPC patches, run right before this list is executed
+  uint64_t skin_scope = 0;  // bone windows belong to this recording, not to another parallel list
   uint64_t index_va = 0;            // GPU address of the bound index buffer view (identifies NPC mesh parts)
   // GPU profiler (dev): the next draw or dispatch starts a segment; draws in the current one, its kind (1 draws,
   // 2 dispatches, 3 rays, 4 acceleration-structure builds) and compute pipeline.
@@ -155,11 +156,11 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
 };
 
 struct Config {
-  bool enabled = false;
+  std::atomic<bool> enabled{false};
   int preset = 0;  // 0 = NGX default, which is preset K for DLAA
   // Share of the output size (per axis) the scene renders at while DLSS is on, through the engine's dynamic
   // resolution (render_scale.hpp); DLSS upscales the rest. 1 = DLAA.
-  float render_scale = 1.0f;
+  std::atomic<float> render_scale{1.0f};
   int toggle_key = VK_F9;
   bool game_sharpening = false;  // run the game's TAA sharpening filter on the DLSS output
   float sharpen_strength = 0.25f;  // its strength while DLSS is on (the game uses 0.25)
@@ -187,7 +188,7 @@ struct Config {
   bool wind_trees = true;
   // DLSS Ray Reconstruction instead of super resolution (docs/raytracing.md): it denoises the game's ray traced
   // shadows and AO itself (the game's denoiser passes its input through while RR runs) and upscales.
-  bool ray_reconstruction = false;
+  std::atomic<bool> ray_reconstruction{false};
   int wind_tree_capacity = 4;
   // Ported path, development option: replace the grass depth prepasses' pixel shader so they write the motion
   // themselves instead of drawing the batch a second time (wind_prepass.hlsl). Works, but costs more than the second
@@ -318,6 +319,8 @@ erdlss::RrGuides g_rr_guides;
 bool g_rr_guides_failed = false;
 std::atomic<uint64_t> g_guides_frame{0}, g_guides_runs{0};
 std::atomic<bool> g_rr_active{false};
+std::atomic<uint64_t> g_rr_last_frame{0};
+std::atomic<float> g_rr_scale{1.0f};
 std::atomic<int> g_rr_preset{0};  // remote "rrpreset 0|4|5|6": NVIDIA's default (F), D, E (transformer) or F
 // The frame of the last DispatchRays: Ray Reconstruction only runs while the game's ray tracing is on (without it
 // there is nothing to denoise and DLSS super resolution is cheaper).
@@ -376,9 +379,14 @@ struct Watched {
   std::atomic<uint32_t> usage{0};  // resource_usage, 0 = no barrier seen yet
 };
 Watched g_watched[12];
+// ReShade calls destroy_resource before Release. Serialize cache use with invalidation; recursive because native
+// passes can create/destroy their own resources and reenter the callbacks on the same thread.
+std::recursive_mutex g_resource_cache_mutex;
+std::atomic<bool> g_track_resource_states{false};
 
 void Watch(uint64_t res) {
   if (res == 0) return;
+  std::lock_guard lock(g_resource_cache_mutex);
   for (Watched& w : g_watched)
     if (w.res.load() == res) return;
   for (int round = 0; round < 2; ++round) {
@@ -394,6 +402,7 @@ void Watch(uint64_t res) {
 }
 
 resource_usage WatchedUsage(uint64_t res) {
+  std::lock_guard lock(g_resource_cache_mutex);
   for (const Watched& w : g_watched)
     if (w.res.load() == res) return static_cast<resource_usage>(w.usage.load());
   return resource_usage::undefined;
@@ -537,7 +546,38 @@ std::atomic<int> g_rt_shadow_raygen{0};
 // Mode 2 and 3's AO (1 ray per pixel at the render size, unless rtsamples says otherwise) replaces the game's
 // half-size AO only while Ray Reconstruction runs, which denoises it; otherwise the game's AO path stays and these
 // modes act as 1.
-bool OurAoActive() { return g_rt_shadow_raygen.load() >= 2 && g_rr_active.load(); }
+bool RrProcessingActive() {
+  return g_config.enabled && g_config.ray_reconstruction && !g_upscale_at_composite && !g_recreate.load() &&
+         g_rr_active.load() && g_rr_scale.load() == g_config.render_scale &&
+         g_frame.load() <= g_rr_last_frame.load() + 1;
+}
+bool OurAoActive() { return g_rt_shadow_raygen.load() >= 2 && RrProcessingActive(); }
+
+// Every early return restores denoising for subsequent frames. Only a successful RR evaluation enables raw
+// processing; its settings and frame also have to match at the earlier lighting passes.
+struct RrEvaluation {
+  bool applied = false;
+  ~RrEvaluation() {
+    if (!applied) g_rr_active = false;
+  }
+  void Complete(bool rr) {
+    applied = true;
+    g_rr_scale = g_config.render_scale.load();
+    g_rr_last_frame = g_frame.load();
+    g_rr_active = rr;
+  }
+};
+
+void SetDlssEnabled(bool enabled) {
+  g_rr_active = false;
+  g_config.enabled = enabled;
+  g_reset = true;
+}
+
+void SetObjectBlur(bool enabled) {
+  if (enabled) g_track_resource_states = true;
+  g_config.object_blur = enabled;
+}
 std::mutex g_rt_ao_mutex;
 resource g_rt_ao_copy = {0};                  // the shadow output copied after our dispatch, under g_rt_ao_mutex
 std::atomic<uint64_t> g_rt_ao_copy_frame{0};  // frame of the last copy + 1 (0: none)
@@ -594,6 +634,7 @@ void LoadConfig() {
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
   g_config.flip_motion = ReadInt(L"FlipMotion", 0) != 0;
   g_config.use_depth_copy = ReadInt(L"UseDepthCopy", 0) != 0;
+  g_track_resource_states = g_config.render_scale < 1.0f || g_config.object_blur;
 }
 
 void SaveConfig() {
@@ -1024,6 +1065,18 @@ uint32_t EngineRenderSize(uint32_t size, float scale) {
   return std::min(size, 4 * static_cast<uint32_t>(std::floor(size * scale / 4.0f + 0.5f)));
 }
 
+bool AtRequestedRenderSize(uint32_t size, uint32_t input, float scale) {
+  const uint32_t want = EngineRenderSize(size, scale);
+  return input <= want + kRenderSizeSlack && want <= input + kRenderSizeSlack;
+}
+
+uint32_t FeatureRenderSize(uint32_t size, uint32_t input, float scale) {
+  const uint32_t want = EngineRenderSize(size, scale);
+  // Honor the game's rounding near the requested size. A transitional frame at the old scale must not cap the
+  // new feature there, or ApplyRenderScale can never reach a larger requested scale.
+  return AtRequestedRenderSize(size, input, scale) ? std::max(want, input) : want;
+}
+
 // The jitter in the scene constants comes from the latest scene draw, recorded in another command list, and was the
 // previous frame's in 2-3% of frames at a busy spot (a site of grace): presets M and L showed it as the whole world
 // jumping, K smoothed over it. The game computes the jitter from the TAA filter's counter, Halton(counter + 1, 2 and
@@ -1131,6 +1184,7 @@ void RestoreTaaState(command_list* cmd_list, const CmdData& data);
 // for the bloom, the emissive buffer for the glow, the half-size depth for the depth of field).
 void StretchPostInputs(command_list* cmd_list, CmdData& data, uint32_t width, uint32_t height, uint32_t in_width,
                        uint32_t in_height) {
+  std::lock_guard resource_lock(g_resource_cache_mutex);
   device* const dev = cmd_list->get_device();
   auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
   if (!g_stretch.ready() && !g_stretch_failed &&
@@ -1453,11 +1507,13 @@ void CorrectPostPassImpl(command_list* cmd_list, CmdData& data, bool compute, Dr
 // Returns true when DLSS replaced the draw. `screen` is CB_AA's g_vScreenPercentage: the share of the targets the
 // scene was rendered into (top-left), below 1 with the engine's dynamic resolution.
 bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
+  RrEvaluation rr_evaluation;
   const uint64_t draw = ++g_taa_draws;
   device* const dev = cmd_list->get_device();
   auto* const state = cmd_list->get_private_data<state_tracking>();
   if (state == nullptr || state->render_targets.empty()) return false;
 
+  std::unique_lock resource_lock(g_resource_cache_mutex);
   const resource color = BoundResource(cmd_list, shader_stage::pixel, 0);   // SourceTex
   if (color != 0) g_taa_source = color.handle;
   const resource motion = BoundResource(cmd_list, shader_stage::pixel, 3);  // g_MoveTex
@@ -1495,6 +1551,7 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
             md.texture.width == width && md.texture.height == height && md.texture.format == format::r16g16_float &&
             dd.texture.width == width && dd.texture.height == height;
   }
+  resource_lock.unlock();
   // The scene constants' screen size is the full one or, with dynamic resolution, possibly the render size.
   const bool scene_ok =
       have_scene && ((scene.width == static_cast<float>(width) && scene.height == static_cast<float>(height)) ||
@@ -1524,18 +1581,21 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
   if (!EnsureOutput(dev, width, height, td.texture.format)) return false;
   const bool game_exposure = g_config.game_exposure && EnsureExposure(dev);
-  // The render size the feature is for: the engine's, once it renders at the scale, else the one it will use.
-  const uint32_t create_w = in_width < width ? in_width : EngineRenderSize(width, g_config.render_scale);
-  const uint32_t create_h = in_height < height ? in_height : EngineRenderSize(height, g_config.render_scale);
+  const uint32_t create_w = FeatureRenderSize(width, in_width, g_config.render_scale);
+  const uint32_t create_h = FeatureRenderSize(height, in_height, g_config.render_scale);
+  const bool render_settled = AtRequestedRenderSize(width, in_width, g_config.render_scale) &&
+                              AtRequestedRenderSize(height, in_height, g_config.render_scale);
   // Ray Reconstruction once its guides exist (drawn at the light pass earlier in the frame).
   // and the game's ray tracing is on.
   const bool want_rr = g_config.ray_reconstruction && g_dlss.rr_available() && g_guides_frame.load() != 0 &&
-                       RayTracingActive();
+                       g_guides_frame.load() + 1 >= g_frame.load() && !g_rr_guides_failed &&
+                       g_rr_guides.normal_roughness() != nullptr && g_rr_guides.diffuse_albedo() != nullptr &&
+                       g_rr_guides.specular_albedo() != nullptr && RayTracingActive();
   if (g_dlss.has_feature() && (g_dlss.feature_rr() != want_rr || g_dlss.feature_width() != width ||
                                g_dlss.feature_height() != height ||
                                g_dlss.feature_scale() != g_config.render_scale || !g_dlss.feature_hdr() ||
                                g_dlss.feature_auto_exposure() == game_exposure ||
-                               ((in_width < width || in_height < height) &&
+                               (render_settled && (in_width < width || in_height < height) &&
                                 (!g_dlss.accepts(in_width, in_height) ||
                                  g_dlss.feature_render_width() > in_width + kRenderSizeSlack ||
                                  g_dlss.feature_render_height() > in_height + kRenderSizeSlack)))) {
@@ -1562,7 +1622,7 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   // E.g. the frame after the feature was created, before the engine follows the render scale, or the first frames
   // after a loading screen.
   if (!g_dlss.accepts(in_width, in_height)) {
-    if (in_width == width && in_height == height) g_scale_requested = g_frame.load();
+    g_scale_requested = g_frame.load();
     return false;
   }
   if (game_exposure) UploadExposure(cmd_list, scene.exposure);
@@ -1581,7 +1641,6 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
     in.diffuse_albedo = g_rr_guides.diffuse_albedo();
     in.specular_albedo = g_rr_guides.specular_albedo();
   }
-  g_rr_active = g_dlss.feature_rr();
   if (g_dlss.feature_rr()) {
     std::lock_guard dump_lock(g_dump_mutex);
     if (!g_rr_dump_name.empty()) {
@@ -1618,9 +1677,12 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   if (masked) cmd_list->barrier(g_mask, resource_usage::shader_resource, resource_usage::unordered_access);
   RestoreState(cmd_list, data);
   if (!ok) {
+    g_reset = true;
+    g_recreate = true;
     if (++g_failures == 1) Log(reshade::log::level::error, g_dlss.status());
     return false;
   }
+  rr_evaluation.Complete(g_dlss.feature_rr());
 
   cmd_list->barrier(g_output, resource_usage::unordered_access, resource_usage::copy_source);
   cmd_list->barrier(target, resource_usage::render_target, resource_usage::copy_dest);
@@ -1686,8 +1748,8 @@ void FinishUpscale(command_list* cmd_list, CmdData& data) {
   if (!g_dlss.has_feature()) {
     const bool created =
         g_dlss.Create(native, width, height,
-                      in.width < width ? in.width : EngineRenderSize(width, g_config.render_scale),
-                      in.height < height ? in.height : EngineRenderSize(height, g_config.render_scale),
+                      FeatureRenderSize(width, in.width, g_config.render_scale),
+                      FeatureRenderSize(height, in.height, g_config.render_scale),
                       g_config.render_scale, g_config.preset, false, false);
     RestoreState(cmd_list, data);
     if (!created) {
@@ -1703,7 +1765,7 @@ void FinishUpscale(command_list* cmd_list, CmdData& data) {
     return;
   }
   if (!g_dlss.accepts(in.width, in.height)) {
-    if (in.width == width && in.height == height) g_scale_requested = g_frame.load();
+    g_scale_requested = g_frame.load();
     return;
   }
 
@@ -1749,11 +1811,15 @@ void FinishUpscale(command_list* cmd_list, CmdData& data) {
 // Remembers the states the game leaves the watched textures in.
 void OnBarrier(command_list*, uint32_t count, const resource* resources, const resource_usage*,
                const resource_usage* new_states) {
+  if (!g_track_resource_states.load(std::memory_order_relaxed)) return;
   for (uint32_t i = 0; i < count; ++i) {
     if (resources[i].handle == 0) continue;
     for (Watched& w : g_watched)
-      if (w.res.load(std::memory_order_relaxed) == resources[i].handle)
-        w.usage.store(static_cast<uint32_t>(new_states[i]), std::memory_order_relaxed);
+      if (w.res.load(std::memory_order_relaxed) == resources[i].handle) {
+        std::lock_guard lock(g_resource_cache_mutex);
+        if (w.res.load(std::memory_order_relaxed) == resources[i].handle)
+          w.usage.store(static_cast<uint32_t>(new_states[i]), std::memory_order_relaxed);
+      }
   }
 }
 
@@ -1870,6 +1936,7 @@ void DestroyRayGenRing(device* dev);
 
 void OnDestroyDevice(device* dev) {
   if (dev != g_device) return;
+  g_rr_active = false;
   std::lock_guard lock(g_dlss_mutex);
   RetireOutput();
   for (const Retired& r : g_retired) dev->destroy_resource(r.res);
@@ -2825,8 +2892,10 @@ bool StreamSkinDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
   D3D12_GPU_VIRTUAL_ADDRESS prev_bones = skin.bones;
   if (stage >= 2) {
     erdlss::SkinMotion::Job job;
+    if (data.skin_scope == 0) data.skin_scope = g_skin.BeginList();
     if (!g_skin.PrepareJob(skin.bones, skin.bones_size, skin.instances, skin.instances_size, skin.idx_param,
-                           skin.index_buffer, skin.index_size, instance_count, part, g_frame.load(), &job)) {
+                           skin.index_buffer, skin.index_size, instance_count, part, g_frame.load(), data.skin_scope,
+                           &job)) {
       ++g_npc_counts.patch;
       return false;
     }
@@ -2983,6 +3052,7 @@ void RestoreTaaState(command_list* cmd_list, const CmdData& data) {
 
 // Merges the ported pass's motion into the TAA's motion texture.
 void MergeWind(command_list* cmd_list, const CmdData& data) {
+  std::unique_lock resource_lock(g_resource_cache_mutex);
   device* const dev = cmd_list->get_device();
   if (cmd_list->get_private_data<state_tracking>() == nullptr) return;
   const resource motion = BoundResource(cmd_list, shader_stage::pixel, 3);  // g_MoveTex
@@ -2991,6 +3061,7 @@ void MergeWind(command_list* cmd_list, const CmdData& data) {
   if (!g_wind_port.Merge(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()),
                          reinterpret_cast<ID3D12Resource*>(motion.handle),
                          reinterpret_cast<ID3D12Resource*>(depth.handle))) {
+    resource_lock.unlock();
     std::lock_guard lock(g_wind_mutex);
     SetWindError("could not merge (depth format or size)");
     return;
@@ -3000,6 +3071,7 @@ void MergeWind(command_list* cmd_list, const CmdData& data) {
 
 // Writes the streamed vegetation's motion into the TAA's motion texture, then puts the TAA draw's state back.
 void ResolveWind(command_list* cmd_list, const CmdData& data) {
+  std::unique_lock resource_lock(g_resource_cache_mutex);
   device* const dev = cmd_list->get_device();
   auto* const state = cmd_list->get_private_data<state_tracking>();
   if (state == nullptr) return;
@@ -3031,6 +3103,7 @@ void ResolveWind(command_list* cmd_list, const CmdData& data) {
                        scene.velocity_bias)) {
       ++g_wind_resolves;
     } else {
+      resource_lock.unlock();
       std::lock_guard lock(g_wind_mutex);
       SetWindError("unexpected depth format at the TAA");
     }
@@ -3440,6 +3513,7 @@ void OnPostPass(command_list* cmd_list, CmdData& data) {
   if (g_passlog_frame.load() != 0) LogPass(cmd_list, data);
   if (g_config.render_scale >= 1.0f || !g_config.enabled) return;
   if (data.pass == Pass::kEmissiveGlow || data.pass == Pass::kDofCoc) {
+    std::lock_guard resource_lock(g_resource_cache_mutex);
     device* const dev = cmd_list->get_device();
     for (uint32_t reg = 0; reg < 4; ++reg) {
       const resource r = BoundResource(cmd_list, shader_stage::pixel, reg);
@@ -3729,6 +3803,7 @@ bool CameraMotionDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t in
 
 // Object-only motion blur: at the TAA, the blur's motion texture (the motion prep's source) without the camera.
 void ObjectBlurTransform(command_list* cmd_list, const CmdData& data) {
+  std::lock_guard resource_lock(g_resource_cache_mutex);
   device* const dev = cmd_list->get_device();
   const resource full = BoundResource(cmd_list, shader_stage::pixel, 3);  // g_MoveTex
   const uint64_t blur_motion = g_motion_src.load();
@@ -3777,6 +3852,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   if (data->pass == Pass::kAoUpscale && (RawMode() == 2 || OurAoActive()) && StochasticAoUpscale(cmd_list, *data))
     return true;
   if (data->pass == Pass::kMotionPrep) {
+    std::lock_guard resource_lock(g_resource_cache_mutex);
     data->depth = BoundResource(cmd_list, shader_stage::pixel, 0);       // g_StencilTexForCopy
     data->depth_copy = BoundResource(cmd_list, shader_stage::pixel, 2);  // g_DepthTex
     if (data->depth != 0) g_depth = data->depth.handle;
@@ -3851,7 +3927,7 @@ std::atomic<bool> g_rt_raw{false};
 // grass the 4 half-size neighbors differ strongly, so picking one at random is noise of its own that more AO rays
 // do not remove: "shadows" is the default until the AO is traced at full size (docs/raytracing.md).
 std::atomic<int> g_rr_raw_mode{1};
-int RawMode() { return g_rt_raw.load() ? 2 : g_rr_active.load() ? g_rr_raw_mode.load() : 0; }
+int RawMode() { return g_rt_raw.load() ? 2 : RrProcessingActive() ? g_rr_raw_mode.load() : 0; }
 bool RawDenoise() { return RawMode() != 0; }
 std::atomic<uint64_t> g_rt_anim{0}, g_rt_refits{0}, g_rt_skipped{0}, g_rt_rays{0}, g_rt_tlas{0}, g_rt_edits{0};
 std::atomic<uint64_t> g_rt_mismatches{0};  // refits whose schedule disagreed with their animation dispatches
@@ -3921,8 +3997,27 @@ void OnInitResource(device*, const resource_desc& desc, const subresource_data*,
 }
 
 void OnDestroyResource(device*, resource res) {
-  std::lock_guard lock(g_upload_mutex);
-  std::erase_if(g_upload_buffers, [res](const UploadBuffer& b) { return b.buffer == res; });
+  {
+    std::lock_guard lock(g_upload_mutex);
+    std::erase_if(g_upload_buffers, [res](const UploadBuffer& b) { return b.buffer == res; });
+  }
+  if (res == 0) return;
+  std::lock_guard lock(g_resource_cache_mutex);
+  bool invalidated = false;
+  for (auto* cached : {&g_depth, &g_depth_copy, &g_motion_src, &g_emissive, &g_half_depth, &g_taa_source}) {
+    uint64_t expected = res.handle;
+    invalidated |= cached->compare_exchange_strong(expected, 0);
+  }
+  for (Watched& w : g_watched) {
+    if (w.res.load() == res.handle) {
+      w.res = 0;
+      w.usage = 0;
+    }
+  }
+  if (invalidated) {
+    g_rr_active = false;
+    g_reset = true;
+  }
 }
 
 // The buffer and offset of `size` bytes at `buffer`/`offset` as ReShade passed them, or false.
@@ -4541,7 +4636,7 @@ void ApplyRenderScale() {
     std::lock_guard lock(g_dlss_mutex);
     if (g_dlss.has_feature() && g_dlss.feature_hdr() != g_upscale_at_composite &&
         g_dlss.feature_scale() == g_config.render_scale)
-      scale = std::clamp(g_config.render_scale, g_dlss.min_scale(), g_dlss.max_scale());
+      scale = std::clamp(g_config.render_scale.load(), g_dlss.min_scale(), g_dlss.max_scale());
   }
   // DLSS needs about 8 x (output / render)^2 jitter positions when it upscales (NVIDIA); the game cycles through 8.
   const uint32_t phases = g_jitter_phases.load();
@@ -4592,13 +4687,13 @@ void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, ui
   last = now;
 
   if (KeyPressed(g_config.toggle_key)) {
-    g_config.enabled = !g_config.enabled;
-    g_reset = true;
+    SetDlssEnabled(!g_config.enabled);
     SaveConfig();
     Log(reshade::log::level::info, g_config.enabled ? "DLSS on." : "DLSS off (game TAA).");
   }
 
   if (g_recreate.exchange(false)) {
+    g_rr_active = false;
     queue->wait_idle();
     std::lock_guard lock(g_dlss_mutex);
     g_dlss.ReleaseFeature();
@@ -4834,8 +4929,7 @@ void OnReshadePresent(effect_runtime* runtime) {
   if (command == "capture") {
     result = CaptureScreenshot(runtime, arg.empty() ? "shot" : arg);
   } else if (command == "dlss") {
-    g_config.enabled = arg == "on";
-    g_reset = true;
+    SetDlssEnabled(arg == "on");
   } else if (command == "sharpen") {
     g_config.game_sharpening = arg == "on";
   } else if (command == "strength") {
@@ -4963,7 +5057,7 @@ void OnReshadePresent(effect_runtime* runtime) {
     result = g_reflex.Timeline();
   } else if (command == "objblur") {  // "objblur" alone reports; "objblur on|off" switches (and saves)
     if (!arg.empty()) {
-      g_config.object_blur = arg == "on";
+      SetObjectBlur(arg == "on");
       SaveConfig();
     }
     result = std::string(g_config.object_blur ? "on" : "off") + ", " + g_object_blur.status() + ", " +
@@ -5002,10 +5096,14 @@ void OnReshadePresent(effect_runtime* runtime) {
     g_config.chromatic_aberration = arg == "on";
   } else if (command == "scale") {
     // scale <render scale>: not saved
-    if (!arg.empty()) g_config.render_scale = std::clamp(std::strtof(arg.c_str(), nullptr), kMinRenderScale, 1.0f);
+    if (!arg.empty()) {
+      g_rr_active = false;
+      g_config.render_scale = std::clamp(std::strtof(arg.c_str(), nullptr), kMinRenderScale, 1.0f);
+      if (g_config.render_scale < 1.0f) g_track_resource_states = true;
+    }
     char text[160];
     std::snprintf(text, sizeof(text), "render scale %.3f, engine %.3f, rendering %ux%u of %ux%u",
-                  g_config.render_scale, g_render_scale.Get(), g_input_width.load(), g_input_height.load(),
+                  g_config.render_scale.load(), g_render_scale.Get(), g_input_width.load(), g_input_height.load(),
                   g_render_width.load(), g_render_height.load());
     result = text;
   } else if (command == "stretch") {
@@ -5123,6 +5221,7 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "rr") {
     // rr on|off: Ray Reconstruction instead of super resolution (saved)
     if (!arg.empty()) {
+      g_rr_active = false;
       g_config.ray_reconstruction = arg == "on";
       g_recreate = true;
       SaveConfig();
@@ -5184,8 +5283,7 @@ void OnReshadePresent(effect_runtime* runtime) {
 void OnOverlay(effect_runtime*) {
   bool enabled = g_config.enabled;
   if (ImGui::Checkbox("Use DLSS instead of the game's TAA", &enabled)) {
-    g_config.enabled = enabled;
-    g_reset = true;
+    SetDlssEnabled(enabled);
     SaveConfig();
   }
   ImGui::SetItemTooltip("Toggle in game with F9 (ToggleKey in EldenRingDLSS.ini).");
@@ -5205,7 +5303,9 @@ void OnOverlay(effect_runtime*) {
   if (!ImGui::IsAnyItemActive()) scale_percent = static_cast<int>(std::lround(g_config.render_scale * 100.0f));
   ImGui::SliderInt("Render scale", &scale_percent, static_cast<int>(kMinRenderScale * 100.0f), 100, "%d%%");
   if (ImGui::IsItemDeactivatedAfterEdit()) {
+    g_rr_active = false;
     g_config.render_scale = std::clamp(scale_percent / 100.0f, kMinRenderScale, 1.0f);
+    if (g_config.render_scale < 1.0f) g_track_resource_states = true;
     SaveConfig();
   }
   ImGui::SetItemTooltip("The scene renders at this share of the screen size (per axis) and DLSS upscales it: 100%% "
@@ -5245,7 +5345,11 @@ void OnOverlay(effect_runtime*) {
                         "animals. This gives them motion from last frame's pose. Uses about 64 MB of video memory "
                         "plus the tree path's stream buffers.");
   if (g_config.npc_motion && g_skin_failed.load()) ImGui::Text("  unavailable: %s", g_skin.status().c_str());
-  if (ImGui::Checkbox("Object-only motion blur (experimental)", &g_config.object_blur)) SaveConfig();
+  bool object_blur = g_config.object_blur;
+  if (ImGui::Checkbox("Object-only motion blur (experimental)", &object_blur)) {
+    SetObjectBlur(object_blur);
+    SaveConfig();
+  }
   if (ImGui::Checkbox("NVIDIA Reflex low latency (experimental)", &g_config.reflex)) {
     g_reflex.SetEnabled(g_config.reflex);
     SaveConfig();
@@ -5318,7 +5422,7 @@ void Initialize(HMODULE module) {
   g_applied_mip_bias = g_config.enabled ? g_config.mip_bias + std::log2(g_config.render_scale) : 0.0f;
   char text[160];
   std::snprintf(text, sizeof(text), "Loaded. DLSS %s; render scale %.2f; toggle key %d; texture mip bias %+.2f.",
-                g_config.enabled ? "on" : "off", g_config.render_scale, g_config.toggle_key, g_applied_mip_bias);
+                g_config.enabled ? "on" : "off", g_config.render_scale.load(), g_config.toggle_key, g_applied_mip_bias);
   Log(reshade::log::level::info, text);
 }
 
@@ -5365,10 +5469,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
-      // The barrier listener costs on every barrier the game records (loading screens record many), so it is only
-      // registered when upscaling is set at startup (the stretch passes need the textures' states).
-      if (g_config.render_scale < 1.0f || g_config.object_blur)
-        reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
+      // Always available for live settings changes; the callback exits immediately until state tracking is needed.
+      reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       // After every other present callback, right before the swap chain presents, and right after it.
       reshade::register_event<reshade::addon_event::present>(

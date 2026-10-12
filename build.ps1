@@ -1,5 +1,5 @@
 # Builds EldenRingDLSS.addon64 with the newest installed Visual Studio (x64, Release).
-param([string]$Config = 'Release')
+param([string]$Config = 'Release', [switch]$Tests)
 $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path "$PSScriptRoot\third_party\dlss\lib\nvsdk_ngx_s.lib")) {
@@ -20,10 +20,15 @@ Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-ar
 
 Push-Location $PSScriptRoot
 try {
-  cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=$Config"
+  $buildTests = if ($Tests) { 'ON' } else { 'OFF' }
+  cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=$Config" "-DERDLSS_BUILD_TESTS=$buildTests"
   if ($LASTEXITCODE) { throw 'CMake configure failed.' }
   cmake --build build
   if ($LASTEXITCODE) { throw 'Build failed.' }
+  if ($Tests) {
+    ctest --test-dir build --output-on-failure
+    if ($LASTEXITCODE) { throw 'Regression checks failed.' }
+  }
   Get-Item build\EldenRingDLSS.addon64
 } finally {
   Pop-Location

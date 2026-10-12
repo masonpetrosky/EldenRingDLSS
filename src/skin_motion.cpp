@@ -139,11 +139,12 @@ void SkinMotion::Shutdown() {
   if (status_ == "initialized") status_ = "off";
 }
 
-bool SkinMotion::WindowFor(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t size, uint64_t frame, Window* out, bool* first) {
+bool SkinMotion::WindowFor(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t size, uint64_t frame, uint64_t scope,
+                           Window* out, bool* first) {
   std::lock_guard lock(windows_mutex_);
-  // The game's constant ring gives every frame's windows new addresses, so a window seen in this or the last CPU
-  // frame (a list may be recorded across a present) belongs to this frame.
-  const auto it = windows_.find(bones);
+  // A recording can span a present, but only draws in that same recording may share its previous-pose window.
+  const WindowKey key{bones, scope};
+  const auto it = windows_.find(key);
   if (it != windows_.end() && it->second.frame + 1 >= frame && it->second.size >= size) {
     *out = it->second;
     *first = false;
@@ -171,7 +172,7 @@ bool SkinMotion::WindowFor(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t size, uint6
   w.size = size;
   w.store_offset = static_cast<uint32_t>(allocate(store_next_));
   w.prev = prev_->GetGPUVirtualAddress() + allocate(prev_next_);
-  windows_[bones] = w;
+  windows_[key] = w;
   *out = w;
   *first = true;
   ++windows_made_;
@@ -182,16 +183,17 @@ bool SkinMotion::WindowFor(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t size, uint6
 bool SkinMotion::PrepareJob(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t bones_size,
                             D3D12_GPU_VIRTUAL_ADDRESS instances, uint32_t instances_size,
                             D3D12_GPU_VIRTUAL_ADDRESS idx_param, D3D12_GPU_VIRTUAL_ADDRESS index_buffer,
-                            uint64_t index_size, uint32_t instance_count, uint32_t part, uint64_t frame, Job* job) {
+                            uint64_t index_size, uint32_t instance_count, uint32_t part, uint64_t frame,
+                            uint64_t scope, Job* job) {
   // Constant buffer views are 256-byte multiples of at most 64 KB.
   const uint32_t size = std::min<uint32_t>(bones_size, 65536) & ~255u;
   const uint32_t instance_slots = std::min<uint32_t>(instances_size, 65536) / (13 * 16);
   const uint32_t index_entries = static_cast<uint32_t>(std::min<uint64_t>(index_size / 4, UINT32_MAX));
-  if (size < 48 || instance_count == 0 || instance_count > 65535 || instance_slots == 0 || index_entries == 0)
+  if (scope == 0 || size < 48 || instance_count == 0 || instance_count > 65535 || instance_slots == 0 || index_entries == 0)
     return false;
   Window window;
   bool first = false;
-  if (!WindowFor(bones, size, frame, &window, &first)) return false;
+  if (!WindowFor(bones, size, frame, scope, &window, &first)) return false;
   job->bones = bones;
   job->instances = instances;
   job->idx_param = idx_param;
@@ -249,6 +251,9 @@ bool SkinMotion::SubmitJobs(ID3D12CommandQueue* queue, const std::vector<Job>& j
     }
     cmd->SetPipelineState(patch_pso_);
     cmd->Dispatch(job.instance_count, 1, 1);
+    // Later parts can revisit the same characters and bones. Their table reads and previous-pose writes must follow
+    // this patch even when no additional window copy is necessary.
+    cmd->ResourceBarrier(1, &uav);
   }
   Marker(cmd, L"ERDLSS <end>");  // the GPU profiler's end of this list
   if (FAILED(cmd->Close())) return false;

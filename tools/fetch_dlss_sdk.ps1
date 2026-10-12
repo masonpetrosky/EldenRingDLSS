@@ -1,14 +1,19 @@
 # Downloads the parts of NVIDIA's DLSS SDK that the add-on builds against into third_party\dlss.
 # The SDK stays under NVIDIA's license (third_party\dlss\LICENSE.txt) and is not committed to this repo.
-param([string]$Version = 'v310.9.1')
+param(
+  [string]$Version = 'v310.9.1',
+  [string]$Destination = (Join-Path $PSScriptRoot '..\third_party\dlss')
+)
 $ErrorActionPreference = 'Stop'
 
-$dst = Join-Path $PSScriptRoot '..\third_party\dlss'
+$dst = [System.IO.Path]::GetFullPath($Destination)
 $base = "https://raw.githubusercontent.com/NVIDIA/DLSS/$Version"
-$headers = gh api "repos/NVIDIA/DLSS/contents/include?ref=$Version" --jq '.[].path' 2>$null
-if (-not $headers) {
-  $headers = 'include/nvsdk_ngx.h', 'include/nvsdk_ngx_defs.h', 'include/nvsdk_ngx_params.h', 'include/nvsdk_ngx_helpers.h'
-}
+# Complete include closure for the D3D12 SR/RR helpers at the pinned SDK version. No GitHub CLI or login is needed.
+$headers = @(
+  'nvsdk_ngx.h', 'nvsdk_ngx_defs.h', 'nvsdk_ngx_params.h', 'nvsdk_ngx_loader.h',
+  'nvsdk_ngx_helpers.h', 'nvsdk_ngx_helpers_d3d.h', 'nvsdk_ngx_helpers_cuda.h',
+  'nvsdk_ngx_helpers_dlssd_d3d.h', 'nvsdk_ngx_defs_dlssd.h', 'nvsdk_ngx_params_dlssd.h'
+)
 $files = @{
   'LICENSE.txt' = 'LICENSE.txt'
   'lib/Windows_x86_64/x64/nvsdk_ngx_s.lib' = 'lib/nvsdk_ngx_s.lib'
@@ -18,7 +23,7 @@ $files = @{
   'lib/Windows_x86_64/rel/nvngx_dlssd.dll' = 'bin/rel/nvngx_dlssd.dll'
   'lib/Windows_x86_64/dev/nvngx_dlssd.dll' = 'bin/dev/nvngx_dlssd.dll'
 }
-foreach ($h in $headers) { $files[$h] = $h }
+foreach ($h in $headers) { $files["include/$h"] = "include/$h" }
 
 foreach ($src in $files.Keys) {
   $out = Join-Path $dst $files[$src]

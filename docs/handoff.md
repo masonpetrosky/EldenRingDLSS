@@ -23,12 +23,43 @@ for picking up.
 | NVIDIA Reflex (injected at the present) | Everyday and dev installs: GPU queue 8 ms shorter, user feels it; ~3% fps |
 | Fast travel left the game at full size (grain under RR) | Fixed (6c124ae), everyday and dev installs (2026-10-12) |
 | GPU profile (5 places) | Done (2026-10-12): `docs/raytracing.md`, "GPU profile: where the frame goes" |
-| Foliage cost in our rays; leaf-shadow popping; a flicker | **Open**, dev install only (83545fe, untested in game): see Next steps 0 |
+| Foliage cost in our rays; leaf-shadow popping; a flicker | **Open**, dev install only (83545fe, visual validation pending): see Next steps 0 |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
 
 ## Installs
+
+Source changes after the 2026-10-12 audit were deployed to **dev only** at 12:52 local time and the game launched
+with `eldenring-dlss-dev`; the everyday install is unchanged. The deployed add-on's SHA-256 is
+`1307DF1FCA83C6C143BBD58F1B21EA23AE67206A0FCC72224C3BA39C31804D7F`. Its previous add-on and configuration are
+backed up in `build/audit/dev-before-fixes-20261012-125204`. After the user's "ready", remote disable/re-enable,
+50% -> 67% -> 50%, RR -> SR -> RR, and 50% -> DLAA -> 50% passed in game. NPC patches matched prior frames
+with no refused windows; they measured 0.30-0.33 ms in two 60-frame profiles at this spot (no controlled old-build
+comparison). Object-blur off/on at DLAA stopped and restarted its transforms. The user pressed physical F9:
+Enabled=0, native rendering, our AO off, and its counters fixed at 20339 across two queries; remote `dlss on`
+restored 50% and our AO. Output resolution changed to 2560x1440: RR recreated at 1280x720, AO/blur resumed,
+the game remained responsive, and evaluation failures stayed zero. Returning to 3840x2160 also recreated RR at
+1920x1080, resumed AO/blur, and kept evaluation failures at zero. After the user quit normally, the dev profile
+was launched again at 13:06 with Enabled=1, RenderScale=1, ObjectBlur=0 for the startup check. After the user's
+"ready", blur stayed at zero camera copies/transforms while off. `objblur on` initialized it live: 60 copies,
+59 transforms after two seconds, then 226/225. The original baseline was restored and its ini matches the
+pre-test ini exactly: DLSS/RR on, scale 0.50, object blur on, NPC motion and Reflex on. The user subsequently
+quit normally; the game and me3 launcher are confirmed closed. The pre-startup ini is backed up at
+`build/audit/in-game/before-native-startup.ini` (Enabled=0 persisted by the physical F9 test, though remote
+`dlss on` restored the first session's runtime); the original baseline ini with Enabled=1 is in
+`build/audit/dev-before-fixes-20261012-125204`. First-session runtime log:
+`build/audit/in-game/ReShade-first-session.log`; startup-check log: `build/audit/in-game/ReShade-native-session.log`.
+Computer Use screenshot capture worked, but injected F9 and Escape did not register.
+Evidence is `build/audit/in-game-validation.txt` and `build/audit/in-game/`. RR processing
+now follows the enabled settings and successful evaluations, destroyed textures leave the caches, scale increases
+create enough input capacity, NPC bone windows are private to each command-list recording, object blur starts state
+tracking when enabled live, and the SDK fetch downloads its complete header set without GitHub CLI. Standalone
+regressions are in `tests/regressions.cpp` (`pwsh build.ps1 -Tests`; optional native checks:
+`build/erdlss_regressions.exe --gpu third_party/dlss/bin/rel`). The targeted F9, scale, resolution-recreation, and
+native-startup blur checks passed. Broader visual checks of NPC motion in crowds and a controlled old/new NPC
+performance comparison remain. An unexpected NGX error can still affect the
+frame whose lighting was already recorded; later frames restore the game's denoisers and recreate the feature.
 
 Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
@@ -49,8 +80,9 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
   b2ac485 (58%, K), 7182d94 (67%, K), f0e8c12 (DLAA). Only update it with the user's
   explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
 - **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLLs including `nvngx_dlssd.dll`):
-  test builds only. Latest build: 83545fe (2026-10-12, **untested in game**: the l_rayGenCB edit fix and refits
-  following their animation, on top of 6c124ae, the everyday build). Since 56dbb23: Ray Reconstruction (`RayReconstruction=1`,
+  test builds only. Latest build: the post-audit fixes (2026-10-12, **targeted regression checks passed** above),
+  including the six source fixes above and 83545fe's l_rayGenCB edit fix and refits
+  following their animation, on top of 6c124ae, the everyday build. Since 56dbb23: Ray Reconstruction (`RayReconstruction=1`,
   used only while the game's ray tracing runs) fed by our own sun shadow ray generation shader with render-size AO
   (`RtShadowRayGen=3`: blue noise, 1 AO and 1 shadow ray per pixel). Ini: `RenderScale=0.50`, `Preset=13` (M),
   `GameExposure=1`. F9 toggles DLSS and saves `Enabled` to the ini: check `Enabled=1` (and the "Loaded. DLSS on" log
@@ -66,6 +98,8 @@ Maximum, motion blur off, 4K, HDR on. Game version: App Ver. 1.17.1 = `eldenring
 - Ask the user to be at the PC before launching the game, and wait for "ready" (loaded in, controls released)
   before in-game tests. Never load into the world without them (their character could be attacked). For daylight,
   they can rest at a grace and "Pass time" to Noon.
+- Questions requiring the user's action stay pending until they answer. Do not put a response deadline or a
+  countdown on these questions; the user explicitly requested this on 2026-10-12.
 - The user is fine with commits being pushed to GitHub without asking. Anything else outward-facing (Nexus,
   Reddit, forums, releases) is confirmed per action; the user posts with their own accounts.
 - HDR: the vanilla game starts in SDR and switches to HDR at the first main-menu click. ReShade.log's output line
@@ -143,7 +177,9 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
-0. **Resume here: test 83545fe in the dev install** (installed, game closed; `docs/raytracing.md`, "Foliage in our
+0. **Resume here: broader NPC motion checks, then test the 83545fe foliage changes** (game closed;
+   targeted post-audit checks passed; original 50% DLSS/RR settings restored;
+   `docs/raytracing.md`, "Foliage in our
    rays, and a flicker"). At the second forest spot (the user's character beside leaves that popped):
    a. After loading in, remote `rtsamples`: more than one distinct set (different shadow fields) confirms the cause.
    b. Screenshot bursts a minute apart (`capture fl_<name><i>` x8; center brightness steady across the 8) and the
@@ -176,8 +212,8 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 7. NPC motion edge: an enemy part shared with the player's equipment gets no motion (excluded with the player's
    parts by mesh key). Check first whether it happens: `npc` reports draws left to the game per frame, which should
    equal the player's part count; fighting soldiers in the player's armor would show more.
-8. Older items: robustness (scale changes at runtime need a restart for the stretch; resolution changes; the first
-   frame of a new command-list kind), performance of the stretch and full-size post-processing (about 1 ms), and
+8. Older items: broader robustness (the first frame of a new command-list kind; targeted live scale and resolution
+   transitions passed on 2026-10-12), performance of the stretch and full-size post-processing (about 1 ms), and
    removing dead experiments (`drs_probe.*`, `engine_resolution.*`, `hw_breakpoints.*`).
 
 ## Recent commits

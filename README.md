@@ -70,7 +70,18 @@ measurements.
 ```
 pwsh tools/fetch_dlss_sdk.ps1     # DLSS SDK headers, static library and DLLs into third_party/dlss (NVIDIA license)
 pwsh build.ps1                    # configures and builds build/EldenRingDLSS.addon64
+pwsh build.ps1 -Tests             # also builds and runs standalone state/transition regression checks
 ```
+
+The SDK fetch uses pinned NVIDIA downloads and does not require GitHub CLI or a GitHub login. To run the additional
+NGX and NPC window checks on an RTX GPU after building with `-Tests`:
+
+```
+build/erdlss_regressions.exe --gpu third_party/dlss/bin/rel
+```
+
+These checks run outside the game. They cover state transitions and native feature creation; visual results and
+frame-time changes still need in-game testing.
 
 ## Installing
 

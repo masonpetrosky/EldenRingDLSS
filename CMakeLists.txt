@@ -9,7 +9,7 @@ add_compile_definitions(UNICODE _UNICODE)
 add_compile_options(/W4 /permissive- /utf-8)
 
 # NVIDIA's DLSS SDK is downloaded by tools/fetch_dlss_sdk.ps1 and stays under NVIDIA's license.
-set(DLSS_SDK_DIR ${CMAKE_SOURCE_DIR}/third_party/dlss)
+set(DLSS_SDK_DIR ${CMAKE_SOURCE_DIR}/third_party/dlss CACHE PATH "NVIDIA DLSS SDK directory")
 if(NOT EXISTS ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib)
   message(FATAL_ERROR "DLSS SDK not found in ${DLSS_SDK_DIR}. Run tools/fetch_dlss_sdk.ps1 first.")
 endif()
@@ -132,9 +132,10 @@ dxil_library(kRtRayGen rt_raygen.hlsl)
 
 configure_file(src/version.rc.in ${CMAKE_BINARY_DIR}/version.rc @ONLY)
 
-add_library(EldenRingDLSS SHARED src/addon.cpp src/descriptors.cpp src/dlss.cpp src/wind.cpp src/wind_port.cpp
+set(ERDLSS_RUNTIME_SOURCES src/descriptors.cpp src/dlss.cpp src/wind.cpp src/wind_port.cpp
             src/tree_dump.cpp src/engine_resolution.cpp src/render_scale.cpp src/stretch.cpp src/taa_jitter.cpp src/rr_guides.cpp src/ao_upscale.cpp
-            src/hw_breakpoints.cpp src/drs_probe.cpp src/rt_pipeline.cpp src/skin_motion.cpp src/dred.cpp src/object_blur.cpp src/reflex.cpp src/gpu_profiler.cpp ${CMAKE_BINARY_DIR}/version.rc ${SHADER_HEADERS})
+            src/hw_breakpoints.cpp src/drs_probe.cpp src/rt_pipeline.cpp src/skin_motion.cpp src/dred.cpp src/object_blur.cpp src/reflex.cpp src/gpu_profiler.cpp)
+add_library(EldenRingDLSS SHARED src/addon.cpp ${ERDLSS_RUNTIME_SOURCES} ${CMAKE_BINARY_DIR}/version.rc ${SHADER_HEADERS})
 target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui ${SHADER_DIR})
 target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include ${NVAPI_DIR})
 target_link_libraries(EldenRingDLSS PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib
@@ -145,3 +146,15 @@ set_target_properties(EldenRingDLSS PROPERTIES SUFFIX ".addon64")
 add_executable(dlss_bench tools/dlss_bench/dlss_bench.cpp)
 target_include_directories(dlss_bench SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
 target_link_libraries(dlss_bench PRIVATE ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib d3d12 dxgi)
+
+# Opt-in regression checks exercise addon helpers without loading or controlling the game.
+option(ERDLSS_BUILD_TESTS "Build standalone addon regression checks" OFF)
+if(ERDLSS_BUILD_TESTS)
+  enable_testing()
+  add_executable(erdlss_regressions tests/regressions.cpp ${ERDLSS_RUNTIME_SOURCES} ${SHADER_HEADERS})
+  target_include_directories(erdlss_regressions PRIVATE src third_party/imgui ${SHADER_DIR})
+  target_include_directories(erdlss_regressions SYSTEM PRIVATE ${DLSS_SDK_DIR}/include ${NVAPI_DIR})
+  target_link_libraries(erdlss_regressions PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib
+                        ${NVAPI_DIR}/amd64/nvapi64.lib d3d12 dxgi)
+  add_test(NAME addon_regressions COMMAND erdlss_regressions)
+endif()

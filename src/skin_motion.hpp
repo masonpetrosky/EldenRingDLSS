@@ -28,21 +28,24 @@ class SkinMotion {
   bool ready() const { return patch_pso_ != nullptr; }
   const std::string& status() const { return status_; }
 
+  // Unique scope for one command-list recording. Lists can be recorded and submitted in different orders.
+  uint64_t BeginList() { return next_scope_.fetch_add(1); }
+
   // A skinned draw's previous-pose patch, planned at the draw and run before its command list (SubmitJobs).
   struct Job {
     D3D12_GPU_VIRTUAL_ADDRESS bones = 0, instances = 0, idx_param = 0, index_buffer = 0;
     D3D12_GPU_VIRTUAL_ADDRESS prev = 0;  // the previous-pose window: bind it as cbObjMatrix for the previous pose
     uint32_t window_bones = 0, store_offset = 0, instance_slots = 0, index_entries = 0, instance_count = 0, part = 0;
-    bool copy = false;  // the frame's first draw of this bone window: copy it first
+    bool copy = false;  // this list's first draw of the window: copy before any of its patches
   };
   // Plans the patch for a skinned draw: `bones` and `bones_size` are the draw's cbObjMatrix (vertex b5), `instances`
   // and `instances_size` its cbInstanceData (vertex b4), `idx_param` its cbInstanceIdxParam (b10), `index_buffer`
   // and `index_size` its g_InstanceIndexBuffer view (t25); `part` identifies the mesh part across frames; `frame` is
-  // the CPU frame (windows are shared by the draws of one frame). False when there is nothing to do (rings full for
-  // this frame, or unusable sizes).
+  // the CPU frame; `scope` is BeginList() for its command-list recording. Windows are shared only within that
+  // recording, so another list's copy cannot overwrite a consumer's previous pose. False for full rings or unusable sizes.
   bool PrepareJob(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t bones_size, D3D12_GPU_VIRTUAL_ADDRESS instances,
                   uint32_t instances_size, D3D12_GPU_VIRTUAL_ADDRESS idx_param, D3D12_GPU_VIRTUAL_ADDRESS index_buffer,
-                  uint64_t index_size, uint32_t instance_count, uint32_t part, uint64_t frame, Job* job);
+                  uint64_t index_size, uint32_t instance_count, uint32_t part, uint64_t frame, uint64_t scope, Job* job);
   // Runs `jobs` on `queue` (a direct queue) in a command list of the add-on's own; call right before the command
   // list that drew them is executed there.
   bool SubmitJobs(ID3D12CommandQueue* queue, const std::vector<Job>& jobs);
@@ -62,14 +65,24 @@ class SkinMotion {
   std::string Stats(uint64_t frame);
 
  private:
+  struct WindowKey {
+    D3D12_GPU_VIRTUAL_ADDRESS bones;
+    uint64_t scope;
+    bool operator==(const WindowKey&) const = default;
+  };
+  struct WindowHash {
+    size_t operator()(const WindowKey& key) const {
+      return std::hash<uint64_t>()(key.bones) ^ (std::hash<uint64_t>()(key.scope) * 0x9E3779B97F4A7C15ull);
+    }
+  };
   struct Window {
     uint64_t frame = 0;
     uint32_t size = 0;
     uint32_t store_offset = 0;           // this frame's copy of the window in the store
     D3D12_GPU_VIRTUAL_ADDRESS prev = 0;  // the previous-pose window
   };
-  // The window for `bones` in `frame`; `first` when this call created it (the caller records the copy).
-  bool WindowFor(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t size, uint64_t frame, Window* out, bool* first);
+  bool WindowFor(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t size, uint64_t frame, uint64_t scope,
+                 Window* out, bool* first);
 
   // The add-on's command lists for the patches, reused once the GPU is done with them (fence values).
   static constexpr int kLists = 16;
@@ -100,7 +113,8 @@ class SkinMotion {
   ID3D12Resource* readback_ = nullptr;  // the table's header, copied every frame
 
   std::mutex windows_mutex_;
-  std::unordered_map<D3D12_GPU_VIRTUAL_ADDRESS, Window> windows_;  // the game's bone windows of the current frame
+  std::atomic<uint64_t> next_scope_{1};
+  std::unordered_map<WindowKey, Window, WindowHash> windows_;  // bone windows per command-list recording
   uint64_t store_next_ = 0, prev_next_ = 0;  // ring positions
   uint64_t budget_frame_ = 0, frame_bytes_ = 0;
 
