@@ -250,6 +250,7 @@ bool SkinMotion::SubmitJobs(ID3D12CommandQueue* queue, const std::vector<Job>& j
     cmd->SetPipelineState(patch_pso_);
     cmd->Dispatch(job.instance_count, 1, 1);
   }
+  Marker(cmd, L"ERDLSS <end>");  // the GPU profiler's end of this list
   if (FAILED(cmd->Close())) return false;
   ID3D12CommandList* const lists[] = {cmd};
   queue->ExecuteCommandLists(1, lists);

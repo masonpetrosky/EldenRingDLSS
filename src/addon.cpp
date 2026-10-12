@@ -47,6 +47,7 @@
 #include "stretch.hpp"
 #include "taa_jitter.hpp"
 #include "kVegetationMaskCs.h"
+#include "gpu_profiler.hpp"
 #include "object_blur.hpp"
 #include "reflex.hpp"
 #include "tree_dump.hpp"
@@ -140,6 +141,12 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   bool tree_wind_patched = false;   // a tree wind copy was written in this command list
   std::vector<erdlss::SkinMotion::Job> skin_jobs;  // NPC patches, run right before this list is executed
   uint64_t index_va = 0;            // GPU address of the bound index buffer view (identifies NPC mesh parts)
+  // GPU profiler (dev): the next draw or dispatch starts a segment; draws in the current one, its kind (1 draws,
+  // 2 dispatches, 3 rays, 4 acceleration-structure builds) and compute pipeline.
+  bool prof_dirty = true;
+  uint32_t prof_draws = 0;
+  int prof_kind = 0;
+  uint64_t prof_pipeline = 0;
   uint32_t rt_group = 0;  // ray tracing: refits recorded so far in this list (the animation dispatches before one belong to it)
   bool rt_group_keep = false;  // the current group animates a skinned character: refit it every frame
 };
@@ -245,6 +252,7 @@ std::unordered_map<uint32_t, uint64_t> g_velocity_parts;
 erdlss::ObjectBlur g_object_blur;
 std::atomic<bool> g_object_blur_failed{false};
 erdlss::Reflex g_reflex;
+erdlss::GpuProfiler g_profiler;  // dev remote "gpuprofile"
 std::atomic<uint64_t> g_blur_frame{0};  // g_frame of the game's last motion blur (0: not seen)
 std::atomic<uint64_t> g_wind_errors{0};
 std::atomic<uint64_t> g_wind_resolves{0};
@@ -1126,6 +1134,7 @@ void StretchPostInputs(command_list* cmd_list, CmdData& data, uint32_t width, ui
     g_stretch_failed = true;
     Log(reshade::log::level::error, "Stretch passes unavailable: " + g_stretch.status());
   }
+  erdlss::Marker(native, L"ERDLSS stretch");
   const resource depth = data.depth != 0 ? data.depth : resource{g_depth.load()};
   const resource depth_copy = data.depth_copy != 0 ? data.depth_copy : resource{g_depth_copy.load()};
   const uint64_t inputs[] = {depth.handle, depth_copy.handle, g_motion_src.load(), g_emissive.load(),
@@ -1596,6 +1605,7 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
   in.mv_scale_y = mv_scale;
   in.reset = g_reset.exchange(false);
   in.frame_time_ms = g_frame_time_ms.load();
+  erdlss::Marker(native, L"ERDLSS DLSS");
   const bool ok = g_dlss.Evaluate(native, in);
   if (masked) cmd_list->barrier(g_mask, resource_usage::shader_resource, resource_usage::unordered_access);
   RestoreState(cmd_list, data);
@@ -1699,6 +1709,7 @@ void FinishUpscale(command_list* cmd_list, CmdData& data) {
   dl.mv_scale_y = in.mv_scale;
   dl.reset = in.reset;
   dl.frame_time_ms = g_frame_time_ms.load();
+  erdlss::Marker(native, L"ERDLSS DLSS");
   const bool ok = g_dlss.Evaluate(native, dl);
   RestoreState(cmd_list, data);
   if (!ok) {
@@ -1912,6 +1923,93 @@ void OnDestroyCommandList(command_list* cmd_list) { cmd_list->destroy_private_da
 
 void OnResetCommandList(command_list* cmd_list) {
   if (auto* data = cmd_list->get_private_data<CmdData>()) *data = CmdData();
+  if (g_profiler.armed()) g_profiler.ListStart(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()));
+}
+
+void OnCloseCommandList(command_list* cmd_list) {
+  if (!g_profiler.armed()) return;
+  auto* const data = cmd_list->get_private_data<CmdData>();
+  g_profiler.ListEnd(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()), g_frame.load(),
+                     data != nullptr ? data->prof_draws : 0);
+}
+
+void OnBindRenderTargets(command_list* cmd_list, uint32_t, const resource_view*, resource_view) {
+  if (auto* data = cmd_list->get_private_data<CmdData>()) data->prof_dirty = true;
+}
+
+// GPU profiler: the label of a segment: its first shader and, for draws, its render targets and depth.
+std::string ProfileLabel(command_list* cmd_list, const CmdData& data, int kind) {
+  if (kind == 3) return "DispatchRays";
+  if (kind == 4) return "AccelerationStructureBuild";
+  std::string name;
+  {
+    std::shared_lock lock(g_material_mutex);
+    const auto it = g_material_vs.find(data.current.handle);
+    if (it != g_material_vs.end()) name = it->second.name;
+  }
+  if (name.empty()) name = PipelineName(data.current.handle);
+  if (name.empty()) name = "?";
+  if (kind == 2) return "CS " + name;
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  device* const dev = cmd_list->get_device();
+  char targets[128] = "no targets";
+  if (state != nullptr) {
+    uint32_t w = 0, h = 0, f = 0, dw = 0, dh = 0;
+    if (!state->render_targets.empty() && state->render_targets[0] != 0) {
+      const resource r = dev->get_resource_from_view(state->render_targets[0]);
+      if (r != 0) {
+        const resource_desc d = dev->get_resource_desc(r);
+        w = d.texture.width;
+        h = d.texture.height;
+        f = static_cast<uint32_t>(d.texture.format);
+      }
+    }
+    if (state->depth_stencil != 0) {
+      const resource r = dev->get_resource_from_view(state->depth_stencil);
+      if (r != 0) {
+        const resource_desc d = dev->get_resource_desc(r);
+        dw = d.texture.width;
+        dh = d.texture.height;
+      }
+    }
+    std::snprintf(targets, sizeof(targets), "%zurt %ux%u f%u ds %ux%u", state->render_targets.size(), w, h, f, dw, dh);
+  }
+  return name + " | " + targets;
+}
+
+// GPU profiler: a timestamp where the game's work changes target or kind (and at every new compute shader and ray
+// dispatch), then the work is counted into the current segment.
+void ProfileWork(command_list* cmd_list, CmdData& data, int kind) {
+  const uint64_t frame = g_frame.load();
+  if (!g_profiler.capturing(frame)) return;
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  bool fresh = data.prof_dirty || kind != data.prof_kind || kind == 3 || g_profiler.TakeForced(native);
+  if (kind == 2 && data.current.handle != data.prof_pipeline) fresh = true;
+  if (fresh) {
+    g_profiler.Boundary(native, frame, ProfileLabel(cmd_list, data, kind), data.prof_draws);
+    data.prof_dirty = false;
+    data.prof_kind = kind;
+    data.prof_pipeline = data.current.handle;
+    data.prof_draws = 0;
+  }
+  ++data.prof_draws;
+}
+
+// GPU profiler: the add-on's own passes (from their markers) as segments of their own; the game's next draw starts
+// another.
+void ProfileMarker(ID3D12GraphicsCommandList* cmd, const wchar_t* text) {
+  const std::wstring_view t(text);
+  static const wchar_t* const kPasses[] = {L"ERDLSS stream resolve", L"ERDLSS npc frame end", L"ERDLSS tree frame end",
+                                           L"ERDLSS object blur motion", L"ERDLSS camera motion copy",
+                                           L"ERDLSS npc patches", L"ERDLSS DLSS", L"ERDLSS stretch", L"ERDLSS <end>"};
+  if (std::none_of(std::begin(kPasses), std::end(kPasses), [&](const wchar_t* p) { return t == p; })) return;
+  std::string label;
+  for (const wchar_t c : t) label.push_back(static_cast<char>(c));  // the markers are ASCII
+  if (t == L"ERDLSS <end>")
+    g_profiler.ListEnd(cmd, g_frame.load(), 0);
+  else
+    g_profiler.Boundary(cmd, g_frame.load(), label, UINT32_MAX);
+  g_profiler.Force(cmd);
 }
 
 // The material name from a vertex shader's debug path, or empty for shaders outside the material library.
@@ -3358,6 +3456,7 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
+  ProfileWork(cmd_list, *data, 1);
   DrawFix fix;
   if (data->post_fix) CorrectPostPass(cmd_list, *data, false, &fix);
   OnPostPass(cmd_list, *data);
@@ -3649,6 +3748,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
+  ProfileWork(cmd_list, *data, 1);
   // Object-only motion blur only while the game's motion blur runs (its passes are skipped when it is off).
   if (data->pass == Pass::kMotionBlur) g_blur_frame = g_frame.load();
   if (data->pass == Pass::kCameraMotion && g_config.object_blur && BlurRunning() &&
@@ -3877,6 +3977,7 @@ bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   SignList(cmd_list, *data, false);
+  ProfileWork(cmd_list, *data, 2);
   if (data->post_fix) CorrectPostPass(cmd_list, *data, true);
   const std::string name = PipelineName(data->current.handle);
   if (name.find("_Animation") != std::string::npos) {
@@ -3944,6 +4045,7 @@ bool OnBuildAccelerationStructure(command_list* cmd_list, acceleration_structure
                                   acceleration_structure_build_flags, uint32_t input_count,
                                   const acceleration_structure_build_input* inputs, resource, uint64_t, resource_view,
                                   resource_view dest, acceleration_structure_build_mode mode) {
+  if (auto* const data = cmd_list->get_private_data<CmdData>()) ProfileWork(cmd_list, *data, 4);
   if (type == acceleration_structure_type::top_level) {
     ++g_rt_tlas;
     if (input_count == 1 && inputs != nullptr) UpdateBlasDistances(cmd_list->get_device(), inputs[0]);
@@ -4255,6 +4357,7 @@ bool OnDispatchRays(command_list* cmd_list, resource raygen, uint64_t raygen_off
                     uint64_t hit_offset, uint64_t hit_size, uint64_t hit_stride, resource callable,
                     uint64_t callable_offset, uint64_t callable_size, uint64_t callable_stride, uint32_t width,
                     uint32_t height, uint32_t depth) {
+  if (auto* const data = cmd_list->get_private_data<CmdData>()) ProfileWork(cmd_list, *data, 3);
   ++g_rt_rays;
   g_last_rays_frame = g_frame.load();
   EditRayGenSamples(cmd_list->get_device(), raygen, raygen_offset, raygen_size);
@@ -4376,6 +4479,11 @@ void CheckDeviceRemoved() {
 
 void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
   const uint64_t frame = ++g_frame;
+  if (g_profiler.armed()) {
+    UINT64 ticks = 0;
+    if (SUCCEEDED(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native())->GetTimestampFrequency(&ticks)))
+      g_profiler.set_frequency(ticks);
+  }
   CheckDeviceRemoved();
   if (sc != nullptr) LogOutputMode(sc);
   static LARGE_INTEGER frequency = {}, last = {};
@@ -4500,6 +4608,21 @@ void OnReshadePresent(effect_runtime* runtime) {
   static std::string wind_debug_request;  // the pending "winddebug" command
   static uint64_t wind_debug_frame = 0;
   static std::string tree_request;  // the pending "treedump" command
+  static std::string profile_request;  // the pending "gpuprofile" command
+  if (!profile_request.empty()) {
+    if (g_frame.load() > g_profiler.end() + 3) {
+      command_queue* const queue = runtime->get_command_queue();
+      queue->wait_idle();
+      erdlss::g_marker_hook = nullptr;
+      g_profiler.RecordResolve(
+          reinterpret_cast<ID3D12GraphicsCommandList*>(queue->get_immediate_command_list()->get_native()));
+      queue->flush_immediate_command_list();
+      queue->wait_idle();
+      FinishRemote(profile_request, g_profiler.Write(g_addon_dir / L"shots"));
+      profile_request.clear();
+    }
+    return;
+  }
   if (!tree_request.empty()) {
     if (g_frame.load() > g_tree_end.load() + 3) {
       command_queue* const queue = runtime->get_command_queue();
@@ -4582,6 +4705,18 @@ void OnReshadePresent(effect_runtime* runtime) {
     g_dump_last = 0;
     g_dump_remaining = std::max(1, std::min(std::atoi(arg.c_str()), 16));
     dump_request = command + " " + arg + " " + arg2;
+    return;
+  }
+  if (command == "gpuprofile") {  // "gpuprofile <frames> <name>"
+    if (!g_profiler.ready() &&
+        (g_device == nullptr || !g_profiler.Init(reinterpret_cast<ID3D12Device*>(g_device->get_native())))) {
+      FinishRemote(command + " " + arg, "could not create the timestamp heap");
+      return;
+    }
+    const int frames = std::clamp(std::atoi(arg.c_str()), 1, 240);
+    g_profiler.Arm(g_frame.load() + 2, static_cast<uint32_t>(frames), arg2.empty() ? "frame" : arg2);
+    erdlss::g_marker_hook = &ProfileMarker;
+    profile_request = command + " " + arg + " " + arg2;
     return;
   }
   if (command == "treedump") {
@@ -5105,6 +5240,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
       reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyCommandList);
       reshade::register_event<reshade::addon_event::reset_command_list>(OnResetCommandList);
+      reshade::register_event<reshade::addon_event::close_command_list>(OnCloseCommandList);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
       reshade::register_event<reshade::addon_event::create_sampler>(OnCreateSampler);
       reshade::register_event<reshade::addon_event::init_pipeline>(OnInitPipeline);
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
