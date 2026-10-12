@@ -26,10 +26,12 @@
 # step and with wind off, frame times with everything on, without the merge, and with wind off.
 # -Round showcase: README comparison: DLSS at render scale 0.50 and 0.67, DLAA and the game TAA, each a screenshot and
 # a 5 s frame-time log. Start the game with RenderScale=0.50 (upscaling needs a scale below 1 at startup); ends at 0.50.
+# -Round rtfoliage: GPU profiles and screenshots of our rays with and without the foliage alpha test, shorter AO rays
+# and nearer opaque shadows (see the round); restores the defaults.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
                'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe', 'upscale',
-               'showcase', 'showcasert')][string]$Round = 'sharpen',
+               'showcase', 'showcasert', 'rtfoliage')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -238,6 +240,27 @@ if ($Round -eq 'sharpen') {
   Send 'capture showrt_vanilla'; LogFrames 'showrt_vanilla'
   Send 'rtdist 20 50'; Send 'rtrefit 2' 3.0; LogFrames 'showrt_taa'
   Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'; LogFrames 'showrt_dlss50'
+} elseif ($Round -eq 'rtfoliage') {
+  # The cost of alpha-tested foliage in our rays: a 30-frame GPU profile and a screenshot per setting (the game's;
+  # AO, shadow or both rays without the alpha test; AO rays at 1/2 and 1/4 of the game's length; shadows opaque
+  # beyond half the game's distance). Summarize with gpu_profile.py shots\gpuprofile_rf_*.csv. Restores the defaults.
+  $game = (Send 'rtsamples') -join ' '
+  $aoLength = [double]([regex]::Match($game, 'AO length ([\d.]+) m').Groups[1].Value)
+  $shadowFar = [double]([regex]::Match($game, 'beyond ([\d.]+) m').Groups[1].Value)
+  $rounds = [ordered]@{
+    base = @('rtalpha on on'); aoopaque = @('rtalpha off on'); shadowopaque = @('rtalpha on off')
+    bothopaque = @('rtalpha off off')
+    aohalf = @('rtalpha on on', ('rtaolen ' + ($aoLength / 2).ToString([cultureinfo]::InvariantCulture)))
+    aoquarter = @(('rtaolen ' + ($aoLength / 4).ToString([cultureinfo]::InvariantCulture)))
+    shadowfarhalf = @('rtaolen 0', ('rtshadowfar ' + ($shadowFar / 2).ToString([cultureinfo]::InvariantCulture)))
+    base2 = @('rtshadowfar 0')
+  }
+  foreach ($name in $rounds.Keys) {
+    foreach ($command in $rounds[$name]) { Send $command | Out-Null }
+    Start-Sleep -Seconds 1
+    Send "gpuprofile 30 rf_$name"; Send "capture rf_$name"
+  }
+  Send 'rtalpha game game'; Send 'rtaolen 0'; Send 'rtshadowfar 0'
 } elseif ($Round -eq 'treecost') {
   # Where the trees' cost goes: grass and trees with and without the resolve draw, grass only.
   Send 'dlss on'; Send 'wind on'; Send 'windtrees on' 3.0; LogFrames 'tc_trees'

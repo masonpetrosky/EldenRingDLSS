@@ -149,6 +149,9 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   uint64_t prof_pipeline = 0;
   uint32_t rt_group = 0;  // ray tracing: refits recorded so far in this list (the animation dispatches before one belong to it)
   bool rt_group_keep = false;  // the current group animates a skinned character: refit it every frame
+  // The current group's animation dispatches ran or were skipped; its refit follows them (refitting vertices the
+  // animation did not write this frame made leaf shadows pop).
+  bool rt_group_animated = false, rt_group_anim_skipped = false;
 };
 
 struct Config {
@@ -3851,6 +3854,7 @@ std::atomic<int> g_rr_raw_mode{1};
 int RawMode() { return g_rt_raw.load() ? 2 : g_rr_active.load() ? g_rr_raw_mode.load() : 0; }
 bool RawDenoise() { return RawMode() != 0; }
 std::atomic<uint64_t> g_rt_anim{0}, g_rt_refits{0}, g_rt_skipped{0}, g_rt_rays{0}, g_rt_tlas{0}, g_rt_edits{0};
+std::atomic<uint64_t> g_rt_mismatches{0};  // refits whose schedule disagreed with their animation dispatches
 std::atomic<uint64_t> g_rt_denoise{0};    // denoiser dispatches seen
 std::atomic<uint64_t> g_rt_edit_fail[7];  // where the denoiser edit stopped (EditBoundConstants `step`)
 
@@ -3994,8 +3998,11 @@ bool OnDispatch(command_list* cmd_list, uint32_t, uint32_t, uint32_t) {
     // player shadows the real one when they move. Vegetation can wait.
     if (name.find("_Skin") != std::string::npos) data->rt_group_keep = true;
     if (g_rt_skip.load() & 1) return true;
-    if (!data->rt_group_keep && SkipThisFrame(PredictedInterval(data->signature, data->rt_group), data->rt_group))
+    if (!data->rt_group_keep && SkipThisFrame(PredictedInterval(data->signature, data->rt_group), data->rt_group)) {
+      data->rt_group_anim_skipped = true;
       return true;
+    }
+    data->rt_group_animated = true;
   } else if ((g_rt_skip.load() & 8) && name.rfind("GXRtPost_", 0) == 0) {
     return true;
   } else if (RawMode() == 2 && name == "GXRtPost_DenoiseATrousFilter") {
@@ -4063,7 +4070,8 @@ bool OnBuildAccelerationStructure(command_list* cmd_list, acceleration_structure
   if (data == nullptr) return false;
   const uint32_t group = data->rt_group++;
   const bool keep = data->rt_group_keep;
-  data->rt_group_keep = false;
+  const bool animated = data->rt_group_animated, anim_skipped = data->rt_group_anim_skipped;
+  data->rt_group_keep = data->rt_group_animated = data->rt_group_anim_skipped = false;
   if (mode != acceleration_structure_build_mode::update) return false;  // only refits can wait
   ++g_rt_refits;
   // D3D12: an acceleration structure's view is its GPU address (reshade_api_resource.hpp).
@@ -4072,7 +4080,14 @@ bool OnBuildAccelerationStructure(command_list* cmd_list, acceleration_structure
     std::unique_lock lock(g_blas_mutex);
     g_group_interval[GroupKey(data->signature, group)] = interval;
   }
-  if ((g_rt_skip.load() & 2) || SkipThisFrame(interval, group)) {
+  bool skip = SkipThisFrame(interval, group);
+  // The animation dispatches decided with last frame's interval; when this one differs, the refit still follows them.
+  if (animated || anim_skipped) {
+    const bool follow = anim_skipped && !animated;
+    if (follow != skip) ++g_rt_mismatches;
+    skip = follow;
+  }
+  if ((g_rt_skip.load() & 2) || skip) {
     ++g_rt_skipped;
     return true;
   }
@@ -4086,13 +4101,48 @@ bool OnBuildAccelerationStructure(command_list* cmd_list, acceleration_structure
 std::atomic<int> g_rt_random_mode{0};  // 0 game's, 1 free (a hash of the frame number)
 // Rays per pixel: l_rayGenCB starts with uint aoSampleCount and uint dirLightShadowSampleCount. It is a local
 // constant buffer: its GPU address sits in the ray generation record of the shader table, after the 32-byte shader
-// identifier. Remote "rtsamples <ao> <shadow>" (0 = the game's) raises them for Ray Reconstruction; the game's values
-// are written back when the override is cleared (the buffer may be written only once).
+// identifier. Remote "rtsamples <ao> <shadow>" (0 = the game's) raises them for Ray Reconstruction; remote "rtalpha",
+// "rtaolen" and "rtshadowfar" set the fields that decide the cost of alpha-tested foliage. The game writes these
+// buffers every frame (about one edit per frame), from a ring whose addresses the AO and the shadow dispatches share
+// over time, so only the overridden fields are written, onto this frame's values: writing back values remembered by
+// address put one dispatch's values into the other's buffer (2026-10-12: shadows beyond l_shadowMaxDist, 1 opaque
+// ray, every few frames: the screen flickered dark under the leaves).
 std::atomic<uint32_t> g_rt_ao_samples{0}, g_rt_shadow_samples{0};
-std::atomic<uint32_t> g_rt_game_ao_samples{0}, g_rt_game_shadow_samples{0};
+std::atomic<int> g_rt_ao_alpha{-1}, g_rt_shadow_alpha{-1};  // l_enableAoAlpha, l_enableShadowAlpha; -1 = the game's
+std::atomic<float> g_rt_ao_length{0.0f};   // l_aoRayLengthRange.y in meters; 0 = the game's
+std::atomic<float> g_rt_shadow_far{0.0f};  // l_shadowMaxDist (1 opaque ray beyond it) in meters; 0 = the game's
+
+// The fields of l_rayGenCB (96 bytes, rt_raygen.hlsl) the overrides touch.
+struct RayGenFields {
+  uint32_t ao_samples = 0, shadow_samples = 0;  // bytes 0 and 4
+  float ao_length = 0;                          // byte 52 (l_aoRayLengthRange.y)
+  uint32_t ao_alpha = 0, shadow_alpha = 0;      // bytes 72 and 76
+  float shadow_far = 0;                         // byte 88 (l_shadowMaxDist)
+
+  static RayGenFields Read(const uint8_t* cb) {
+    RayGenFields f;
+    std::memcpy(&f.ao_samples, cb, 4);
+    std::memcpy(&f.shadow_samples, cb + 4, 4);
+    std::memcpy(&f.ao_length, cb + 52, 4);
+    std::memcpy(&f.ao_alpha, cb + 72, 4);
+    std::memcpy(&f.shadow_alpha, cb + 76, 4);
+    std::memcpy(&f.shadow_far, cb + 88, 4);
+    return f;
+  }
+  void Write(uint8_t* cb) const {
+    std::memcpy(cb, &ao_samples, 4);
+    std::memcpy(cb + 4, &shadow_samples, 4);
+    std::memcpy(cb + 52, &ao_length, 4);
+    std::memcpy(cb + 72, &ao_alpha, 4);
+    std::memcpy(cb + 76, &shadow_alpha, 4);
+    std::memcpy(cb + 88, &shadow_far, 4);
+  }
+  bool operator==(const RayGenFields&) const = default;
+};
 std::atomic<uint64_t> g_rt_sample_edits{0}, g_rt_sample_misses{0};
 std::mutex g_rt_samples_mutex;
-std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> g_rt_sample_originals;  // CB address -> game's counts
+RayGenFields g_rt_game_fields;                 // under g_rt_samples_mutex: the last seen before the edit
+std::vector<RayGenFields> g_rt_seen_fields;    // under g_rt_samples_mutex: the distinct sets seen (at most 8)
 
 bool ResolveUpload(resource* buffer, uint64_t* offset, uint64_t size);
 
@@ -4146,20 +4196,27 @@ void EditRayGenSamples(device* dev, resource raygen, uint64_t raygen_offset, uin
     }
     if (!resolved) continue;
     void* cb = nullptr;
-    if (!dev->map_buffer_region(buffer, offset, 8, map_access::read_write, &cb)) continue;
+    if (!dev->map_buffer_region(buffer, offset, 96, map_access::read_write, &cb)) continue;
     uint32_t counts[2];
     std::memcpy(counts, cb, sizeof(counts));
     bool found = false;
     if (counts[0] <= 64 && counts[1] <= 64 && (counts[0] | counts[1]) != 0) {
       found = true;
+      const RayGenFields now = RayGenFields::Read(static_cast<const uint8_t*>(cb));
       std::lock_guard lock(g_rt_samples_mutex);
-      auto it = g_rt_sample_originals.find(args[i]);
-      if (it == g_rt_sample_originals.end()) it = g_rt_sample_originals.emplace(args[i], std::pair{counts[0], counts[1]}).first;
-      g_rt_game_ao_samples = it->second.first;
-      g_rt_game_shadow_samples = it->second.second;
-      const uint32_t want[2] = {ao != 0 ? ao : it->second.first, shadow != 0 ? shadow : it->second.second};
-      if (want[0] != counts[0] || want[1] != counts[1]) {
-        std::memcpy(cb, want, sizeof(want));
+      g_rt_game_fields = now;
+      if (g_rt_seen_fields.size() < 8 &&
+          std::find(g_rt_seen_fields.begin(), g_rt_seen_fields.end(), now) == g_rt_seen_fields.end())
+        g_rt_seen_fields.push_back(now);
+      RayGenFields want = now;
+      if (ao != 0) want.ao_samples = ao;
+      if (shadow != 0) want.shadow_samples = shadow;
+      if (g_rt_ao_alpha.load() >= 0) want.ao_alpha = static_cast<uint32_t>(g_rt_ao_alpha.load());
+      if (g_rt_shadow_alpha.load() >= 0) want.shadow_alpha = static_cast<uint32_t>(g_rt_shadow_alpha.load());
+      if (g_rt_ao_length.load() > 0.0f) want.ao_length = g_rt_ao_length.load();
+      if (g_rt_shadow_far.load() > 0.0f) want.shadow_far = g_rt_shadow_far.load();
+      if (!(want == now)) {
+        want.Write(static_cast<uint8_t*>(cb));
         ++g_rt_sample_edits;
       }
     }
@@ -4176,6 +4233,38 @@ void EditRayGenSamples(device* dev, resource raygen, uint64_t raygen_offset, uin
   }
   if (log_now) Log(reshade::log::level::info, "Ray generation record:" + log_text);
   ++g_rt_sample_misses;
+}
+
+// Remote "rtsamples", "rtalpha", "rtaolen", "rtshadowfar": the game's values, the distinct sets seen, the overrides.
+std::string RayGenFieldsText() {
+  RayGenFields game;
+  std::vector<RayGenFields> seen;
+  {
+    std::lock_guard lock(g_rt_samples_mutex);
+    game = g_rt_game_fields;
+    seen = g_rt_seen_fields;
+  }
+  const auto describe = [](const RayGenFields& f) {
+    char text[160];
+    std::snprintf(text, sizeof(text), "rays AO %u, shadows %u; alpha test AO %u, shadows %u; AO length %.2f m; "
+                  "shadows opaque (1 ray) beyond %.1f m", f.ao_samples, f.shadow_samples, f.ao_alpha, f.shadow_alpha,
+                  f.ao_length, f.shadow_far);
+    return std::string(text);
+  };
+  const auto alpha = [](int v) { return std::string(v < 0 ? "game" : v != 0 ? "on" : "off"); };
+  std::string result = "game's (last): " + describe(game) + ". Distinct sets seen: " + std::to_string(seen.size());
+  for (const RayGenFields& f : seen) result += " [" + describe(f) + "]";
+  char text[512];
+  std::snprintf(text, sizeof(text),
+                ". Overrides (0/game = the game's; with our AO 1 ray each): rays AO %u, shadows %u; alpha AO %s, "
+                "shadows %s; AO length %.2f; shadow far %.1f. Edits %llu, records without the buffer %llu, records not "
+                "readable %llu",
+                g_rt_ao_samples.load(), g_rt_shadow_samples.load(), alpha(g_rt_ao_alpha).c_str(),
+                alpha(g_rt_shadow_alpha).c_str(), g_rt_ao_length.load(), g_rt_shadow_far.load(),
+                static_cast<unsigned long long>(g_rt_sample_edits.load()),
+                static_cast<unsigned long long>(g_rt_sample_misses.load()),
+                static_cast<unsigned long long>(g_rt_sample_no_record.load()));
+  return result + text;
 }
 std::mutex g_rt_random_mutex;
 std::vector<float> g_rt_random_log;  // under g_rt_random_mutex
@@ -4946,13 +5035,14 @@ void OnReshadePresent(effect_runtime* runtime) {
     double per[6];
     for (int i = 0; i < 6; ++i) per[i] = double(now[i] - last[i]) / double(frames), last[i] = now[i];
     last_frame = g_frame.load();
-    char text[512];
+    char text[768];
     const uint64_t hits = g_rt_dist_hits.exchange(0), misses = g_rt_dist_misses.exchange(0);
+    const uint64_t mismatches = g_rt_mismatches.exchange(0);
     std::snprintf(text, sizeof(text),
                   "distance schedule near %.0f m far %.0f m: structures %u / %u / %u, lookups %llu hit %llu missed, "
                   "instance reads %llu ok %llu failed; "
                   "raw %d, skip %u, refit every %u, feedback %.3f, constrain %d; per frame over %llu: %.1f animation dispatches, %.1f refits "
-                  "(%.1f skipped), %.2f top-level builds, %.2f DispatchRays, %.2f denoiser edits; totals: %llu denoiser "
+                  "(%.1f skipped, %.2f following their animation against the schedule), %.2f top-level builds, %.2f DispatchRays, %.2f denoiser edits; totals: %llu denoiser "
                   "dispatches, edit failures at steps 1-6: %llu %llu %llu %llu %llu %llu",
                   g_rt_near.load(), g_rt_far.load(), g_rt_buckets[0].load(), g_rt_buckets[1].load(),
                   g_rt_buckets[2].load(), static_cast<unsigned long long>(hits),
@@ -4961,7 +5051,8 @@ void OnReshadePresent(effect_runtime* runtime) {
                   static_cast<unsigned long long>(g_rt_instance_fails.load()),
                   g_rt_raw.load() ? 1 : 0, g_rt_skip.load(), g_rt_refit_every.load(), g_rt_feedback.load(),
                   g_rt_constrain.load(),
-                  static_cast<unsigned long long>(frames), per[0], per[1], per[2], per[3], per[4], per[5],
+                  static_cast<unsigned long long>(frames), per[0], per[1], per[2],
+                  static_cast<double>(mismatches) / static_cast<double>(frames), per[3], per[4], per[5],
                   static_cast<unsigned long long>(g_rt_denoise.load()),
                   static_cast<unsigned long long>(g_rt_edit_fail[1].load()),
                   static_cast<unsigned long long>(g_rt_edit_fail[2].load()),
@@ -4990,12 +5081,20 @@ void OnReshadePresent(effect_runtime* runtime) {
       g_rt_ao_samples = static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 0, 16));
       g_rt_shadow_samples = static_cast<uint32_t>(std::clamp(std::atoi(arg2.c_str()), 0, 16));
     }
-    result = "rays per pixel: game's AO " + std::to_string(g_rt_game_ao_samples.load()) + ", shadows " +
-             std::to_string(g_rt_game_shadow_samples.load()) + "; override AO " +
-             std::to_string(g_rt_ao_samples.load()) + ", shadows " + std::to_string(g_rt_shadow_samples.load()) +
-             " (0 = game's); edits " + std::to_string(g_rt_sample_edits.load()) + ", records without the buffer " +
-             std::to_string(g_rt_sample_misses.load()) + ", records not readable " +
-             std::to_string(g_rt_sample_no_record.load());
+    result = RayGenFieldsText();
+  } else if (command == "rtalpha") {  // "rtalpha <ao> <shadow>": the alpha test per ray kind, on|off|game
+    const auto parse = [](const std::string& v) { return v == "on" ? 1 : v == "off" ? 0 : -1; };
+    if (!arg.empty()) {
+      g_rt_ao_alpha = parse(arg);
+      g_rt_shadow_alpha = parse(arg2.empty() ? std::string("game") : arg2);
+    }
+    result = RayGenFieldsText();
+  } else if (command == "rtaolen") {  // "rtaolen <meters>": the AO rays' length; 0 = the game's
+    if (!arg.empty()) g_rt_ao_length = (std::max)(0.0f, std::strtof(arg.c_str(), nullptr));
+    result = RayGenFieldsText();
+  } else if (command == "rtshadowfar") {  // "rtshadowfar <meters>": 1 opaque shadow ray beyond it; 0 = the game's
+    if (!arg.empty()) g_rt_shadow_far = (std::max)(0.0f, std::strtof(arg.c_str(), nullptr));
+    result = RayGenFieldsText();
   } else if (command == "rtrandom") {
     if (arg == "log") {
       std::lock_guard lock(g_rt_random_mutex);
