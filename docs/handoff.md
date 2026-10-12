@@ -29,11 +29,13 @@ the tonemapped image at the final composite.
 Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
-  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit 91d6b47, installed 2026-10-10 late evening with the
-  user's OK: 50% with preset M, DLSS jitter from the TAA filter's counter, the distortion/sparks/grace-flame fixes,
-  the distance-based ray tracing refits. No Ray Reconstruction. Its ini: `Preset=13`, `RenderScale=0.50`, game
-  sharpening off, game exposure on, chromatic aberration off, `WindMotion=1`, `WindMode=1`, `WindTrees=1`. Backups
-  in `build\everyday-backup\`: b2ac485 (58%, K), 7182d94 (67%, K), f0e8c12 (DLAA). Only update it with the user's
+  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit ff56979, installed 2026-10-11 late evening with the
+  user's OK: 50% with preset M, enemy and animal motion vectors (`NpcMotion=1`) and the trees' motion at 50% fixed,
+  on top of the jitter, distortion/sparks/grace-flame fixes and distance-based ray tracing refits. No Ray
+  Reconstruction (our ray generation library is added to the game's pipeline but unused with `RtShadowRayGen` unset).
+  Its ini: `Preset=13`, `RenderScale=0.50`, game sharpening off, game exposure on, chromatic aberration off,
+  `WindMotion=1`, `WindMode=1`, `WindTrees=1`, `NpcMotion=1`. Backups in `build\everyday-backup\`: 91d6b47 (the
+  previous everyday build, 50%, M), b2ac485 (58%, K), 7182d94 (67%, K), f0e8c12 (DLAA). Only update it with the user's
   explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
 - **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLLs including `nvngx_dlssd.dll`):
   test builds only. Latest build (2026-10-11, commit 56dbb23 and later): Ray Reconstruction (`RayReconstruction=1`,
