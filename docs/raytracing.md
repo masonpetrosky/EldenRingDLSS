@@ -348,3 +348,29 @@ fights: three captures 15 s apart while fighting). CSVs in `captures/gpuprofile/
   pixels; GPU busy 15.7 vs 12.3 ms.
 - Realistic savings: 1.5-2.5 ms in ordinary scenes (forest rays, builds in fights, the small items), more in forests.
   Reflections or GI would cost frame rate rather than replace existing work.
+
+### Foliage in our rays, and a flicker (2026-10-12, later; open)
+
+A second forest spot (`ab_capture.ps1 -Round rtfoliage`, 30-frame profiles; the game's values: AO rays 3 m, alpha
+test on for AO and shadows, shadows opaque with 1 ray beyond 110 m). Here our rays cost only 1.2 ms and the
+acceleration-structure builds 3.8 ms (413 structures beyond 50 m with the schedule off), so the 4.5 ms of the first
+forest spot depends on the view. Our rays, ms: the game's 1.23; AO without the alpha test 0.73; shadows without it
+1.14; both 0.65; AO rays 1.5 m 1.05, 0.75 m 0.91; opaque shadows beyond 55 m 1.18. The AO alpha test is most of the
+cost; the user saw no difference toggling it every 4 s. Both may have been measured under the flicker below: redo.
+
+- Leaf shadows popped a few times per second near the player. `rtdist 0` + `rtrefit 1` (no schedule) stopped it.
+  The animation dispatches decide with the interval their group had last frame, the refit with this frame's: they
+  disagreed for about 26 of 135 refits per frame there (a refit of vertices not animated that frame). 83545fe makes
+  the refit follow its animation dispatches; rtinfo counts the disagreements.
+- The build with that change flickered over the whole view: frames where everything near was in shadow (sunlit
+  bushes black) in runs of a few captures, the distant trees unchanged. Screenshot bursts (8 captures, center
+  brightness): 0.09-0.16 and 0.10-0.20 while flickering; steady with the game's ray generation (`rtgen 0`), and
+  steady with everything (schedule on or off) after switching `rtgen 0` and back to 3. So a state, not the schedule.
+- Likely cause: the l_rayGenCB edit introduced for `rtalpha`/`rtaolen`/`rtshadowfar` wrote six fields back from
+  values remembered per buffer address. The game writes these buffers every frame from a ring whose addresses the AO
+  and the shadow dispatches share over time; values remembered from the AO dispatch's buffer (e.g. a different
+  `l_shadowMaxDist`) in the shadow dispatch's buffer give 1 opaque shadow ray (dark under leaves). The ring's
+  alignment drifts, and `rtgen 0` changes the allocations per frame. The counts-only edit before it wrote back only
+  the ray counts, the same in both buffers. 83545fe writes only the overridden fields onto this frame's values and
+  lists the distinct value sets in `rtsamples` (more than one set with different shadow fields confirms it).
+  Untested in game.

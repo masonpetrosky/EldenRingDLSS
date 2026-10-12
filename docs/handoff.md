@@ -23,6 +23,7 @@ for picking up.
 | NVIDIA Reflex (injected at the present) | Everyday and dev installs: GPU queue 8 ms shorter, user feels it; ~3% fps |
 | Fast travel left the game at full size (grain under RR) | Fixed (6c124ae), everyday and dev installs (2026-10-12) |
 | GPU profile (5 places) | Done (2026-10-12): `docs/raytracing.md`, "GPU profile: where the frame goes" |
+| Foliage cost in our rays; leaf-shadow popping; a flicker | **Open**, dev install only (83545fe, untested in game): see Next steps 1 |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -48,8 +49,8 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
   b2ac485 (58%, K), 7182d94 (67%, K), f0e8c12 (DLAA). Only update it with the user's
   explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
 - **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLLs including `nvngx_dlssd.dll`):
-  test builds only. Latest build: 6c124ae (2026-10-12: the GPU profiler and the fast-travel fix on top of the
-  everyday build's features). Since 56dbb23: Ray Reconstruction (`RayReconstruction=1`,
+  test builds only. Latest build: 83545fe (2026-10-12, **untested in game**: the l_rayGenCB edit fix and refits
+  following their animation, on top of 6c124ae, the everyday build). Since 56dbb23: Ray Reconstruction (`RayReconstruction=1`,
   used only while the game's ray tracing runs) fed by our own sun shadow ray generation shader with render-size AO
   (`RtShadowRayGen=3`: blue noise, 1 AO and 1 shadow ray per pixel). Ini: `RenderScale=0.50`, `Preset=13` (M),
   `GameExposure=1`. F9 toggles DLSS and saves `Enabled` to the ini: check `Enabled=1` (and the "Loaded. DLSS on" log
@@ -142,6 +143,17 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
+0. **Resume here: test 83545fe in the dev install** (installed, game closed; `docs/raytracing.md`, "Foliage in our
+   rays, and a flicker"). At the second forest spot (the user's character beside leaves that popped):
+   a. After loading in, remote `rtsamples`: more than one distinct set (different shadow fields) confirms the cause.
+   b. Screenshot bursts a minute apart (`capture fl_<name><i>` x8; center brightness steady across the 8) and the
+      user's eye: no whole-view flicker, no popping leaf shadows. `rtinfo`: refits following their animation
+      against the schedule (about 26 per frame there).
+   c. If stable: `ab_capture.ps1 -Round rtfoliage` again, then the AO alpha A/B (`rtalpha off on` vs `rtalpha on on`,
+      4 s each; the user looks under the trees by brightness). If AO without the alpha test stays invisible, make it
+      the default while our AO feeds RR (was in the flickering build, taken out until re-checked).
+   d. Then the everyday install, with the user's OK: its 6c124ae writes back only the ray counts and seems free of
+      the flicker, but has the refit/animation disagreement (leaf shadows that pop near the player).
 1. **Fast-travel fix in everyday play** (6c124ae, in the everyday install since 2026-10-12): before it, after any
    loading screen the engine stayed at full size, DLSS and RR stopped, and the game's denoiser got our 1-ray AO and
    shadows (grain on the character, walls and ground). Tested in the dev install (two fast travels, back at 50% within
@@ -171,6 +183,6 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 ## Recent commits
 
 See `git log`. 2026-10-12: GPU profiler (fe36062, resolve fixed in 7f1dee1), fast-travel fix
-(6c124ae). 2026-10-11: release packaging and README (bf33a45, d20a54c, 28007e3, 3962d3e); our ray generation
+(6c124ae), foliage switches and the refit/flicker fixes (83545fe, untested). 2026-10-11: release packaging and README (bf33a45, d20a54c, 28007e3, 3962d3e); our ray generation
 shaders in the game's pipeline (6d7c0b1), render-size AO into RR and PCG noise (9c60c29), blue noise (23b8223),
 temporal blue noise option (9ffc216), 1 sun shadow ray (56dbb23), the NPC motion vector finding (7883869).
