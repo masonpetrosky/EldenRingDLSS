@@ -57,21 +57,39 @@ def category(key):
     return "full-screen passes"
 
 
+def busy_ms(intervals):
+    """Median per frame of the time any queue was busy (the union of its segments), in milliseconds."""
+    busy = []
+    for iv in intervals.values():
+        iv.sort()
+        total, start, end = 0.0, *iv[0]
+        for s, e in iv[1:]:
+            if s > end:
+                total += end - start
+                start, end = s, e
+            else:
+                end = max(end, e)
+        busy.append(total + end - start)
+    busy.sort()
+    return busy[len(busy) // 2] / 1000.0 if busy else 0.0
+
+
 def load(path):
-    frames = set()
+    frames = collections.defaultdict(list)
     per_key = collections.defaultdict(float)
     per_key_segments = collections.Counter()
     per_key_draws = collections.Counter()
     with open(path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            frames.add(row["frame"])
+            start = float(row["start_us"])
+            frames[row["frame"]].append((start, start + float(row["us"])))
             draws = int(row["draws"])
             key = pass_key(row["label"], draws)
             per_key[key] += float(row["us"])
             per_key_segments[key] += 1
             per_key_draws[key] += draws
     n = max(1, len(frames))
-    return n, {k: v / n / 1000.0 for k, v in per_key.items()}, per_key_segments, per_key_draws
+    return n, {k: v / n / 1000.0 for k, v in per_key.items()}, per_key_segments, per_key_draws, busy_ms(frames)
 
 
 def main():
@@ -84,8 +102,9 @@ def main():
         top = int(args[args.index("--top") + 1])
     if "--compare" in args:
         compare = args[args.index("--compare") + 1]
-    n, ms, segments, draws = load(args[0])
-    print("%s: %d frames, %.2f ms of segments per frame" % (args[0], n, sum(ms.values())))
+    n, ms, segments, draws, busy = load(args[0])
+    print("%s: %d frames, %.2f ms of segments per frame, GPU busy %.2f ms (median)" % (args[0], n, sum(ms.values()),
+                                                                                  busy))
     cats = collections.defaultdict(float)
     for k, v in ms.items():
         cats[category(k)] += v

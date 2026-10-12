@@ -294,9 +294,10 @@ struct UpscaleInputs {
 };
 UpscaleInputs g_upscale;                     // under g_dlss_mutex
 std::atomic<uint64_t> g_last_upscale{0};     // g_frame of the last upscaled frame (either path)
-// g_frame when the feature was created: it only takes the scaled size, so the engine switches before the first
-// upscaled frame.
-std::atomic<uint64_t> g_feature_created{0};
+// g_frame when DLSS last asked for the render scale without upscaling: when the feature was created, and when the
+// engine renders at full size with a feature for the scale (e.g. after a loading screen, where nothing upscaled and
+// the scale went back to 1). The feature only takes the scaled size, so the engine switches first.
+std::atomic<uint64_t> g_scale_requested{0};
 bool g_upscale_at_composite = false;         // development (remote "upscaleat"): the composite path above
 std::atomic<uint32_t> g_jitter_phases{0};   // development (remote "jitter <phases>"; 0 = from the scale)
 
@@ -1547,7 +1548,7 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
       g_config.enabled = false;
       Log(reshade::log::level::error, g_dlss.status() + "; DLSS disabled.");
     } else {
-      g_feature_created = g_frame.load();
+      g_scale_requested = g_frame.load();
       Log(reshade::log::level::info, "Created DLSS feature for render scale " +
                                          std::to_string(g_config.render_scale) + ", preset " +
                                          std::to_string(g_config.preset) + ": " + g_dlss.status());
@@ -1555,8 +1556,12 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
     g_reset = true;
     return false;  // DLSS takes over from the next frame
   }
-  // E.g. the frame after the feature was created, before the engine follows the render scale.
-  if (!g_dlss.accepts(in_width, in_height)) return false;
+  // E.g. the frame after the feature was created, before the engine follows the render scale, or the first frames
+  // after a loading screen.
+  if (!g_dlss.accepts(in_width, in_height)) {
+    if (in_width == width && in_height == height) g_scale_requested = g_frame.load();
+    return false;
+  }
   if (game_exposure) UploadExposure(cmd_list, scene.exposure);
   const bool masked = g_config.vegetation_mask > 0.0f &&
                       BuildMask(cmd_list, BoundResource(cmd_list, shader_stage::pixel, 5) /* g_StencilTex */, width,
@@ -1686,7 +1691,7 @@ void FinishUpscale(command_list* cmd_list, CmdData& data) {
       g_config.enabled = false;
       Log(reshade::log::level::error, g_dlss.status() + "; DLSS disabled.");
     } else {
-      g_feature_created = g_frame.load();
+      g_scale_requested = g_frame.load();
       Log(reshade::log::level::info, "Created DLSS feature for render scale " +
                                          std::to_string(g_config.render_scale) + ", preset " +
                                          std::to_string(g_config.preset) + ": " + g_dlss.status());
@@ -1694,7 +1699,10 @@ void FinishUpscale(command_list* cmd_list, CmdData& data) {
     g_reset = true;
     return;
   }
-  if (!g_dlss.accepts(in.width, in.height)) return;
+  if (!g_dlss.accepts(in.width, in.height)) {
+    if (in.width == width && in.height == height) g_scale_requested = g_frame.load();
+    return;
+  }
 
   erdlss::DlssInputs dl;
   dl.color = reinterpret_cast<ID3D12Resource*>(scene.handle);
@@ -4440,7 +4448,7 @@ void ApplyRenderScale() {
   float scale = 1.0f;
   const uint64_t frame = g_frame.load();
   if (g_config.enabled && g_config.render_scale < 1.0f &&
-      (frame <= g_last_upscale.load() + 4 || frame <= g_feature_created.load() + 30)) {
+      (frame <= g_last_upscale.load() + 4 || frame <= g_scale_requested.load() + 30)) {
     std::lock_guard lock(g_dlss_mutex);
     if (g_dlss.has_feature() && g_dlss.feature_hdr() != g_upscale_at_composite &&
         g_dlss.feature_scale() == g_config.render_scale)
