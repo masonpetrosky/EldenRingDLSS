@@ -19,7 +19,7 @@ for picking up.
 | 4. Release | v0.1.0 on GitHub (release zip) and Nexus Mods (2026-10-11) |
 | Motion vectors for enemies and animals | Everyday and dev installs (`NpcMotion=1`), +0.2-0.3 ms (2026-10-11) |
 | Tree motion vectors at 50% | Were lost from 2026-10-10 (resolve viewport); fixed, everyday install updated |
-| Object-only motion blur | Dev install (`ObjectBlur=1`, with the game's blur on), works, ~0.1 ms (2026-10-12) |
+| Object-only motion blur | Everyday and dev installs (`ObjectBlur=1`; idle while the game's blur is off), works (2026-10-12) |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -29,15 +29,17 @@ the tonemapped image at the final composite.
 Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
-  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit ff56979, installed 2026-10-11 late evening with the
+  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit bba1275, installed 2026-10-12 after midnight with the
   user's OK: 50% with preset M, enemy and animal motion vectors (`NpcMotion=1`) and the trees' motion at 50% fixed,
+  object-only motion blur (`ObjectBlur=1`; the user keeps the game's Motion Blur off, which makes it idle),
   on top of the jitter, distortion/sparks/grace-flame fixes and distance-based ray tracing refits. Ray
   Reconstruction on with our ray generation shaders (`RayReconstruction=1`, `RtShadowRayGen=3`, release
   `nvngx_dlssd.dll` 310.9.1), the dev install's setup, turned on the same night at the user's request: measured +1.9
   ms over DLSS M in its first version, about 1.6 ms of that recovered since (render-size AO, 1 sun shadow ray).
   Its ini: `Preset=13`, `RenderScale=0.50`, game sharpening off, game exposure on, chromatic aberration off,
-  `WindMotion=1`, `WindMode=1`, `WindTrees=1`, `NpcMotion=1`, `RayReconstruction=1`, `RtShadowRayGen=3`. Backups in
-  `build\everyday-backup\`: ff56979-noRR (this build's ini before RR), 91d6b47 (the previous everyday build, 50%, M),
+  `WindMotion=1`, `WindMode=1`, `WindTrees=1`, `NpcMotion=1`, `RayReconstruction=1`, `RtShadowRayGen=3`,
+  `ObjectBlur=1`. Backups in `build\everyday-backup\`: ff56979 (the previous everyday build, with RR), ff56979-noRR
+  (its ini before RR), 91d6b47 (the previous everyday build, 50%, M),
   b2ac485 (58%, K), 7182d94 (67%, K), f0e8c12 (DLAA). Only update it with the user's
   explicit OK and with the game closed (`tools/deploy.ps1 -Target main`).
 - **Dev** (`eldenring-dlss-dev`, `natives\EldenRingDLSS-dev`, developer DLSS DLLs including `nvngx_dlssd.dll`):
@@ -134,8 +136,8 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
-1. **Object-only motion blur into the everyday install**, if the user wants it (`ObjectBlur=1`; the game's Motion
-   Blur setting must be on). Details: docs/recon.md, "Object-only motion blur".
+1. Check in game that object-only blur stays idle with the game's Motion Blur off and starts within a frame when it is
+   turned on (bba1275 gates it on the blur pass; the blur itself was tested with ff56979+63c015a).
 2. RR's responsivity mask on vegetation (preset F only; negative values favor stability) for the grass at 50%.
 3. The outreach drafts above, one at a time with the user.
 4. NPC motion edge: an enemy part shared with the player's equipment gets no motion (excluded with the player's
