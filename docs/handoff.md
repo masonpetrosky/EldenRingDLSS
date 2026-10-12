@@ -141,7 +141,7 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 1. **GPU profile session** (goal: free 3-5 ms for ray-traced reflections and GI): dev profile, the user stands still
    at 3-4 places (open field with grass, forest, castle interior, a fight); at each, remote `gpuprofile 60 <place>`,
-   then `.toolsenv\Scripts\python.exe tools\gpu_profile.py <shots>\gpuprofile_<place>.csv`. The profiler (fe36062) is
+   then `.tools\venv\Scripts\python.exe tools\gpu_profile.py <shots>\gpuprofile_<place>.csv`. The profiler (fe36062) is
    untested in game. Look first for work ray tracing makes redundant (rasterized sun shadow maps, SSAO, SSR), the
    resolution-independent scene refits, and full-size post-processing (depth of field, bloom).
 2. **Reflex** (docs/recon.md, "NVIDIA Reflex, injected at the present"): the sleep works (8-9 ms per frame, the frame's
