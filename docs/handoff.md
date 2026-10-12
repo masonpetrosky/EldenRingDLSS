@@ -20,7 +20,7 @@ for picking up.
 | Motion vectors for enemies and animals | Everyday and dev installs (`NpcMotion=1`), +0.2-0.3 ms (2026-10-11) |
 | Tree motion vectors at 50% | Were lost from 2026-10-10 (resolve viewport); fixed, everyday install updated |
 | Object-only motion blur | Everyday and dev installs (`ObjectBlur=1`), in daily use with the game's blur on (2026-10-12) |
-| NVIDIA Reflex (injected at the present) | Dev build, off by default: no latency gained in the first test; diagnosing |
+| NVIDIA Reflex (injected at the present) | Dev install: sleeps 8-9 ms/frame, GPU queue 8 ms shorter, user feels it; ~3% fps |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -138,11 +138,10 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
-1. **Reflex diagnosis** (docs/recon.md, "NVIDIA Reflex, injected at the present"): in game, `reflexlat markers on`,
-   `reflexlat` with Reflex off and on: how long the sleep blocks, when the frame's first submission comes after its
-   start, the GPU start. If the game submits late and waits on the GPU itself, Reflex cannot help; if the sleep just
-   sits at the wrong spot, hook the game's frame start (Ghidra) and sleep there. NVAPI is linked into every build
-   (its MIT notice is in the package's licenses since this commit).
+1. **Reflex** (docs/recon.md, "NVIDIA Reflex, injected at the present"): the sleep works (8-9 ms per frame, the frame's
+   GPU work queued 8 ms less) and the user noticed an improvement. Open: whether the game reads input after the sleep
+   (hook its input call and timestamp it against the markers), the everyday install (user's OK, game closed), and a
+   hook at the game's own frame start if the input timing shows the sleep is too late.
 2. Object-only blur, open edges: idle with the game's Motion Blur off is untested by measurement (bba1275 gates it on
    the blur pass; with the blur on the user tested this build in the everyday install). Watch for a pixel of blur on
    silhouettes while strafing and on swaying grass and trees (docs/recon.md, "Object-only motion blur").

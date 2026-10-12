@@ -836,3 +836,21 @@ end of the CPU's work (then there is no queue to remove, and no Reflex would gai
 another thread before the presenting thread returns (then the sleep is at the wrong spot). The dev build now reports
 the sleep's actual duration and the driver's frame timeline (remote `reflexlat`, with `reflexlat markers on` for the
 timeline while Reflex is off), with the frame's first `ExecuteCommandLists` as its render-submit start.
+
+Diagnosis (same spot type, remote `reflexlat`, medians over the driver's last 64 frames; the frame's start is the
+marker after the sleep, its first submission the first `ExecuteCommandLists` after that):
+
+| | off | on |
+| --- | --- | --- |
+| sleep per frame | 0 ms | 8-9 ms (max ~10.7) |
+| frame start to first submission | 6.0 ms | 6.0 ms |
+| first submission to present | 12.8 ms | 4.3 ms |
+| OS render queue | 29.4 ms | 21.2 ms |
+| frame start to GPU end | 35.6 ms | 27.4 ms |
+| GPU frame time | 19.0 ms | 19.6 ms |
+
+Without Reflex the presenting thread already waits about 8.5 ms per frame between its first submission and the
+present; with it, that wait moves into the sleep before the frame starts, and the frame's GPU work sits about 8 ms less
+in the queue. PresentMon's CPU-start-to-GPU-start stays the same because it counts from the previous present, before
+the sleep. Whether input gets 8 ms fresher depends on where the game reads it (not measured: an input hook would tell).
+The user switched it live and noticed an improvement with it on. Cost about 3% frame rate.
