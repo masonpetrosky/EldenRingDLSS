@@ -47,6 +47,7 @@
 #include "stretch.hpp"
 #include "taa_jitter.hpp"
 #include "kVegetationMaskCs.h"
+#include "object_blur.hpp"
 #include "tree_dump.hpp"
 #include "wind.hpp"
 #include "wind_port.hpp"
@@ -71,6 +72,7 @@ enum class Pass : uint8_t {
   kLightDir,      // the sun light pass, which reads the complete G-buffer (Ray Reconstruction's guides)
   kAoReproj,      // the AO chain's temporal pass (half size)
   kAoUpscale,     // the AO chain's bilateral upscale to full size
+  kCameraMotion,  // MotionBlurWriteCMBVelocity: the camera's motion from depth, under the velocity draws
 };
 
 // cbSceneParam, bound at vertex shader register b8 by the scene shaders. Offsets are in floats.
@@ -181,6 +183,8 @@ struct Config {
   bool wind_prepass = false;
   // Motion vectors for enemies and animals (skin_motion.hpp), through the wind's stream-output path.
   bool npc_motion = false;
+  // Object-only motion blur (object_blur.hpp): the game's motion blur without the camera's motion.
+  bool object_blur = false;
   bool dred = false;  // development: D3D12 crash breadcrumbs (dred.hpp), read at startup
   bool flip_jitter_x = false;
   bool flip_jitter_y = false;
@@ -230,9 +234,13 @@ struct NpcCounts {
   std::atomic<uint64_t> seen{0}, velocity{0}, prepare{0}, inputs{0}, patch{0}, streamed{0}, replaced{0};
 };
 NpcCounts g_npc_counts;
-// Mesh parts (PartKey) that the game draws velocity for (the player's): left to the game.
+// Mesh parts (PartKey) that the game draws velocity for, with the frame it last did: the player's always; with the
+// game's motion blur on, also nearby creatures, which the game may stop drawing velocity for. Left to the game while it
+// does.
 std::shared_mutex g_velocity_mutex;
-std::unordered_set<uint32_t> g_velocity_parts;
+std::unordered_map<uint32_t, uint64_t> g_velocity_parts;
+erdlss::ObjectBlur g_object_blur;
+std::atomic<bool> g_object_blur_failed{false};
 std::atomic<uint64_t> g_wind_errors{0};
 std::atomic<uint64_t> g_wind_resolves{0};
 std::string g_wind_error;  // first error, under g_wind_mutex
@@ -558,6 +566,7 @@ void LoadConfig() {
   g_config.wind_prepass = ReadInt(L"WindPrepass", 0) != 0;
   g_config.wind_trees = ReadInt(L"WindTrees", 1) != 0;
   g_config.npc_motion = ReadInt(L"NpcMotion", 0) != 0;
+  g_config.object_blur = ReadInt(L"ObjectBlur", 0) != 0;
   g_npc_stage = std::clamp(ReadInt(L"NpcStage", 3), 1, 3);
   g_config.dred = ReadInt(L"Dred", 0) != 0;
   g_config.ray_reconstruction = ReadInt(L"RayReconstruction", 0) != 0;
@@ -586,6 +595,7 @@ void SaveConfig() {
   WriteInt(L"WindPrepass", g_config.wind_prepass);
   WriteInt(L"WindTrees", g_config.wind_trees);
   WriteInt(L"NpcMotion", g_config.npc_motion);
+  WriteInt(L"ObjectBlur", g_config.object_blur);
   WriteInt(L"RayReconstruction", g_config.ray_reconstruction);
   WriteInt(L"WindTreeCapacity", g_config.wind_tree_capacity);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
@@ -621,6 +631,7 @@ Pass Classify(uint32_t count, const pipeline_subobject* subobjects) {
   if (Contains(ps, "GXLightAcc_DDirLightShadowed")) return Pass::kLightDir;
   if (Contains(ps, "ScreenSpaceAO2_SeparatedReProj")) return Pass::kAoReproj;
   if (Contains(ps, "ScreenSpaceAO2_BilateralUpScale")) return Pass::kAoUpscale;
+  if (Contains(ps, "MotionBlurWriteCMBVelocity")) return Pass::kCameraMotion;
   if (Contains(vs, "_Velo")) return Pass::kScene;
   return Pass::kOther;
 }
@@ -1859,6 +1870,7 @@ void OnDestroyDevice(device* dev) {
     g_wind_port.Shutdown();
     g_skin.Shutdown();
   }
+  g_object_blur.Shutdown();
   g_tree_end = 0;
   g_tree_dump.Shutdown();
   g_dlss.Shutdown();
@@ -2639,13 +2651,24 @@ bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
 
 // The game draws velocity for these mesh parts itself (the player's), seen at its velocity pass.
 void NoteVelocityPart(uint32_t part) {
+  const uint64_t frame = g_frame.load();
   {
     std::shared_lock lock(g_velocity_mutex);
-    if (g_velocity_parts.count(part) != 0) return;
+    const auto it = g_velocity_parts.find(part);
+    if (it != g_velocity_parts.end() && it->second == frame) return;
   }
   std::unique_lock lock(g_velocity_mutex);
-  if (g_velocity_parts.size() > 4096) g_velocity_parts.clear();  // new equipment over a long session
-  g_velocity_parts.insert(part);
+  if (g_velocity_parts.size() > 4096)
+    std::erase_if(g_velocity_parts, [frame](const auto& entry) { return entry.second + 120 < frame; });
+  g_velocity_parts[part] = frame;
+}
+
+// True when the game drew velocity for `part` in one of the last frames (its velocity pass comes after the G-buffer,
+// so this frame's is not known yet).
+bool GameDrawsVelocity(uint32_t part) {
+  std::shared_lock lock(g_velocity_mutex);
+  const auto it = g_velocity_parts.find(part);
+  return it != g_velocity_parts.end() && it->second + 2 >= g_frame.load();
 }
 
 // An enemy's or animal's G-buffer draw: its previous pose from last frame's bones (skin_motion.hpp) and camera.
@@ -2658,12 +2681,9 @@ bool StreamSkinDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
     return false;
   }
   const uint32_t part = PartKey(data.index_va, first_index, index_count);
-  {
-    std::shared_lock lock(g_velocity_mutex);
-    if (g_velocity_parts.count(part) != 0) {
-      ++g_npc_counts.velocity;
-      return false;
-    }
+  if (GameDrawsVelocity(part)) {
+    ++g_npc_counts.velocity;
+    return false;
   }
   StreamDraw draw;
   if (!PrepareStreamDraw(cmd_list, data, "character", &draw)) {
@@ -3553,11 +3573,64 @@ bool StochasticAoUpscale(command_list* cmd_list, CmdData& data) {
   return true;
 }
 
+// Object-only motion blur: the camera pass's output, copied right after it draws (it draws here, then the copy).
+bool CameraMotionDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
+                      uint32_t first_instance) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  device* const dev = cmd_list->get_device();
+  if (state == nullptr || state->render_targets.empty()) return false;
+  const resource target = dev->get_resource_from_view(state->render_targets[0]);
+  if (target == 0 || dev->get_resource_desc(target).texture.format != format::r16g16_float) return false;
+  if (!g_object_blur.ready()) {
+    if (g_object_blur_failed.load()) return false;
+    if (!g_object_blur.Init(reinterpret_cast<ID3D12Device*>(dev->get_native()))) {
+      g_object_blur_failed = true;
+      Log(reshade::log::level::error, "Object motion blur unavailable: " + g_object_blur.status());
+      return false;
+    }
+    Log(reshade::log::level::info, "Object motion blur on.");
+  }
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  native->DrawInstanced(vertex_count, instance_count, first_vertex, first_instance);
+  g_object_blur.RecordCameraCopy(native, reinterpret_cast<ID3D12Resource*>(target.handle));
+  return true;
+}
+
+// Object-only motion blur: at the TAA, the blur's motion texture (the motion prep's source) without the camera.
+void ObjectBlurTransform(command_list* cmd_list, const CmdData& data) {
+  device* const dev = cmd_list->get_device();
+  const resource full = BoundResource(cmd_list, shader_stage::pixel, 3);  // g_MoveTex
+  const uint64_t blur_motion = g_motion_src.load();
+  if (!g_object_blur.ready() || full == 0 || blur_motion == 0 || blur_motion == full.handle) return;
+  const resource_usage usage = WatchedUsage(blur_motion);
+  if (usage == resource_usage::undefined) return;
+  SceneParams scene;
+  if (data.scene_valid) {
+    scene = data.scene;
+  } else {
+    std::lock_guard lock(g_scene_mutex);
+    scene = g_scene;
+  }
+  const resource_desc fd = dev->get_resource_desc(full);
+  uint32_t width = fd.texture.width, height = fd.texture.height;
+  if (scene.width >= 1.0f && scene.height >= 1.0f) {
+    width = std::min(width, static_cast<uint32_t>(scene.width));
+    height = std::min(height, static_cast<uint32_t>(scene.height));
+  }
+  if (g_object_blur.RecordTransform(reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native()),
+                                    reinterpret_cast<ID3D12Resource*>(full.handle),
+                                    reinterpret_cast<ID3D12Resource*>(blur_motion), ToD3D12(usage), width, height))
+    RestoreTaaState(cmd_list, data);
+}
+
 bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
             uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
+  if (data->pass == Pass::kCameraMotion && g_config.object_blur &&
+      CameraMotionDraw(cmd_list, vertex_count, instance_count, first_vertex, first_instance))
+    return true;
   if (data->pass == Pass::kLightDir && g_config.enabled && g_config.ray_reconstruction && g_dlss.rr_available() &&
       RayTracingActive())
     MakeRrGuides(cmd_list, *data);
@@ -3574,9 +3647,9 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     data->depth_copy = BoundResource(cmd_list, shader_stage::pixel, 2);  // g_DepthTex
     if (data->depth != 0) g_depth = data->depth.handle;
     if (data->depth_copy != 0) g_depth_copy = data->depth_copy.handle;
-    if (g_config.render_scale < 1.0f) {
-      // The scene's motion (g_MoveTex, R16G16_FLOAT), which the bloom reads after the TAA. The depth buffers' states
-      // are tracked from here on for the stretch.
+    if (g_config.render_scale < 1.0f || g_config.object_blur) {
+      // The scene's motion (g_MoveTex, R16G16_FLOAT), which the motion blur reads after the TAA. The depth buffers'
+      // states are tracked from here on for the stretch.
       for (uint32_t reg = 0; reg < 4; ++reg) {
         const resource r = BoundResource(cmd_list, shader_stage::pixel, reg);
         if (r != 0 && cmd_list->get_device()->get_resource_desc(r).texture.format == format::r16g16_float) {
@@ -3597,6 +3670,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     ObserveTaaResolution(cmd_list, screen);
     if ((g_config.wind_motion || g_config.npc_motion) && g_wind_ready.load()) ResolveWind(cmd_list, *data);
     if (g_config.wind_motion && g_port_ready.load()) MergeWind(cmd_list, *data);
+    if (g_config.object_blur) ObjectBlurTransform(cmd_list, *data);  // before the stretch in ReplaceTaa
     if (g_dump_remaining.load() > 0) DumpTaaInputs(cmd_list);
     return ReplaceTaa(cmd_list, *data, screen);
   }
@@ -4619,6 +4693,14 @@ void OnReshadePresent(effect_runtime* runtime) {
              (g_skin.ready() ? g_skin.Stats(g_frame.load()) : "not running: " + g_skin.status()) + "; " +
              std::to_string(g_wind.skin_pipeline_count()) + " character pipelines, " +
              std::to_string(g_wind.skin_draws()) + " streamed draws so far; " + NpcDrawStats();
+  } else if (command == "objblur") {  // "objblur" alone reports; "objblur on|off" switches (and saves)
+    if (!arg.empty()) {
+      g_config.object_blur = arg == "on";
+      SaveConfig();
+    }
+    result = std::string(g_config.object_blur ? "on" : "off") + ", " + g_object_blur.status() + ", " +
+             std::to_string(g_object_blur.copies()) + " camera copies, " + std::to_string(g_object_blur.transforms()) +
+             " transforms";
   } else if (command == "npcstage") {
     if (!arg.empty()) g_npc_stage = std::clamp(std::atoi(arg.c_str()), 1, 3);
     result = "stage " + std::to_string(g_npc_stage.load());
@@ -4885,6 +4967,9 @@ void OnOverlay(effect_runtime*) {
                         "animals. This gives them motion from last frame's pose. Uses about 64 MB of video memory "
                         "plus the tree path's stream buffers.");
   if (g_config.npc_motion && g_skin_failed.load()) ImGui::Text("  unavailable: %s", g_skin.status().c_str());
+  if (ImGui::Checkbox("Object-only motion blur (experimental)", &g_config.object_blur)) SaveConfig();
+  ImGui::SetItemTooltip("With the game's motion blur on (Low, Medium or High), blurs only what moves both on the screen "
+                        "and in the world: enemies, animals, swings. Turning the camera no longer blurs the scene.");
   if (g_config.wind_motion) {
     std::unique_lock lock(g_wind_mutex, std::try_to_lock);
     if (lock.owns_lock()) {
@@ -4995,7 +5080,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       // The barrier listener costs on every barrier the game records (loading screens record many), so it is only
       // registered when upscaling is set at startup (the stretch passes need the textures' states).
-      if (g_config.render_scale < 1.0f) reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
+      if (g_config.render_scale < 1.0f || g_config.object_blur)
+        reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
       reshade::register_overlay(nullptr, OnOverlay);

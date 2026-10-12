@@ -778,3 +778,37 @@ each other (one frame of wrong motion). Cloth is not a gap for enemies as far as
 draws read all vertex streams from the model's own buffer (bone-driven, e.g. 105277 and 106085: vb0-2 in 110289 and
 99931), so the bone matching covers them; only the player's cape uses per-frame cloth buffers (111712: vb0 76484,
 vb2 76485), and the game draws the player's velocity itself.
+
+## Object-only motion blur (2026-10-12, capture `er117_mblur_goat_f1921.rdc`)
+
+The user likes object motion blur but not camera motion blur. Capture with the game's motion blur on High, vanilla game
+at 4K (no add-on), a goat rolling in front of the player (`tools/rdc_flow.py` follows the textures):
+
+- `MotionBlurWriteCMBVelocity` (85720) writes the camera's motion from depth into the scene's motion texture (49228,
+  R16G16_FLOAT): screen uv minus the uv reprojected through `cbFilterParam.g_mCurToPrevScreen`, times
+  `g_vIntensity` (aspect, 1) and the linear `g_vSrcVelocityEncode` (1, 1). The velocity draws then add the player
+  and, with the blur on, nearby creatures: the goat's `C[...]_FurBlur_Velo_Skin` draws bind `cbPrevObjMatrix` with a
+  real previous pose (the game gives some characters velocity when its blur is on; the soldier and sheep further
+  away got none). The add-on's NPC exclusion now expires two frames after the game last drew a part's velocity.
+- `StencilAndMotionVectorPreprocess` (86578) copies it, per pixel the motion of the nearest-depth texel of a 2x2
+  neighborhood, into the TAA's input (56757). The add-on's NPC, tree and grass motion goes into that copy at the TAA,
+  and DLSS reads it.
+- The fur blur (86462-86551, `MotionBlur_*` on a 1920x1080 fur-direction texture from the `_FurDir` draws) smears
+  fur along its direction before the TAA; it is not motion blur.
+- The motion blur proper runs after the TAA, the transparent effects and depth of field: `MotionBlur_WriteVelocity
+  AndDepthPack_DownScale` (86919) reads the original motion texture 49228, then tile max, dilation in x and y, and
+  `MotionBlur_WriteMotionBlurPS[Reconstruction][Bidir]` (86991) blurs the full-size image (a per-pixel
+  reconstruction filter). So DLSS gets unblurred frames, and at render scales below 1 the add-on's existing stretch
+  of the motion source (`g_motion_src`) already gives the blur a full-size texture.
+
+Built (`ObjectBlur=1`, overlay checkbox, remote `objblur on|off`, `object_blur.*`): the camera pass draws through the
+add-on, which copies its output; at the TAA, after the NPC and vegetation motion is in the TAA's copy, a full-screen
+pass rewrites the blur's input over the render-size area with, per pixel, the full motion (the TAA's copy) or the full
+motion minus the camera's, whichever is shorter. Only what moves both on the screen and in the world blurs; the
+character the camera follows and a standing enemy during a pan stay sharp, as does the world when the camera turns.
+The game's own setting (Low, Medium, High) still switches and scales the blur. Cost 0.05-0.1 ms (16.10 vs
+16.14-16.19 ms, 4K at 50%). The user switched it live while turning the camera, swinging and rolling: "works as
+intended".
+
+Possible rough edges, not seen yet: the TAA's copy is depth-dilated, so silhouettes of static things can keep a pixel
+of parallax motion while strafing; swaying grass and trees carry their small wind motion into the blur.

@@ -19,7 +19,7 @@ for picking up.
 | 4. Release | v0.1.0 on GitHub (release zip) and Nexus Mods (2026-10-11) |
 | Motion vectors for enemies and animals | Everyday and dev installs (`NpcMotion=1`), +0.2-0.3 ms (2026-10-11) |
 | Tree motion vectors at 50% | Were lost from 2026-10-10 (resolve viewport); fixed, everyday install updated |
-| Object-only motion blur | **Wanted** by the user (next step 1) |
+| Object-only motion blur | Dev install (`ObjectBlur=1`, with the game's blur on), works, ~0.1 ms (2026-10-12) |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -134,13 +134,8 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
-1. **Object-only motion blur.** The user likes object motion blur but not camera motion blur; today the game's
-   object blur only covers the player (no NPC velocity), and turning motion blur on blurs camera motion too. Plan: a
-   capture with motion blur on to find the blur passes, then remove the camera part of the motion they read (the
-   camera motion is what `MotionBlurWriteCMBVelocityPS` writes from depth and the matrices) or give them an
-   object-only velocity. Check that our wind motion vectors (merged into the same motion texture) do not get grass
-   blurred. Our NPC and tree motion is written at the TAA (the stream resolve); check whether the game's blur passes
-   read the motion texture before that, in which case the resolve has to move earlier for the blur to see it.
+1. **Object-only motion blur into the everyday install**, if the user wants it (`ObjectBlur=1`; the game's Motion
+   Blur setting must be on). Details: docs/recon.md, "Object-only motion blur".
 2. RR's responsivity mask on vegetation (preset F only; negative values favor stability) for the grass at 50%.
 3. The outreach drafts above, one at a time with the user.
 4. NPC motion edge: an enemy part shared with the player's equipment gets no motion (excluded with the player's
