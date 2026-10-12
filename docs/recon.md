@@ -812,3 +812,27 @@ intended".
 
 Possible rough edges, not seen yet: the TAA's copy is depth-dilated, so silhouettes of static things can keep a pixel
 of parallax motion while strafing; swaying grass and trees carry their small wind motion into the blur.
+
+## NVIDIA Reflex, injected at the present (2026-10-12)
+
+`Reflex=1` (overlay checkbox, dev remote `reflex on|off`, `reflex.*`, NVAPI from `tools/fetch_nvapi.ps1`, MIT,
+statically linked): low-latency mode through `NvAPI_D3D_SetSleepMode`, `NvAPI_D3D_Sleep` right after each present
+(ReShade's `finish_present`), markers around the present and a simulation start after the sleep. The add-on cannot
+see where the game samples input or starts its frame, so this is the spot a mod can reach; built-in Reflex sleeps
+right before the game's input sampling.
+
+First test (dev, 4K at 50%, RR, ray tracing Maximum, GPU-bound at about 50 fps; G-Sync on, the control panel forces
+V-Sync on). The driver confirmed low-latency mode on and saw the sleep calls (`reflex`: "game sleep seen"), but
+PresentMon (10 s each, medians, twice):
+
+| | frame time | `MsGPULatency` (CPU start to GPU start) | `MsCPUBusy` |
+| --- | --- | --- | --- |
+| off | 19.76-19.83 ms | 17.22-17.24 ms | 19.49-19.55 ms |
+| on | 20.37-20.39 ms | 17.46-17.51 ms | 20.10-20.14 ms |
+
+No latency gained and about 3% fewer frames. A working sleep would have moved most of the 17 ms from GPU latency into
+CPU time. Either the game already waits on the GPU inside its own loop and submits most of a frame's work only at the
+end of the CPU's work (then there is no queue to remove, and no Reflex would gain much), or the next frame starts on
+another thread before the presenting thread returns (then the sleep is at the wrong spot). The dev build now reports
+the sleep's actual duration and the driver's frame timeline (remote `reflexlat`, with `reflexlat markers on` for the
+timeline while Reflex is off), with the frame's first `ExecuteCommandLists` as its render-submit start.

@@ -20,6 +20,7 @@ for picking up.
 | Motion vectors for enemies and animals | Everyday and dev installs (`NpcMotion=1`), +0.2-0.3 ms (2026-10-11) |
 | Tree motion vectors at 50% | Were lost from 2026-10-10 (resolve viewport); fixed, everyday install updated |
 | Object-only motion blur | Everyday and dev installs (`ObjectBlur=1`), in daily use with the game's blur on (2026-10-12) |
+| NVIDIA Reflex (injected at the present) | Dev build, off by default: no latency gained in the first test; diagnosing |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -137,15 +138,20 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
-1. Object-only blur, open edges: idle with the game's Motion Blur off is untested by measurement (bba1275 gates it on
+1. **Reflex diagnosis** (docs/recon.md, "NVIDIA Reflex, injected at the present"): in game, `reflexlat markers on`,
+   `reflexlat` with Reflex off and on: how long the sleep blocks, when the frame's first submission comes after its
+   start, the GPU start. If the game submits late and waits on the GPU itself, Reflex cannot help; if the sleep just
+   sits at the wrong spot, hook the game's frame start (Ghidra) and sleep there. NVAPI is linked into every build
+   (its MIT notice is in the package's licenses since this commit).
+2. Object-only blur, open edges: idle with the game's Motion Blur off is untested by measurement (bba1275 gates it on
    the blur pass; with the blur on the user tested this build in the everyday install). Watch for a pixel of blur on
    silhouettes while strafing and on swaying grass and trees (docs/recon.md, "Object-only motion blur").
-2. RR's responsivity mask on vegetation (preset F only; negative values favor stability) for the grass at 50%.
-3. The outreach drafts above, one at a time with the user.
-4. NPC motion edge: an enemy part shared with the player's equipment gets no motion (excluded with the player's
+3. RR's responsivity mask on vegetation (preset F only; negative values favor stability) for the grass at 50%.
+4. The outreach drafts above, one at a time with the user.
+5. NPC motion edge: an enemy part shared with the player's equipment gets no motion (excluded with the player's
    parts by mesh key). Check first whether it happens: `npc` reports draws left to the game per frame, which should
    equal the player's part count; fighting soldiers in the player's armor would show more.
-5. Older items: robustness (scale changes at runtime need a restart for the stretch; resolution changes; the first
+6. Older items: robustness (scale changes at runtime need a restart for the stretch; resolution changes; the first
    frame of a new command-list kind), performance of the stretch and full-size post-processing (about 1 ms), and
    removing dead experiments (`drs_probe.*`, `engine_resolution.*`, `hw_breakpoints.*`).
 

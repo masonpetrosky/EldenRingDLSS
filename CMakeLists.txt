@@ -13,6 +13,11 @@ set(DLSS_SDK_DIR ${CMAKE_SOURCE_DIR}/third_party/dlss)
 if(NOT EXISTS ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib)
   message(FATAL_ERROR "DLSS SDK not found in ${DLSS_SDK_DIR}. Run tools/fetch_dlss_sdk.ps1 first.")
 endif()
+# NVIDIA's NVAPI (MIT, Reflex low-latency sleep), downloaded by tools/fetch_nvapi.ps1.
+set(NVAPI_DIR ${CMAKE_SOURCE_DIR}/third_party/nvapi)
+if(NOT EXISTS ${NVAPI_DIR}/amd64/nvapi64.lib)
+  message(FATAL_ERROR "NVAPI not found in ${NVAPI_DIR}. Run tools/fetch_nvapi.ps1 first.")
+endif()
 
 # ReShade's state tracking helper (BSD-3-Clause OR MIT).
 add_library(reshade_utils STATIC third_party/reshade/state_tracking.cpp)
@@ -129,10 +134,11 @@ configure_file(src/version.rc.in ${CMAKE_BINARY_DIR}/version.rc @ONLY)
 
 add_library(EldenRingDLSS SHARED src/addon.cpp src/descriptors.cpp src/dlss.cpp src/wind.cpp src/wind_port.cpp
             src/tree_dump.cpp src/engine_resolution.cpp src/render_scale.cpp src/stretch.cpp src/taa_jitter.cpp src/rr_guides.cpp src/ao_upscale.cpp
-            src/hw_breakpoints.cpp src/drs_probe.cpp src/rt_pipeline.cpp src/skin_motion.cpp src/dred.cpp src/object_blur.cpp ${CMAKE_BINARY_DIR}/version.rc ${SHADER_HEADERS})
+            src/hw_breakpoints.cpp src/drs_probe.cpp src/rt_pipeline.cpp src/skin_motion.cpp src/dred.cpp src/object_blur.cpp src/reflex.cpp ${CMAKE_BINARY_DIR}/version.rc ${SHADER_HEADERS})
 target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui ${SHADER_DIR})
-target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
-target_link_libraries(EldenRingDLSS PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib d3d12)
+target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include ${NVAPI_DIR})
+target_link_libraries(EldenRingDLSS PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib
+                      ${NVAPI_DIR}/amd64/nvapi64.lib d3d12)
 set_target_properties(EldenRingDLSS PROPERTIES SUFFIX ".addon64")
 
 # Development tool: times DLSS outside the game (tools/dlss_bench/dlss_bench.cpp).

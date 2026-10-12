@@ -48,6 +48,7 @@
 #include "taa_jitter.hpp"
 #include "kVegetationMaskCs.h"
 #include "object_blur.hpp"
+#include "reflex.hpp"
 #include "tree_dump.hpp"
 #include "wind.hpp"
 #include "wind_port.hpp"
@@ -186,6 +187,7 @@ struct Config {
   bool npc_motion = false;
   // Object-only motion blur (object_blur.hpp): the game's motion blur without the camera's motion.
   bool object_blur = false;
+  bool reflex = false;  // NVIDIA Reflex low-latency mode, injected at the present (reflex.hpp)
   bool dred = false;  // development: D3D12 crash breadcrumbs (dred.hpp), read at startup
   bool flip_jitter_x = false;
   bool flip_jitter_y = false;
@@ -242,6 +244,7 @@ std::shared_mutex g_velocity_mutex;
 std::unordered_map<uint32_t, uint64_t> g_velocity_parts;
 erdlss::ObjectBlur g_object_blur;
 std::atomic<bool> g_object_blur_failed{false};
+erdlss::Reflex g_reflex;
 std::atomic<uint64_t> g_blur_frame{0};  // g_frame of the game's last motion blur (0: not seen)
 std::atomic<uint64_t> g_wind_errors{0};
 std::atomic<uint64_t> g_wind_resolves{0};
@@ -569,6 +572,7 @@ void LoadConfig() {
   g_config.wind_trees = ReadInt(L"WindTrees", 1) != 0;
   g_config.npc_motion = ReadInt(L"NpcMotion", 0) != 0;
   g_config.object_blur = ReadInt(L"ObjectBlur", 0) != 0;
+  g_config.reflex = ReadInt(L"Reflex", 0) != 0;
   g_npc_stage = std::clamp(ReadInt(L"NpcStage", 3), 1, 3);
   g_config.dred = ReadInt(L"Dred", 0) != 0;
   g_config.ray_reconstruction = ReadInt(L"RayReconstruction", 0) != 0;
@@ -598,6 +602,7 @@ void SaveConfig() {
   WriteInt(L"WindTrees", g_config.wind_trees);
   WriteInt(L"NpcMotion", g_config.npc_motion);
   WriteInt(L"ObjectBlur", g_config.object_blur);
+  WriteInt(L"Reflex", g_config.reflex);
   WriteInt(L"RayReconstruction", g_config.ray_reconstruction);
   WriteInt(L"WindTreeCapacity", g_config.wind_tree_capacity);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
@@ -1829,6 +1834,12 @@ void OnInitDevice(device* dev) {
     Log(reshade::log::level::info, "DLSS is available.");
   else
     Log(reshade::log::level::warning, "DLSS unavailable: " + g_dlss.status());
+  if (g_reflex.Init(reinterpret_cast<ID3D12Device*>(dev->get_native()))) {
+    if (g_config.reflex) g_reflex.SetEnabled(true);
+    Log(reshade::log::level::info, "Reflex available; low-latency mode " + g_reflex.status() + ".");
+  } else {
+    Log(reshade::log::level::warning, "Reflex unavailable: " + g_reflex.status());
+  }
   if (!erdlss::rt_pipeline::InstallHook(reinterpret_cast<ID3D12Device*>(dev->get_native())))
     Log(reshade::log::level::warning, "Could not hook CreateStateObject; the shadow ray generation shaders are off.");
 }
@@ -3180,6 +3191,7 @@ void LearnListKindsLocked();
 // Command lists in GPU order: every list submitted after the one holding the TAA, until the UI composite, is
 // post-processing.
 void OnExecuteCommandList(command_queue* queue, command_list* cmd_list) {
+  g_reflex.OnSubmit();
   auto* const data = cmd_list->get_private_data<CmdData>();
   // The previous poses its NPC draws read, written just before them on the same queue.
   if (data != nullptr && !data->skin_jobs.empty() && g_skin.ready() &&
@@ -4704,6 +4716,16 @@ void OnReshadePresent(effect_runtime* runtime) {
              (g_skin.ready() ? g_skin.Stats(g_frame.load()) : "not running: " + g_skin.status()) + "; " +
              std::to_string(g_wind.skin_pipeline_count()) + " character pipelines, " +
              std::to_string(g_wind.skin_draws()) + " streamed draws so far; " + NpcDrawStats();
+  } else if (command == "reflex") {  // "reflex" alone reports; "reflex on|off" switches (and saves)
+    if (!arg.empty()) {
+      g_config.reflex = arg == "on";
+      g_reflex.SetEnabled(g_config.reflex);
+      SaveConfig();
+    }
+    result = g_reflex.SleepStatus();
+  } else if (command == "reflexlat") {  // the frame timeline; "reflexlat markers on|off" also marks with Reflex off
+    if (arg == "markers") g_reflex.set_markers(arg2 == "on");
+    result = g_reflex.Timeline();
   } else if (command == "objblur") {  // "objblur" alone reports; "objblur on|off" switches (and saves)
     if (!arg.empty()) {
       g_config.object_blur = arg == "on";
@@ -4979,6 +5001,13 @@ void OnOverlay(effect_runtime*) {
                         "plus the tree path's stream buffers.");
   if (g_config.npc_motion && g_skin_failed.load()) ImGui::Text("  unavailable: %s", g_skin.status().c_str());
   if (ImGui::Checkbox("Object-only motion blur (experimental)", &g_config.object_blur)) SaveConfig();
+  if (ImGui::Checkbox("NVIDIA Reflex low latency (experimental)", &g_config.reflex)) {
+    g_reflex.SetEnabled(g_config.reflex);
+    SaveConfig();
+  }
+  ImGui::SetItemTooltip("Keeps the CPU from queuing frames ahead of the GPU, which lowers input latency when the GPU "
+                        "is the bottleneck. Added by the add-on at the present, not by the game. %s",
+                        g_reflex.status().c_str());
   ImGui::SetItemTooltip("With the game's motion blur on (Low, Medium or High), blurs only what moves both on the screen "
                         "and in the world: enemies, animals, swings. Turning the camera no longer blurs the scene.");
   if (g_config.wind_motion) {
@@ -5094,6 +5123,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       if (g_config.render_scale < 1.0f || g_config.object_blur)
         reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+      // After every other present callback, right before the swap chain presents, and right after it.
+      reshade::register_event<reshade::addon_event::present>(
+          [](command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*) { g_reflex.BeforePresent(); });
+      reshade::register_event<reshade::addon_event::finish_present>(
+          [](command_queue*, swapchain*) { g_reflex.AfterPresent(); });
       reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
       reshade::register_overlay(nullptr, OnOverlay);
       break;
