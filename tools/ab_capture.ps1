@@ -33,7 +33,7 @@ param(
                'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe', 'upscale',
                'showcase', 'showcasert', 'rtfoliage')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
-  [string]$PresentMon = "$env:USERPROFILE\Documents\AC2HighFPS\.presentmon\2.5.1\PresentMon-2.5.1-x64.exe"
+  [string]$PresentMon = "$env:USERPROFILE\Documents\Tools\PresentMon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
 $ErrorActionPreference = 'Stop'
 

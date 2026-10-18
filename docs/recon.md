@@ -494,7 +494,7 @@ The renderer is dynamic-resolution aware on PC (RenderDoc, forest capture):
 Tools:
 - Hardware breakpoints through the debug registers (`src/hw_breakpoints.*`, remotes `hwfill`, `hwexec`, `hwwatch`)
   work, but the game crashes silently about 30 s after they are armed (anti-tamper). Not usable.
-- Ghidra 12.1.4 headless (portable in `.tools`, project in `Documents\GhidraProjects`, 70 min first analysis) with
+- Ghidra 12.1.4 headless (portable, with its JDK and project in `Documents\Tools\Ghidra`, 70 min first analysis) with
   `tools/ghidra/ErQuery.java` and `query.ps1`: decompile, decompileat, xrefs, calls, writes, symbols, near, ptrs,
   bytepair. RTTI names survive (`GXBS::GXAntiAliasingFilter`, `GXBS::GXToneMapFilter`, `GXSR::GXRenderingPipeline`,
   `CS::CSGxLoadBalancerHelperImp`, ...). The property registration for `Performance.IsEnableDynamicResolution`

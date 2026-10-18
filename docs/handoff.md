@@ -138,7 +138,7 @@ pwsh -NoProfile -File tools/package.ps1               # release zip in dist\ (ve
 - `tools/mem.py` reads, searches and writes the running game's memory from outside; works under RenderDoc too.
 - Analysis scripts in `tools/` (Python venv at `.tools\venv`): `mv_check.py` (motion dumps), `shots.py`,
   `wind_check.py`, `tree_check.py`, `prepass_check.py`, `blue_noise.py` (regenerates `src/blue_noise.hlsli`).
-- RenderDoc 1.46 is in `.tools\renderdoc`, launched through the `eldenring-recon` me3 profile (user presses F12;
+- RenderDoc 1.46 is in the shared `Documents\Tools\RenderDoc`, launched through the `eldenring-recon` me3 profile (user presses F12;
   captures land in `%LOCALAPPDATA%\Temp\RenderDoc`, moved to `captures/`). Newest: `er117_npcs_f978.rdc` (a soldier
   and sheep moving, motion blur off; analysis in `captures/npcs/`), `er117_rtmax_*` (ray tracing; its DXIL libraries
   dumped to `captures/rtlibs/` by `tools/rdc_rtlibs.py`). Scripts: `qrenderdoc.exe --python tools/rdc_*.py` with
