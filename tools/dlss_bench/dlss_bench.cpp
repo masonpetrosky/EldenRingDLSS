@@ -185,6 +185,8 @@ int main(int argc, char** argv) {
       {"Performance", NVSDK_NGX_PerfQuality_Value_MaxPerf, 13, p_w, p_h, p_w, p_h},
       {"Performance", NVSDK_NGX_PerfQuality_Value_MaxPerf, 12, p_w, p_h, p_w, p_h},
       {"Quality", NVSDK_NGX_PerfQuality_Value_MaxQuality, 5, q_w, q_h, q_w, q_h},
+      {"DLAA", NVSDK_NGX_PerfQuality_Value_DLAA, 12, out_w, out_h, out_w, out_h},
+      {"Quality", NVSDK_NGX_PerfQuality_Value_MaxQuality, 12, q_w, q_h, q_w, q_h},
       {"Performance", NVSDK_NGX_PerfQuality_Value_MaxPerf, 5, p_w, p_h, p_w, p_h},
   };
   const char* preset_names[] = {"", "", "", "", "", "E", "", "", "", "", "J", "K", "L", "M"};

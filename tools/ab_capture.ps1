@@ -1,8 +1,9 @@
 # Captures the same spot with several anti-aliasing settings through the add-on's remote control.
 # Stand still in game first. Writes shots to <add-on folder>\shots and restores DLAA without sharpening.
 # -Round sharpen: DLAA with sharpening 0/0.10/0.25, preset J, game TAA.
-# -Round presets: DLAA presets K/M/L, sharpening 0.15, game TAA, each with a 5 s PresentMon frame-time log
-# (shots\<name>.csv).
+# -Round presets: super resolution presets K, M, L and E at the current render scale (Ray Reconstruction off, it has
+# its own model), each with a screenshot, a 5 s frame-time log and a 30-frame GPU profile (tools\gpu_profile.py
+# shots\gpuprofile_pr_*.csv); then back to the ini's preset.
 # -Round ca: the game's chromatic aberration on and off (measure with tools\ca_measure.py), then back to the
 # ini setting.
 # -Round mv: two dumps of the TAA's motion vectors and color (8 frames each, 1 s apart) for tools\mv_check.py.
@@ -227,6 +228,16 @@ if ($Round -eq 'sharpen') {
   Send 'scale 1' 5.0; Send 'scale'; Send 'capture dlaa'; LogFrames 'dlaa'
   Send 'dlss off' 2.0; Send 'capture taa'; LogFrames 'taa'
   Send 'dlss on'; Send 'scale 0.67' 5.0; Send 'scale'; Send 'postinfo'
+} elseif ($Round -eq 'presets') {
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = ($ini | Where-Object { $_ -match '^Preset=' }) -replace '^Preset=', ''
+  if (-not $restore) { $restore = '0' }
+  Send 'dlss on'; Send 'rr'
+  foreach ($p in ([ordered]@{ K = 11; M = 13; L = 12; E = 5 }).GetEnumerator()) {
+    Send "preset $($p.Value)" 4.0
+    Send "capture pr_$($p.Key)"; LogFrames "pr_$($p.Key)"; Send "gpuprofile 30 pr_$($p.Key)"
+  }
+  Send "preset $restore"
 } elseif ($Round -eq 'showcase') {
   Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'; Send 'capture show_dlss50'; LogFrames 'show_dlss50'
   Send 'scale 0.67' 5.0; Send 'scale'; Send 'capture show_dlss67'; LogFrames 'show_dlss67'
