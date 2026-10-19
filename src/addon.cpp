@@ -5341,7 +5341,7 @@ void OnOverlay(effect_runtime*) {
   if (ImGui::Checkbox("Chromatic aberration (game default)", &g_config.chromatic_aberration)) SaveConfig();
   ImGui::SetItemTooltip("The game's lens effect: red and blue shift up to a pixel apart toward the left and right "
                         "edges, which softens the image there. Works with DLSS on or off.");
-  if (ImGui::Checkbox("Wind motion vectors (experimental)", &g_config.wind_motion)) SaveConfig();
+  if (ImGui::Checkbox("Wind motion vectors", &g_config.wind_motion)) SaveConfig();
   ImGui::SetItemTooltip("Gives grass and bushes swaying in the wind motion vectors, so DLSS (or the game's TAA) can "
                         "follow them instead of smearing. Costs GPU time (about 1 ms at 4K in a grass field).");
   if (g_config.wind_motion && g_config.wind_mode == 1) {
@@ -5352,16 +5352,18 @@ void OnOverlay(effect_runtime*) {
                           g_config.wind_tree_capacity * 32 + 13);
     ImGui::Unindent();
   }
-  if (ImGui::Checkbox("Enemy and animal motion vectors (experimental)", &g_config.npc_motion)) SaveConfig();
-  ImGui::SetItemTooltip("The game only gives the player's character motion vectors, so DLSS smears moving enemies and "
-                        "animals. This gives them motion from last frame's pose. Uses about 64 MB of video memory "
-                        "plus the tree path's stream buffers.");
+  if (ImGui::Checkbox("Enemy, NPC and animal motion vectors", &g_config.npc_motion)) SaveConfig();
+  ImGui::SetItemTooltip("The game only gives the player's character motion vectors, so DLSS smears moving enemies, "
+                        "NPCs and animals. This gives them motion from last frame's pose (about 0.2-0.3 ms). Uses "
+                        "about 64 MB of video memory plus the tree path's stream buffers.");
   if (g_config.npc_motion && g_skin_failed.load()) ImGui::Text("  unavailable: %s", g_skin.status().c_str());
   bool object_blur = g_config.object_blur;
-  if (ImGui::Checkbox("Object-only motion blur (experimental)", &object_blur)) {
+  if (ImGui::Checkbox("Object-only motion blur", &object_blur)) {
     SetObjectBlur(object_blur);
     SaveConfig();
   }
+  ImGui::SetItemTooltip("With the game's motion blur on (Low, Medium or High), blurs only what moves both on the screen "
+                        "and in the world: enemies, animals, swings. Turning the camera no longer blurs the scene.");
   if (ImGui::Checkbox("NVIDIA Reflex low latency (experimental)", &g_config.reflex)) {
     g_reflex.SetEnabled(g_config.reflex);
     SaveConfig();
@@ -5369,8 +5371,6 @@ void OnOverlay(effect_runtime*) {
   ImGui::SetItemTooltip("Keeps the CPU from queuing frames ahead of the GPU, which lowers input latency when the GPU "
                         "is the bottleneck. Added by the add-on at the present, not by the game. %s",
                         g_reflex.status().c_str());
-  ImGui::SetItemTooltip("With the game's motion blur on (Low, Medium or High), blurs only what moves both on the screen "
-                        "and in the world: enemies, animals, swings. Turning the camera no longer blurs the scene.");
   if (g_config.wind_motion) {
     std::unique_lock lock(g_wind_mutex, std::try_to_lock);
     if (lock.owns_lock()) {
