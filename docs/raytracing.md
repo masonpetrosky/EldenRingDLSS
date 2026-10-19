@@ -308,7 +308,9 @@ shaders share local root signature 6723 (`l_rayGenCB` b16, normal t67, depth t68
   `tools/blue_noise.py`; DXIL keeps it a global constant, no per-thread copy). Per frame and stream the tiles get a
   random toroidal shift and a random value rotation (Cranley-Patterson) from `frameRandom`, so every frame is
   spatially blue and frames differ. Same cost as PCG (12.68 ms both). User, switching live: "not a big difference
-  but I think blue is a little less noisy". Dev install default: `RtShadowRayGen=3`.
+  but I think blue is a little less noisy". Dev install default: `RtShadowRayGen=3`; the add-on's default since
+  0.2.0, when modes 2-4 also stopped routing the shadow dispatch through the port without RR (the game's own shaders
+  run then).
 - Temporal blue noise (`rtgen 4`, `ErdlssShadowAoTemporalRayGen`): the add-on writes the frame number into
   `g_sceneCB`'s padding after `frameRandom` (`padd4`, byte 244) at the shadow dispatch; each pixel steps its
   blue-noise value along the R2 sequence (fixed point, exact for any frame). Same cost; the user saw no difference

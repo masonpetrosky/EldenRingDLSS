@@ -159,11 +159,16 @@ pwsh -NoProfile -File tools/package.ps1               # release zip in dist\ (ve
   apart while the light changed; a fairer pair would be back-to-back, possibly with `GameSharpening=1`.
 - **0.2.0, prepared 2026-10-19, not released.** The Nexus page had 323 unique downloads and six unanswered comments,
   two of them about no frame-rate gain: 0.1.0 stops upscaling after the first loading screen (fixed in 6c124ae).
-  Built from a3c6f83 (`CHANGELOG.md`), zip in `dist\` with NpcMotion=1 in its ini, regression and GPU checks passed.
+  Zip in `dist\` (`CHANGELOG.md`) with NpcMotion=1 in its ini, regression and GPU checks passed. Rebuilt the same day
+  after the user asked for Ray Reconstruction to be featured: an overlay checkbox with a state line, `RtShadowRayGen`
+  3 by default (modes 2-4 now replace the game's rays only while RR runs; otherwise the game's shaders run, not our
+  port), and `ab_capture.ps1 -Round rrshow` for the page's RR images (SR, RR with our rays, RR with the game's rays,
+  TAA; each with frame times and the DLSS ones with a GPU profile).
   The remote control works in release builds too, so `dist\test-0.2.0` (the zip plus ReShade64.asi, RenderScale=0.50,
   `EldenRingDLSS-fps.me3` with UnlockTheFps) can run `ab_capture.ps1 -Folder <its EldenRingDLSS folder>` rounds.
   Waiting for one in-game pass by the user (log, showcase screenshots and frame rates, fast travel, NPCs, leaf
-  shadows under trees for 83545fe, preset E), then the release, the Nexus file, page and replies (drafts in
+  shadows under trees for 83545fe, presets K/M/L/E, Ray Reconstruction from the new checkbox), then the release, the
+  Nexus file, page and replies (drafts in
   `dist\nexus\page-0.2.0.bbcode` and `replies-2026-10-19.json`, local only).
 
 ## Ray tracing with our own ray generation shaders (dev)

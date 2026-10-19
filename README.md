@@ -3,7 +3,8 @@
 A [ReShade](https://reshade.me) 6.8 add-on that replaces ELDEN RING's temporal anti-aliasing with NVIDIA DLSS on
 Direct3D 12: DLAA at native resolution, or upscaling from a lower render resolution through the engine's own
 (console) dynamic resolution, plus several fixes the game needs before DLSS looks right. It also makes the game's
-ray tracing cheaper and has an experimental DLSS Ray Reconstruction path.
+ray tracing cheaper, and replaces its ray tracing denoisers with DLSS Ray Reconstruction, fed by the add-on's own
+rays.
 
 This is a personal research project, developed and tested on one machine (RTX 5070 Ti, 4K HDR, ELDEN RING App Ver.
 1.17.1 (`eldenring.exe` file version 2.7.1.0), ReShade 6.8, [me3](https://github.com/garyttierney/me3) 0.13). It is
@@ -55,13 +56,36 @@ measurements.
 - **Cheaper ray tracing**: the game re-animates and refits ~200 bottom-level acceleration structures every frame;
   the add-on refits vegetation by distance (near every frame, far every 2nd/4th frame) and characters every frame,
   which halved the ray tracing cost on Maximum in testing.
-- **DLSS Ray Reconstruction (experimental)**: guide buffers (world normals, roughness, diffuse and specular albedo)
-  drawn from the game's G-buffer, the ray traced shadows passed raw into RR, used only while ray tracing is on. With
-  `RtShadowRayGen=3` the add-on's own ray generation shader, added to the game's pipeline, traces ambient occlusion at
-  the render size and one sun shadow ray per pixel with blue noise, cheaper and cleaner than the game's rays under RR
-  (see `docs/raytracing.md`).
+- **DLSS Ray Reconstruction** (overlay checkbox, `RayReconstruction=1`) while the game's ray tracing is on: it
+  replaces the game's denoisers, which blur the sun shadows of grass and leaves and ghost under trees. The add-on
+  draws RR's guide buffers (world normals, roughness, diffuse and specular albedo) from the game's G-buffer and
+  passes the ray traced signals in raw. See [Ray tracing](#ray-tracing).
+- **Its own rays under Ray Reconstruction** (`RtShadowRayGen=3`, the default): a ray generation shader added to the
+  game's ray tracing pipeline traces ambient occlusion and the sun shadows with one ray each per pixel at the render
+  size, with blue noise. The game traces AO at a quarter of the pixels, and its random numbers form a wave pattern
+  that its denoisers hid and RR showed in distant grass.
 - Removes the game's chromatic aberration (optional), texture LOD bias for the upscale, fixes for the heat
   distortion, sparks and grace flames at reduced render sizes.
+
+## Ray tracing
+
+ELDEN RING ray traces sun shadows and ambient occlusion (Ray Tracing Quality in the graphics settings). The add-on
+changes three things:
+
+- **Cheaper acceleration structures**: the game re-animates and refits about 200 bottom-level structures every
+  frame. The add-on refits distant vegetation every 2nd or 4th frame, which took 3.3 ms off a 23.9 ms frame on
+  Maximum (the first two rows of the table above).
+- **DLSS Ray Reconstruction** replaces the game's shadow and AO denoisers (a temporal filter with about 10 frames of
+  history, then two à-trous blurs at half size). It keeps the shadows of grass blades and leaves sharp and ghosts
+  less under trees. Tick "Ray Reconstruction" in the overlay; it runs while the game's ray tracing is on.
+- **The add-on's own rays** under Ray Reconstruction: one AO ray and one sun shadow ray per pixel at the render size
+  with blue noise. On Maximum the game traces 4 AO rays per pixel at half size and 2 shadow rays per pixel; the same
+  number of AO rays spread over every pixel gives per-pixel contact shadows, and one shadow ray saved 1.4 ms with no
+  visible difference.
+
+Ray Reconstruction itself takes about 4.0 ms at a 50% render scale, 6.3 ms at 67% and 12.4 ms at 100% (DLAA) at 4K
+on an RTX 5070 Ti, partly paid back by the denoisers and rays it replaces, so pair it with upscaling.
+[`docs/raytracing.md`](docs/raytracing.md) has the details and measurements.
 
 ## Requirements
 
@@ -131,8 +155,8 @@ documents each key.
 | `NpcMotion` | 0 | Motion vectors for enemies, NPCs and animals. |
 | `ObjectBlur` | 0 | With the game's Motion Blur on, blur only moving objects, not camera turns. |
 | `Reflex` | 0 | NVIDIA Reflex low-latency mode (experimental). |
-| `RayReconstruction` | 0 | DLSS Ray Reconstruction while the game's ray tracing is on. |
-| `RtShadowRayGen` | 0 | 3 = the add-on's own AO and sun shadow rays (blue noise) under Ray Reconstruction. |
+| `RayReconstruction` | 0 | DLSS Ray Reconstruction while the game's ray tracing is on (overlay checkbox). |
+| `RtShadowRayGen` | 3 | Under Ray Reconstruction: 3 = the add-on's own AO and sun shadow rays (blue noise), 0 = the game's rays (1, 2 and 4 are development options). |
 | `ToggleKey` | 120 | Virtual key code for the DLSS toggle (120 = F9; ignored while Alt, Ctrl or Shift is held). |
 
 `VegetationMask`, `WindPrepass`, `WindCapacity`, `FlipJitterX/Y`, `FlipMotion` and `UseDepthCopy` are development
@@ -180,8 +204,8 @@ hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale
 - Tested on one GPU, at 4K and in HDR. Some corrections depend on exact sizes (render sizes are rounded by the engine
   to 4 or 8 pixels).
 - Ray Reconstruction at 50-67% shows more shimmer in grass than at DLAA. It comes from the upscale (it stays with the
-  game's own rays and with RR off); the add-on's own rays (`RtShadowRayGen=3`) remove the wave pattern the game's
-  noise made in distant grass under RR.
+  game's own rays and with RR off); the add-on's own rays (`RtShadowRayGen=3`, the default) remove the wave pattern
+  the game's noise made in distant grass under RR.
 - Every normal exit of the game ends in a harmless WER crash report (an allocator check at shutdown); it predates
   this add-on.
 

@@ -3,7 +3,7 @@
 # -Round sharpen: DLAA with sharpening 0/0.10/0.25, preset J, game TAA.
 # -Round presets: super resolution presets K, M, L and E at the current render scale (Ray Reconstruction off, it has
 # its own model), each with a screenshot, a 5 s frame-time log and a 30-frame GPU profile (tools\gpu_profile.py
-# shots\gpuprofile_pr_*.csv); then back to the ini's preset.
+# shots\gpuprofile_pr_*.csv); then back to the ini's preset and Ray Reconstruction setting.
 # -Round ca: the game's chromatic aberration on and off (measure with tools\ca_measure.py), then back to the
 # ini setting.
 # -Round mv: two dumps of the TAA's motion vectors and color (8 frames each, 1 s apart) for tools\mv_check.py.
@@ -27,12 +27,16 @@
 # step and with wind off, frame times with everything on, without the merge, and with wind off.
 # -Round showcase: README comparison: DLSS at render scale 0.50 and 0.67, DLAA and the game TAA, each a screenshot and
 # a 5 s frame-time log. Start the game with RenderScale=0.50 (upscaling needs a scale below 1 at startup); ends at 0.50.
+# -Round rrshow: Ray Reconstruction for the README and the Nexus page, at render scale 0.50: DLSS super resolution with
+# the game's denoisers, Ray Reconstruction with the add-on's rays and with the game's rays, and the game's TAA at full
+# size; each a screenshot and a 5 s frame-time log, the DLSS ones also a 30-frame GPU profile. Then back to the ini's
+# RayReconstruction and RtShadowRayGen; ends at 0.50.
 # -Round rtfoliage: GPU profiles and screenshots of our rays with and without the foliage alpha test, shorter AO rays
 # and nearer opaque shadows (see the round); restores the defaults.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
                'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe', 'upscale',
-               'showcase', 'showcasert', 'rtfoliage')][string]$Round = 'sharpen',
+               'showcase', 'showcasert', 'rrshow', 'rtfoliage')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\Tools\PresentMon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -232,12 +236,13 @@ if ($Round -eq 'sharpen') {
   $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
   $restore = ($ini | Where-Object { $_ -match '^Preset=' }) -replace '^Preset=', ''
   if (-not $restore) { $restore = '0' }
-  Send 'dlss on'; Send 'rr'
+  $rr = if ($ini -match '^RayReconstruction=1') { 'on' } else { 'off' }
+  Send 'dlss on'; Send 'rr off'
   foreach ($p in ([ordered]@{ K = 11; M = 13; L = 12; E = 5 }).GetEnumerator()) {
     Send "preset $($p.Value)" 4.0
     Send "capture pr_$($p.Key)"; LogFrames "pr_$($p.Key)"; Send "gpuprofile 30 pr_$($p.Key)"
   }
-  Send "preset $restore"
+  Send "preset $restore"; Send "rr $rr"
 } elseif ($Round -eq 'showcase') {
   Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'; Send 'capture show_dlss50'; LogFrames 'show_dlss50'
   Send 'scale 0.67' 5.0; Send 'scale'; Send 'capture show_dlss67'; LogFrames 'show_dlss67'
@@ -251,6 +256,19 @@ if ($Round -eq 'sharpen') {
   Send 'capture showrt_vanilla'; LogFrames 'showrt_vanilla'
   Send 'rtdist 20 50'; Send 'rtrefit 2' 3.0; LogFrames 'showrt_taa'
   Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'; LogFrames 'showrt_dlss50'
+} elseif ($Round -eq 'rrshow') {
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $rr = if ($ini -match '^RayReconstruction=1') { 'on' } else { 'off' }
+  $rtgen = ($ini | Where-Object { $_ -match '^RtShadowRayGen=' }) -replace '^RtShadowRayGen=', ''
+  if (-not $rtgen) { $rtgen = '3' }
+  Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'; Send 'rtgen 3'; Send 'rr off' 4.0; Send 'rr'
+  Send 'capture rr_sr'; LogFrames 'rr_sr'; Send 'gpuprofile 30 rr_sr'
+  Send 'rr on' 6.0; Send 'rr'; Send 'rtgen'
+  Send 'capture rr_rr'; LogFrames 'rr_rr'; Send 'gpuprofile 30 rr_rr'
+  Send 'rtgen 0' 4.0; Send 'capture rr_gamerays'; LogFrames 'rr_gamerays'; Send 'gpuprofile 30 rr_gamerays'
+  Send "rtgen $rtgen"; Send "rr $rr"
+  Send 'scale 1' 5.0; Send 'dlss off' 2.0; Send 'capture rr_taa'; LogFrames 'rr_taa'
+  Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'
 } elseif ($Round -eq 'rtfoliage') {
   # The cost of alpha-tested foliage in our rays: a 30-frame GPU profile and a screenshot per setting (the game's;
   # AO, shadow or both rays without the alpha test; AO rays at 1/2 and 1/4 of the game's length; shadows opaque

@@ -21,10 +21,14 @@ New:
 - Object-only motion blur (`ObjectBlur`, off): with the game's Motion Blur on, only moving things blur, not camera
   turns.
 - NVIDIA Reflex low-latency mode (`Reflex`, experimental, off).
-- Ray Reconstruction (experimental): the add-on's own ambient occlusion and sun shadow rays (`RtShadowRayGen=3`),
-  cleaner and cheaper than the game's rays under Ray Reconstruction.
+- Ray Reconstruction in the overlay: a checkbox, with a line that says whether it runs or what it waits for (DLSS,
+  the game's ray tracing).
+- Under Ray Reconstruction the add-on now traces the ambient occlusion and sun shadows itself (`RtShadowRayGen=3`, the
+  new default): one ray each per pixel at the render size with blue noise, where the game traces AO at a quarter of
+  the pixels. Sharper contact shadows in grass, no wave pattern in distant grass (the game's random numbers made one
+  that its denoisers had hidden), and cheaper. Without Ray Reconstruction the game's own rays run, as before.
 
 ## 0.1.0 (2026-10-11)
 
 First release: DLSS in place of the game's TAA (DLAA, or upscaling through the engine's dynamic resolution), motion
-vectors for swaying grass and trees, cheaper ray tracing, experimental Ray Reconstruction.
+vectors for swaying grass and trees, cheaper ray tracing, experimental Ray Reconstruction (`RayReconstruction=1`).

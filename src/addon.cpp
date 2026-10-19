@@ -539,13 +539,12 @@ void Log(reshade::log::level level, const std::string& message) {
 }
 
 // Which ray generation shader the sun shadow dispatch runs (rt_pipeline.hpp): 0 the game's, 1 our port, 2 our port
-// plus the AO at the render size (PCG noise), 3 the same with blue noise, 4 with blue noise animated over frames.
-// Ini RtShadowRayGen (read only), remote "rtgen".
-std::atomic<int> g_rt_shadow_raygen{0};
+// plus the AO at the render size (PCG noise), 3 (default) the same with blue noise, 4 with blue noise animated over
+// frames. Ini RtShadowRayGen (read only), remote "rtgen".
+std::atomic<int> g_rt_shadow_raygen{3};
 
-// Mode 2 and 3's AO (1 ray per pixel at the render size, unless rtsamples says otherwise) replaces the game's
-// half-size AO only while Ray Reconstruction runs, which denoises it; otherwise the game's AO path stays and these
-// modes act as 1.
+// Modes 2-4 (1 AO and 1 sun shadow ray per pixel at the render size, unless rtsamples says otherwise) replace the
+// game's ray generation only while Ray Reconstruction runs, which denoises them; otherwise the game's own shaders run.
 bool RrProcessingActive() {
   return g_config.enabled && g_config.ray_reconstruction && !g_upscale_at_composite && !g_recreate.load() &&
          g_rr_active.load() && g_rr_scale.load() == g_config.render_scale &&
@@ -572,6 +571,12 @@ void SetDlssEnabled(bool enabled) {
   g_rr_active = false;
   g_config.enabled = enabled;
   g_reset = true;
+}
+
+void SetRayReconstruction(bool enabled) {
+  g_rr_active = false;
+  g_config.ray_reconstruction = enabled;
+  g_recreate = true;
 }
 
 void SetObjectBlur(bool enabled) {
@@ -628,7 +633,7 @@ void LoadConfig() {
   g_npc_stage = std::clamp(ReadInt(L"NpcStage", 3), 1, 3);
   g_config.dred = ReadInt(L"Dred", 0) != 0;
   g_config.ray_reconstruction = ReadInt(L"RayReconstruction", 0) != 0;
-  g_rt_shadow_raygen = std::clamp(ReadInt(L"RtShadowRayGen", 0), 0, 4);
+  g_rt_shadow_raygen = std::clamp(ReadInt(L"RtShadowRayGen", 3), 0, 4);
   g_config.wind_tree_capacity = std::max(1, std::min(ReadInt(L"WindTreeCapacity", 4), 16));
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
@@ -4499,14 +4504,17 @@ void WriteFrameIndex(command_list* cmd_list) {
   }
 }
 
-// Routes the game's ray generation dispatches while rtgen is 1 or 2. True when the game's dispatch is to be skipped:
-// the sun shadows ran with our shader instead, or the game's half-size AO is not needed (OurAoActive).
+// Routes the game's ray generation dispatches: rtgen 1 (the exact port) always, 2-4 only while Ray Reconstruction
+// runs (OurAoActive); otherwise the game's own shaders run. True when the game's dispatch is to be skipped: the sun
+// shadows ran with our shader instead, or the game's half-size AO is not needed.
 bool RouteRayGen(command_list* cmd_list, resource raygen, uint64_t raygen_offset, uint64_t raygen_size, resource miss,
                  uint64_t miss_offset, uint64_t miss_size, uint64_t miss_stride, resource hit, uint64_t hit_offset,
                  uint64_t hit_size, uint64_t hit_stride, resource callable, uint64_t callable_offset,
                  uint64_t callable_size, uint64_t callable_stride, uint32_t width, uint32_t height, uint32_t depth) {
   const int mode = g_rt_shadow_raygen.load();
-  if (mode == 0 || raygen_size < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES || raygen_size > kRayGenSlotBytes)
+  const bool our_ao = OurAoActive();
+  if (mode == 0 || (mode >= 2 && !our_ao) || raygen_size < D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES ||
+      raygen_size > kRayGenSlotBytes)
     return false;
   device* const dev = cmd_list->get_device();
   resource buffer = raygen;
@@ -4520,7 +4528,6 @@ bool RouteRayGen(command_list* cmd_list, resource raygen, uint64_t raygen_offset
   uint8_t record[kRayGenSlotBytes];
   std::memcpy(record, mapped, static_cast<size_t>(raygen_size));
   dev->unmap_buffer_region(buffer);
-  const bool our_ao = OurAoActive();
   if (erdlss::rt_pipeline::IsGameAo(record)) {
     if (!our_ao) return false;
     ++g_rt_ao_skipped;
@@ -5224,9 +5231,7 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "rr") {
     // rr on|off: Ray Reconstruction instead of super resolution (saved)
     if (!arg.empty()) {
-      g_rr_active = false;
-      g_config.ray_reconstruction = arg == "on";
-      g_recreate = true;
+      SetRayReconstruction(arg == "on");
       SaveConfig();
     }
     result = std::string("Ray Reconstruction ") + (g_config.ray_reconstruction ? "on" : "off") +
@@ -5290,6 +5295,34 @@ void OnOverlay(effect_runtime*) {
     SaveConfig();
   }
   ImGui::SetItemTooltip("Toggle in game with F9 (ToggleKey in EldenRingDLSS.ini).");
+  bool rr = g_config.ray_reconstruction;
+  if (ImGui::Checkbox("Ray Reconstruction", &rr)) {
+    SetRayReconstruction(rr);
+    SaveConfig();
+  }
+  ImGui::SetItemTooltip("DLSS Ray Reconstruction replaces the game's ray tracing denoisers, which blur the sun shadows "
+                        "of grass and leaves and ghost under trees. Works while the game's ray tracing is on (Ray "
+                        "Tracing Quality in the graphics settings). The add-on then traces its own sun shadow and AO "
+                        "rays, one of each per pixel at the render size (RtShadowRayGen in EldenRingDLSS.ini, 0 keeps "
+                        "the game's). Best with upscaling: at 4K on an RTX 5070 Ti it takes about 4 ms at a 50%% "
+                        "render scale and 12 ms at 100%%, partly paid back by the denoisers it replaces.");
+  const bool rr_running = RrProcessingActive();
+  if (g_config.ray_reconstruction) {
+    const char* state = "  running";
+    if (!g_config.enabled)
+      state = "  needs DLSS on";
+    else if (!g_dlss.rr_available())
+      state = "  not available: nvngx_dlssd.dll is missing or the driver is too old";
+    else if (g_rr_guides_failed)
+      state = "  unavailable: its guide buffers could not be created (see ReShade.log)";
+    else if (!RayTracingActive())
+      state = "  waiting for the game's ray tracing (Ray Tracing Quality in the graphics settings)";
+    else if (!rr_running)
+      state = "  starting";
+    else if (OurAoActive())
+      state = "  running, with the add-on's rays";
+    ImGui::TextUnformatted(state);
+  }
 
   // NVIDIA's default depends on the mode the render scale maps to.
   char default_name[16];
@@ -5310,6 +5343,7 @@ void OnOverlay(effect_runtime*) {
                         "M and L: newer transformer models, NVIDIA's defaults for Performance and Ultra Performance.\n"
                         "They cost more than K, much more on RTX 20 and 30 cards (NVIDIA recommends K there).\n"
                         "E: the older CNN model, about half of K's cost.");
+  if (rr_running) ImGui::TextUnformatted("  not used while Ray Reconstruction runs (it has its own model)");
   // Applied on release: every change recreates the DLSS feature.
   static int scale_percent = 0;
   if (!ImGui::IsAnyItemActive()) scale_percent = static_cast<int>(std::lround(g_config.render_scale * 100.0f));
