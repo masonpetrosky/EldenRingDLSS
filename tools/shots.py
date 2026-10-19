@@ -15,8 +15,11 @@ R10G10B10A2, R8G8B8A8, RGBA16F = 24, 28, 10
 SRGB, SCRGB, HDR10_PQ = 1, 2, 3
 
 
-def load(shots, name):
-    w, h, fmt, space = (int(x) for x in open(os.path.join(shots, name + ".txt")).read().split())
+def load(shots, name, space=None):
+    """The shot as SDR RGB in [0, 1]. `space` overrides the .txt's color space: the add-on tags HDR captures as sRGB
+    when the game switched to HDR after startup, so pass HDR10_PQ for those."""
+    w, h, fmt, tagged = (int(x) for x in open(os.path.join(shots, name + ".txt")).read().split())
+    space = space or tagged
     raw = np.fromfile(os.path.join(shots, name + ".bin"), dtype=np.uint32 if fmt != RGBA16F else np.float16)
     if fmt == R10G10B10A2:
         v = raw.reshape(h, w)

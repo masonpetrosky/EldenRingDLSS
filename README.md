@@ -190,7 +190,9 @@ hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale
   pass logs (`passlog`), the render scale (`scale`), presets, jitter, ray tracing switches (`rtskip`, `rtrefit`,
   `rtdist`, `rtsamples`, `rtinfo`) and Ray Reconstruction (`rr`, `rrraw`, `rrpreset`, `rrdump`); see
   `OnReshadePresent` in `src/addon.cpp`.
-- `tools/ab_capture.ps1`: scripted comparison rounds with PresentMon frame-time logs.
+- `tools/ab_capture.ps1`: scripted comparison rounds with PresentMon frame-time logs; `tools/frames.py` turns the
+  logs into the frame-rate columns above, and `tools/compare_crops.py` makes labeled 1:1 crop sheets like the
+  comparison images.
 - `tools/mem.py`: read, search and write the running game's memory from outside.
 - `tools/rdc_*.py`: RenderDoc 1.46 scripts (run with `qrenderdoc.exe --python`) to list passes, constants, bindings,
   ray tracing calls and readers of a resource in a capture.
