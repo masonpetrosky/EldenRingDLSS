@@ -4686,7 +4686,10 @@ void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, ui
     g_frame_time_ms = static_cast<float>(1000.0 * (now.QuadPart - last.QuadPart) / frequency.QuadPart);
   last = now;
 
-  if (KeyPressed(g_config.toggle_key)) {
+  // Not with Alt, Ctrl or Shift held: Alt+F9 is the NVIDIA App's record shortcut.
+  const bool modifier =
+      ((GetAsyncKeyState(VK_MENU) | GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_SHIFT)) & 0x8000) != 0;
+  if (KeyPressed(g_config.toggle_key) && !modifier) {
     SetDlssEnabled(!g_config.enabled);
     SaveConfig();
     Log(reshade::log::level::info, g_config.enabled ? "DLSS on." : "DLSS off (game TAA).");
@@ -5288,16 +5291,25 @@ void OnOverlay(effect_runtime*) {
   }
   ImGui::SetItemTooltip("Toggle in game with F9 (ToggleKey in EldenRingDLSS.ini).");
 
-  static const char* kPresetNames[] = {"Default (K)", "J", "K", "L", "M"};
-  static const int kPresetValues[] = {0, 10, 11, 12, 13};
+  // NVIDIA's default depends on the mode the render scale maps to.
+  char default_name[16];
+  std::snprintf(default_name, sizeof(default_name), "Default (%s)",
+                erdlss::DefaultPresetLetter(g_config.render_scale));
+  const char* const preset_names[] = {default_name, "E (older CNN model, lightest)", "J", "K", "L", "M"};
+  static const int kPresetValues[] = {0, 5, 10, 11, 12, 13};
+  constexpr int kPresetCount = 6;
   int index = 0;
-  for (int i = 0; i < 5; ++i)
+  for (int i = 0; i < kPresetCount; ++i)
     if (kPresetValues[i] == g_config.preset) index = i;
-  if (ImGui::Combo("Preset", &index, kPresetNames, 5)) {
+  if (ImGui::Combo("Preset", &index, preset_names, kPresetCount)) {
     g_config.preset = kPresetValues[index];
     g_recreate = true;
     SaveConfig();
   }
+  ImGui::SetItemTooltip("K: transformer model, NVIDIA's default for DLAA, Quality and Balanced.\n"
+                        "M and L: newer transformer models, NVIDIA's defaults for Performance and Ultra Performance.\n"
+                        "They cost more than K, much more on RTX 20 and 30 cards (NVIDIA recommends K there).\n"
+                        "E: the older CNN model, about half of K's cost.");
   // Applied on release: every change recreates the DLSS feature.
   static int scale_percent = 0;
   if (!ImGui::IsAnyItemActive()) scale_percent = static_cast<int>(std::lround(g_config.render_scale * 100.0f));

@@ -37,7 +37,8 @@ measurements.
 ## Features
 
 - **DLSS at the TAA**, before tonemapping, with HDR input and the game's exposure (NVIDIA's recommended placement).
-  Presets selectable (K, M, L, ...). F9 toggles between DLSS and the game's TAA.
+  Presets selectable (K, M, L, J, and E, the older CNN model at about half of K's cost). F9 toggles between DLSS and
+  the game's TAA.
 - **Upscaling** through the engine's dynamic resolution scale (`RenderScale`, e.g. 0.50 = Performance, 0.58 =
   Balanced, 0.67 = Quality). Everything after the TAA was queued by the engine at the render size; the add-on
   corrects those passes per draw (viewports, scissors, resolution constants), stretches the render-size inputs they
@@ -46,13 +47,19 @@ measurements.
   filter's own counter (the scene constants are sometimes a frame stale, which presets M and L show as judder).
 - **Motion vectors for wind-animated vegetation** (grass, bushes, SpeedTree trees), which the game does not write and
   DLSS therefore smears: a port of the game's grass wind shader and a stream-output replay of the tree shaders.
+- **Motion vectors for enemies, NPCs and animals**: the game only draws velocity for the player's character. The
+  add-on replays the other skinned characters' G-buffer draws with last frame's bones, matched per mesh part.
+- **Object-only motion blur** (optional): with the game's Motion Blur on, enemies, animals and swings blur, camera
+  turns do not.
+- **NVIDIA Reflex** (experimental): the driver's low-latency mode, with the sleep injected at the present.
 - **Cheaper ray tracing**: the game re-animates and refits ~200 bottom-level acceleration structures every frame;
   the add-on refits vegetation by distance (near every frame, far every 2nd/4th frame) and characters every frame,
   which halved the ray tracing cost on Maximum in testing.
 - **DLSS Ray Reconstruction (experimental)**: guide buffers (world normals, roughness, diffuse and specular albedo)
-  drawn from the game's G-buffer, the game's ray traced shadows passed raw into RR, used only while ray tracing is
-  on. Works end to end; at 50% the result is limited by the game's thin ray tracing signal (see
-  `docs/raytracing.md`).
+  drawn from the game's G-buffer, the ray traced shadows passed raw into RR, used only while ray tracing is on. With
+  `RtShadowRayGen=3` the add-on's own ray generation shader, added to the game's pipeline, traces ambient occlusion at
+  the render size and one sun shadow ray per pixel with blue noise, cheaper and cleaner than the game's rays under RR
+  (see `docs/raytracing.md`).
 - Removes the game's chromatic aberration (optional), texture LOD bias for the upscale, fixes for the heat
   distortion, sparks and grace flames at reduced render sizes.
 
@@ -89,7 +96,8 @@ Download `EldenRingDLSS-<version>.zip` from [Releases](https://github.com/masonp
 follow its `INSTALL.txt`. In short: take `ReShade64.dll` from the installer of ReShade 6.8 or newer with full add-on
 support (the installer opens as a zip archive in 7-Zip), put it into the zip's `EldenRingDLSS` folder as
 `ReShade64.asi`, and double-click `EldenRingDLSS.me3` to start the game through me3. F9 toggles DLSS, the ReShade
-overlay (Home) has the settings. Nothing is written to the game folder.
+overlay (Home) has the settings. Nothing is written to the game folder. What changed between versions:
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ### From a build
 
@@ -105,12 +113,13 @@ The game must be closed while installing (the add-on file is locked while it run
 ## Settings
 
 `EldenRingDLSS.ini` next to the add-on (most are also in the ReShade overlay). The defaults below are the add-on's; the
-release zip's ini (`package/EldenRingDLSS.ini`) starts with `Enabled=1` and `WindMotion=1` and documents each key.
+release zip's ini (`package/EldenRingDLSS.ini`) starts with `Enabled=1`, `WindMotion=1` and `NpcMotion=1` and
+documents each key.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `Enabled` | 0 | DLSS on (1) or the game's TAA (0). F9 toggles it and saves it. |
-| `Preset` | 0 | DLSS preset: 0 = NVIDIA's default for the mode, 11 = K, 12 = L, 13 = M. |
+| `Preset` | 0 | DLSS preset: 0 = NVIDIA's default for the mode, 5 = E, 10 = J, 11 = K, 12 = L, 13 = M. |
 | `RenderScale` | 1.0 | Render size per axis; below 1 DLSS upscales (0.50, 0.58, 0.67, 0.77). |
 | `GameExposure` | 1 | Give DLSS the game's exposure instead of DLSS's auto-exposure. |
 | `GameSharpening` | 0 | Run the game's TAA sharpening on the DLSS output (`SharpenStrength`). |
@@ -119,8 +128,12 @@ release zip's ini (`package/EldenRingDLSS.ini`) starts with `Enabled=1` and `Win
 | `WindMotion` | 0 | Motion vectors for wind-animated vegetation. |
 | `WindMode` | 1 | 1 = ported grass shader plus tree replay; 0 = stream output for everything. |
 | `WindTrees` | 1 | Include SpeedTree trees and shrubs (`WindTreeCapacity`, millions of vertices per frame). |
+| `NpcMotion` | 0 | Motion vectors for enemies, NPCs and animals. |
+| `ObjectBlur` | 0 | With the game's Motion Blur on, blur only moving objects, not camera turns. |
+| `Reflex` | 0 | NVIDIA Reflex low-latency mode (experimental). |
 | `RayReconstruction` | 0 | DLSS Ray Reconstruction while the game's ray tracing is on. |
-| `ToggleKey` | 120 | Virtual key code for the DLSS toggle (120 = F9). |
+| `RtShadowRayGen` | 0 | 3 = the add-on's own AO and sun shadow rays (blue noise) under Ray Reconstruction. |
+| `ToggleKey` | 120 | Virtual key code for the DLSS toggle (120 = F9; ignored while Alt, Ctrl or Shift is held). |
 
 `VegetationMask`, `WindPrepass`, `WindCapacity`, `FlipJitterX/Y`, `FlipMotion` and `UseDepthCopy` are development
 options.
@@ -166,8 +179,9 @@ hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale
   A game update can break either (the add-on then falls back to DLAA or the game's TAA and logs it).
 - Tested on one GPU, at 4K and in HDR. Some corrections depend on exact sizes (render sizes are rounded by the engine
   to 4 or 8 pixels).
-- Ray Reconstruction at 50-67% shows shimmering grass: the game traces AO at half resolution with few rays. A
-  replacement ray generation shader with full-resolution AO is the planned fix.
+- Ray Reconstruction at 50-67% shows more shimmer in grass than at DLAA. It comes from the upscale (it stays with the
+  game's own rays and with RR off); the add-on's own rays (`RtShadowRayGen=3`) remove the wave pattern the game's
+  noise made in distant grass under RR.
 - Every normal exit of the game ends in a harmless WER crash report (an allocator check at shutdown); it predates
   this add-on.
 
@@ -179,6 +193,7 @@ The add-on's own code is MIT licensed (`LICENSE`). It uses:
   BSD-3-Clause or MIT, see `third_party/reshade/LICENSE.md`).
 - Dear ImGui headers (`third_party/imgui`, MIT, see `third_party/imgui/LICENSE.txt`).
 - The NVIDIA DLSS SDK, under NVIDIA's license, fetched by `tools/fetch_dlss_sdk.ps1` and not included here.
+- NVIDIA NVAPI (MIT), fetched by `tools/fetch_nvapi.ps1` and linked statically for Reflex.
 
 Not affiliated with or endorsed by FromSoftware, Bandai Namco or NVIDIA. ELDEN RING is a trademark of its owners;
 DLSS is a trademark of NVIDIA.

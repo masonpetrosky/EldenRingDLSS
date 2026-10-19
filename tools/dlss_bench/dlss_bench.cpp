@@ -172,6 +172,7 @@ int main(int argc, char** argv) {
   const UINT q_w = share(0.67f, out_w), q_h = share(0.67f, out_h);
   const UINT p_w = out_w / 2, p_h = out_h / 2;
   std::vector<Case> cases = {
+      {"DLAA", NVSDK_NGX_PerfQuality_Value_DLAA, 5, out_w, out_h, out_w, out_h},
       {"DLAA", NVSDK_NGX_PerfQuality_Value_DLAA, 11, out_w, out_h, out_w, out_h},
       {"DLAA", NVSDK_NGX_PerfQuality_Value_DLAA, 13, out_w, out_h, out_w, out_h},
       {"Quality", NVSDK_NGX_PerfQuality_Value_MaxQuality, 11, q_w, q_h, out_w, out_h},
@@ -183,8 +184,10 @@ int main(int argc, char** argv) {
       {"Performance", NVSDK_NGX_PerfQuality_Value_MaxPerf, 13, p_w, p_h, out_w, out_h},
       {"Performance", NVSDK_NGX_PerfQuality_Value_MaxPerf, 13, p_w, p_h, p_w, p_h},
       {"Performance", NVSDK_NGX_PerfQuality_Value_MaxPerf, 12, p_w, p_h, p_w, p_h},
+      {"Quality", NVSDK_NGX_PerfQuality_Value_MaxQuality, 5, q_w, q_h, q_w, q_h},
+      {"Performance", NVSDK_NGX_PerfQuality_Value_MaxPerf, 5, p_w, p_h, p_w, p_h},
   };
-  const char* preset_names[] = {"", "", "", "", "", "", "", "", "", "", "J", "K", "L", "M"};
+  const char* preset_names[] = {"", "", "", "", "", "E", "", "", "", "", "J", "K", "L", "M"};
 
   const bool rr = argc > 4 && std::string(argv[4]) == "rr";
   if (rr) {

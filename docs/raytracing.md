@@ -88,6 +88,21 @@ Fixed in commit 41e83fa: the feature is created for the engine's render size. NV
 3.6x K. (Luma's Persona 5 Royal mod creates DLSS for the real render size, so its M cost there likely came from
 running at native resolution, where M is expensive.)
 
+Preset E (2026-10-19, asked for on Nexus): the older CNN model, marked deprecated in the 310.x headers, still runs in
+the 310.9.1 DLL (`dlss_bench` creates it, and it times apart from K). RTX 5070 Ti, feature created for the render size:
+
+| Output | Mode | E | K | M | L |
+| --- | --- | --- | --- | --- | --- |
+| 3840x2160 | DLAA | 0.72 ms | 1.65 ms | 6.02 ms | |
+| 3840x2160 | Quality | 0.67 ms | 1.55 ms | 3.21 ms | |
+| 3840x2160 | Performance | 0.61 ms | 1.51 ms | 2.12 ms | 2.70 ms |
+| 2560x1440 | DLAA | 0.36 ms | 0.83 ms | 2.62 ms | |
+| 2560x1440 | Quality | 0.34 ms | 0.79 ms | 1.44 ms | |
+| 2560x1440 | Performance | 0.32 ms | 0.77 ms | 0.93 ms | 1.19 ms |
+
+NVIDIA describes M and L as a heavier cost on RTX 20 and 30 cards (no FP8), so E is the light option there. The
+overlay lists E since 0.2.0.
+
 ## DLSS Ray Reconstruction (RR)
 
 From NVIDIA's DLSS-RR Integration Guide (github.com/NVIDIA/DLSS, doc/):

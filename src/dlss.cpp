@@ -64,6 +64,15 @@ void NVSDK_CONV OnNgxLog(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX
 
 }  // namespace
 
+// The SDK's defaults (nvsdk_ngx_defs.h, 310.x): M for Performance, L for Ultra Performance, K for the other modes.
+const char* DefaultPresetLetter(float scale) {
+  switch (PickMode(scale).value) {
+    case NVSDK_NGX_PerfQuality_Value_MaxPerf: return "M";
+    case NVSDK_NGX_PerfQuality_Value_UltraPerformance: return "L";
+    default: return "K";
+  }
+}
+
 bool Dlss::Init(ID3D12Device* device, const std::wstring& dll_dir, const std::wstring& log_dir) {
   device_ = device;
   const wchar_t* paths[] = {dll_dir.c_str()};

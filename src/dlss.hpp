@@ -36,6 +36,9 @@ struct DlssInputs {
   ID3D12Resource* specular_albedo = nullptr;
 };
 
+// The preset NVIDIA's default picks for the quality mode a render scale maps to: "K", "M" or "L".
+const char* DefaultPresetLetter(float scale);
+
 class Dlss {
  public:
   // Initializes NGX for the device. nvngx_dlss.dll is loaded from `dll_dir`; NGX writes its logs to `log_dir`.
