@@ -37,12 +37,16 @@
 # 0.50 with DLSS on.
 # -Round mvcost: what the add-on's motion vectors cost at the current DLSS settings: 5 s frame-time logs with
 # everything on, tree motion off, wind (grass and trees) off, and wind and NPC motion off; then back to the ini.
+# -Round water: the native-size water reflections (WaterReflections) at a still camera on water: 8-shot bursts with
+# them on and off at the current render scale and with the game's TAA at full size (temporal noise: tools\flicker.py),
+# and a 5 s frame-time log and a 30-frame GPU profile on and off (tools\gpu_profile.py --compare). Shots go to
+# shots\water; ends with DLSS at 0.50 and the ini's setting.
 # -Round rtfoliage: GPU profiles and screenshots of our rays with and without the foliage alpha test, shorter AO rays
 # and nearer opaque shadows (see the round); restores the defaults.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
                'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe', 'upscale',
-               'showcase', 'showcasert', 'rrshow', 'vanilla', 'mvcost', 'rtfoliage')][string]$Round = 'sharpen',
+               'showcase', 'showcasert', 'rrshow', 'vanilla', 'mvcost', 'rtfoliage', 'water')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\Tools\PresentMon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -319,6 +323,16 @@ if ($Round -eq 'sharpen') {
     Send "gpuprofile 30 rf_$name"; Send "capture rf_$name"
   }
   Send 'rtalpha game game'; Send 'rtaolen 0'; Send 'rtshadowfar 0'
+} elseif ($Round -eq 'water') {
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $restore = if ($ini -match '^WaterReflections=0') { 'off' } else { 'on' }
+  New-Item -ItemType Directory -Force (Join-Path $Folder 'shots\water') | Out-Null
+  function Burst([string]$Name) { foreach ($i in 0..7) { Send "capture water/${Name}_$i" | Out-Null }; "captured $Name" }
+  Send 'dlss on'; Send 'scale'; Send 'ssr on' 1.5; Send 'ssr'; Burst 'on'
+  Send 'ssr off' 1.5; Send 'ssr'; Burst 'off'; LogFrames 'water_off'; Send 'gpuprofile 30 water_off' 2.0
+  Send 'ssr on' 1.5; Send 'ssr'; LogFrames 'water_on'; Send 'gpuprofile 30 water_on' 2.0; Burst 'on2'
+  Send 'scale 1' 5.0; Send 'dlss off' 3.0; Send 'scale'; Burst 'taa'
+  Send 'dlss on'; Send 'scale 0.5' 5.0; Send "ssr $restore"; Send 'scale'; Send 'ssr'
 } elseif ($Round -eq 'treecost') {
   # Where the trees' cost goes: grass and trees with and without the resolve draw, grass only.
   Send 'dlss on'; Send 'wind on'; Send 'windtrees on' 3.0; LogFrames 'tc_trees'

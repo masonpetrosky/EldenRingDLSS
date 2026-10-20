@@ -51,6 +51,7 @@
 #include "object_blur.hpp"
 #include "reflex.hpp"
 #include "tree_dump.hpp"
+#include "water_ssr.hpp"
 #include "wind.hpp"
 #include "wind_port.hpp"
 
@@ -76,6 +77,10 @@ enum class Pass : uint8_t {
   kAoUpscale,     // the AO chain's bilateral upscale to full size
   kCameraMotion,  // MotionBlurWriteCMBVelocity: the camera's motion from depth, under the velocity draws
   kMotionBlur,    // the motion blur's first pass after the TAA (runs only with the game's motion blur on)
+  // The water's screen-space reflections (water_ssr.hpp): the half-size depth's 2x2 downscale, the linear depth, the
+  // water's reflection draws (M[...]_FwdSsr), the reflection's mip downscale and blur, and the forward draws (the
+  // water's lighting reads the reflection there).
+  kDepthHalf, kSsrConvert, kSsrWater, kSsrDown, kSsrBlur, kForward,
 };
 
 // cbSceneParam, bound at vertex shader register b8 by the scene shaders. Offsets are in floats.
@@ -199,6 +204,9 @@ struct Config {
   // Object-only motion blur (object_blur.hpp): the game's motion blur without the camera's motion.
   bool object_blur = false;
   bool reflex = false;  // NVIDIA Reflex low-latency mode, injected at the present (reflex.hpp)
+  // While upscaling, the water's screen-space reflections at the size the game uses at a 100% render scale
+  // (water_ssr.hpp) instead of its share of it.
+  bool water_reflections = true;
   bool dred = false;  // development: D3D12 crash breadcrumbs (dred.hpp), read at startup
   bool flip_jitter_x = false;
   bool flip_jitter_y = false;
@@ -365,6 +373,23 @@ std::atomic<uint32_t> g_last_out_width{0}, g_last_out_height{0};
 std::atomic<uint64_t> g_motion_src{0};       // the scene's motion: the motion prep pass's g_MoveTex
 std::atomic<uint64_t> g_emissive{0};         // the emissive buffer: EmissiveToGlowPS's source
 std::atomic<uint64_t> g_half_depth{0};       // the half-size depth: LensSimu2_ComputeCoCF's
+
+// Water reflections at the native size while upscaling (water_ssr.hpp; docs/recon.md). The engine's chain is recorded
+// in one command list: the half-size depth's 2x2 downscale (whose source, a copy of the full-size depth, the add-on's
+// depth pass reads), GXSsrConvertDepth (where the add-on decides for the chain and runs that pass), the water's
+// reflection draws, then a downscale and two blurs per mip. The water's lighting reads the result in the forward pass,
+// recorded in another list.
+erdlss::WaterSsr g_water_ssr;  // under g_ssr_mutex
+std::mutex g_ssr_mutex;
+bool g_ssr_failed = false;                   // its pipeline could not be made (under g_ssr_mutex)
+std::atomic<bool> g_ssr_chain{false};        // the latest chain was drawn into the add-on's textures
+std::atomic<uint64_t> g_ssr_chain_frame{0};  // g_frame of the latest such chain
+std::atomic<uint64_t> g_ssr_prev_full{0};    // g_frame of the latest SampleColor1 that filled its whole target
+// The engine's textures: the reflection (g_RLRTexture), the blur's intermediate and the linear depth.
+std::atomic<uint64_t> g_ssr_reflection{0}, g_ssr_blur{0}, g_ssr_linear{0};
+std::mutex g_ssr_sources_mutex;
+std::unordered_map<uint64_t, uint64_t> g_ssr_depth_sources;  // half-size depth -> the full-size depth it came from
+std::atomic<uint64_t> g_ssr_chains{0}, g_ssr_water{0}, g_ssr_steps{0}, g_ssr_lit{0}, g_ssr_misses{0};
 
 // Development pass log (remote "passlog"): every draw after the TAA in one frame, with its viewport and targets.
 std::mutex g_passlog_mutex;
@@ -630,6 +655,7 @@ void LoadConfig() {
   g_config.npc_motion = ReadInt(L"NpcMotion", 0) != 0;
   g_config.object_blur = ReadInt(L"ObjectBlur", 0) != 0;
   g_config.reflex = ReadInt(L"Reflex", 0) != 0;
+  g_config.water_reflections = ReadInt(L"WaterReflections", 1) != 0;
   g_npc_stage = std::clamp(ReadInt(L"NpcStage", 3), 1, 3);
   g_config.dred = ReadInt(L"Dred", 0) != 0;
   g_config.ray_reconstruction = ReadInt(L"RayReconstruction", 0) != 0;
@@ -661,6 +687,7 @@ void SaveConfig() {
   WriteInt(L"NpcMotion", g_config.npc_motion);
   WriteInt(L"ObjectBlur", g_config.object_blur);
   WriteInt(L"Reflex", g_config.reflex);
+  WriteInt(L"WaterReflections", g_config.water_reflections);
   WriteInt(L"RayReconstruction", g_config.ray_reconstruction);
   WriteInt(L"WindTreeCapacity", g_config.wind_tree_capacity);
   WriteInt(L"FlipJitterX", g_config.flip_jitter_x);
@@ -698,7 +725,13 @@ Pass Classify(uint32_t count, const pipeline_subobject* subobjects) {
   if (Contains(ps, "ScreenSpaceAO2_BilateralUpScale")) return Pass::kAoUpscale;
   if (Contains(ps, "MotionBlurWriteCMBVelocity")) return Pass::kCameraMotion;
   if (Contains(ps, "MotionBlur_WriteVelocityAndDepthPack_DownScale")) return Pass::kMotionBlur;
+  if (Contains(ps, "DepthScale2x2OutputDepth")) return Pass::kDepthHalf;
+  if (Contains(ps, "GXSsrConvertDepth")) return Pass::kSsrConvert;
+  if (Contains(ps, "GXSsrTexDownScale")) return Pass::kSsrDown;
+  if (Contains(ps, "GXSsrTexBlur2")) return Pass::kSsrBlur;
+  if (Contains(ps, "_FwdSsr")) return Pass::kSsrWater;
   if (Contains(vs, "_Velo")) return Pass::kScene;
+  if (Contains(ps, "_Fwd")) return Pass::kForward;
   return Pass::kOther;
 }
 
@@ -1384,9 +1417,12 @@ void CorrectPostPassImpl(command_list* cmd_list, CmdData& data, bool compute, Dr
   // reflection source (SampleColor1 after the depth of field: a half-size copy of the frame that the next frame's
   // M[Water]*_FwdSsr draws read as g_PrevFrameTexture before the TAA, in the scene's share like everything there):
   // it keeps the share and only reads the whole full-size frame (cbPostProcessCommon below). Filled whole, the water
-  // reflected the top-left part of the screen (a lit pillar, the stars) at render scales below 1.
+  // reflected the top-left part of the screen (a lit pillar, the stars) at render scales below 1, unless the water
+  // draws are told to read all of it too: with the native-size water reflections (SsrWaterDraw), which want a
+  // native-size image to reflect.
   float old_vp[2] = {0, 0}, new_vp[2] = {0, 0};
-  if (!state->viewports.empty() && name != "SampleColor1") {
+  const bool reflection_source = name == "SampleColor1";
+  if (!state->viewports.empty() && (!reflection_source || g_config.water_reflections)) {
     const viewport vp = state->viewports[0];
     resource target = {0};
     if (!state->render_targets.empty() && state->render_targets[0] != 0)
@@ -1412,6 +1448,7 @@ void CorrectPostPassImpl(command_list* cmd_list, CmdData& data, bool compute, Dr
         }
         old_vp[0] = vp.width, old_vp[1] = vp.height, new_vp[0] = tw, new_vp[1] = th;
         fixed = true;
+        if (reflection_source) g_ssr_prev_full = g_frame.load();
       }
     }
   }
@@ -1983,6 +2020,11 @@ void OnDestroyDevice(device* dev) {
     g_skin.Shutdown();
   }
   g_object_blur.Shutdown();
+  {
+    std::lock_guard ssr_lock(g_ssr_mutex);
+    g_ssr_chain = false;
+    g_water_ssr.Shutdown();
+  }
   g_tree_end = 0;
   g_tree_dump.Shutdown();
   g_dlss.Shutdown();
@@ -2088,7 +2130,8 @@ void ProfileMarker(ID3D12GraphicsCommandList* cmd, const wchar_t* text) {
   const std::wstring_view t(text);
   static const wchar_t* const kPasses[] = {L"ERDLSS stream resolve", L"ERDLSS npc frame end", L"ERDLSS tree frame end",
                                            L"ERDLSS object blur motion", L"ERDLSS camera motion copy",
-                                           L"ERDLSS npc patches", L"ERDLSS DLSS", L"ERDLSS stretch", L"ERDLSS <end>"};
+                                           L"ERDLSS npc patches", L"ERDLSS DLSS", L"ERDLSS stretch",
+                                           L"ERDLSS water reflections", L"ERDLSS <end>"};
   if (std::none_of(std::begin(kPasses), std::end(kPasses), [&](const wchar_t* p) { return t == p; })) return;
   std::string label;
   for (const wchar_t c : t) label.push_back(static_cast<char>(c));  // the markers are ASCII
@@ -3517,6 +3560,285 @@ void LogPass(command_list* cmd_list, const CmdData& data) {
   g_passlog.push_back(text);
 }
 
+// --- Water reflections (water_ssr.hpp) ---------------------------------------------------------------------
+
+bool ReadBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg, uint32_t offset, void* out,
+                        uint32_t size);
+
+bool SsrWanted() { return g_config.water_reflections && g_config.enabled && g_config.render_scale < 0.99f; }
+
+void SsrMiss(const std::string& what) {
+  if (g_ssr_misses++ < 4) Log(reshade::log::level::warning, "Water reflections: " + what);
+}
+
+bool IsReflectionTexture(device* dev, resource res) {
+  if (res == 0) return false;
+  const resource_desc d = dev->get_resource_desc(res);
+  return d.texture.format == format::r16g16b16a16_float && d.texture.levels == erdlss::WaterSsr::kMips;
+}
+
+// Points shader register `reg` of `stage` at `srv` (a descriptor in a non-shader-visible heap) for the coming draw.
+// The game gives every draw its own copies of the descriptor tables it sets, from a ring that wraps within a frame
+// (tools/rdc_descslots.py on er117_scale67_f2898.rdc: no other event reads the SSR draws' slots), so the write
+// reaches this draw only, and the game writes the slot anew when the ring comes round.
+bool RedirectShaderResource(command_list* cmd_list, shader_stage stage, uint32_t reg,
+                            D3D12_CPU_DESCRIPTOR_HANDLE srv) {
+  device* const dev = cmd_list->get_device();
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
+  if (state == nullptr || descriptors == nullptr) return false;
+  const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
+  if (it == state->descriptor_tables.end()) return false;
+  descriptor_heap heap = {0};
+  uint32_t offset = 0;
+  if (!descriptors->Find(dev, it->second.first, it->second.second, stage, RegisterKind::kShaderResource, reg, 0,
+                         &heap, &offset))
+    return false;
+  // ReShade reports the game's own heap object, whose CPU handles are the real ones.
+  auto* const h = reinterpret_cast<ID3D12DescriptorHeap*>(heap.handle);
+  if (h == nullptr) return false;
+  const D3D12_DESCRIPTOR_HEAP_DESC hd = h->GetDesc();
+  if (hd.Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || offset >= hd.NumDescriptors) return false;
+  auto* const native = reinterpret_cast<ID3D12Device*>(dev->get_native());
+  D3D12_CPU_DESCRIPTOR_HANDLE dst = h->GetCPUDescriptorHandleForHeapStart();
+  dst.ptr += static_cast<SIZE_T>(offset) *
+             native->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  native->CopyDescriptorsSimple(1, dst, srv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  return true;
+}
+
+// Puts the game's render targets, viewports and scissors back after the add-on drew into its own targets natively.
+void RestoreTargets(command_list* cmd_list) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  cmd_list->bind_render_targets_and_depth_stencil(static_cast<uint32_t>(state->render_targets.size()),
+                                                  state->render_targets.data(), state->depth_stencil);
+  if (!state->viewports.empty())
+    cmd_list->bind_viewports(0, static_cast<uint32_t>(state->viewports.size()), state->viewports.data());
+  if (!state->scissor_rects.empty())
+    cmd_list->bind_scissor_rects(0, static_cast<uint32_t>(state->scissor_rects.size()), state->scissor_rects.data());
+}
+
+// DepthScale2x2OutputDepth: remembers which full-size depth each half-size depth is made from. The SSR's comes from a
+// copy of the main depth, which the add-on's depth pass reads instead.
+void NoteHalfDepth(command_list* cmd_list) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  if (state == nullptr || state->depth_stencil == 0) return;
+  device* const dev = cmd_list->get_device();
+  std::lock_guard resource_lock(g_resource_cache_mutex);
+  const resource source = BoundResource(cmd_list, shader_stage::pixel, 1);  // g_DepthTex
+  const resource half = dev->get_resource_from_view(state->depth_stencil);
+  if (source == 0 || half == 0) return;
+  std::lock_guard lock(g_ssr_sources_mutex);
+  g_ssr_depth_sources[half.handle] = source.handle;
+}
+
+// GXSsrConvertDepth, the chain's first draw: decides whether the chain runs in the add-on's textures and if so writes
+// their depth inputs. The engine's own draw runs as well (nothing reads its result then).
+void StartSsrChain(command_list* cmd_list, CmdData& data) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  if (!SsrWanted() || state == nullptr || state->render_targets.empty() || state->render_targets[0] == 0 ||
+      state->viewports.empty()) {
+    g_ssr_chain = false;
+    return;
+  }
+  device* const dev = cmd_list->get_device();
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  std::lock_guard resource_lock(g_resource_cache_mutex);
+  bool chain = false;
+  const resource linear = dev->get_resource_from_view(state->render_targets[0]);
+  const resource half = BoundResource(cmd_list, shader_stage::pixel, 1);  // g_DepthTexture, the half-size depth
+  uint64_t full = 0;
+  {
+    std::lock_guard lock(g_ssr_sources_mutex);
+    const auto it = g_ssr_depth_sources.find(half.handle);
+    if (it != g_ssr_depth_sources.end()) full = it->second;
+  }
+  // The screen percentage the water draws use (SC_DynamicResolution_ScreenPercentage), if this draw's viewport (the
+  // share of the half-size target) agrees.
+  const resource_desc ld = dev->get_resource_desc(linear);
+  const auto ew = static_cast<float>(ld.texture.width), eh = static_cast<float>(ld.texture.height);
+  float px, py;
+  {
+    std::lock_guard lock(g_scene_mutex);
+    px = g_scene.percentages[0];
+    py = g_scene.percentages[1];
+  }
+  const viewport vp = state->viewports[0];
+  if (!(std::fabs(ew * px - vp.width) <= 1.5f && std::fabs(eh * py - vp.height) <= 1.5f)) {
+    px = vp.width / ew;
+    py = vp.height / eh;
+  }
+  float param[4];  // cbPerScene (pixel b0) g_vDepthComputeParam
+  if (linear == 0 || full == 0) {
+    SsrMiss("the depth inputs were not found");
+  } else if (!ReadBoundConstants(cmd_list, shader_stage::pixel, 0, 272, param, sizeof(param))) {
+    SsrMiss("the depth parameters were not readable");
+  } else {
+    const float depth_param[2] = {param[0], param[2]};
+    std::lock_guard lock(g_ssr_mutex);
+    if (!g_water_ssr.ready() && !g_ssr_failed &&
+        !g_water_ssr.Init(reinterpret_cast<ID3D12Device*>(dev->get_native()))) {
+      g_ssr_failed = true;
+      Log(reshade::log::level::error, "Water reflections unavailable: " + g_water_ssr.status());
+    }
+    const uint32_t old_width = g_water_ssr.width(), old_height = g_water_ssr.height();
+    if (g_water_ssr.ready() && g_water_ssr.Prepare(ld.texture.width, ld.texture.height, px, py, g_frame.load())) {
+      if (g_water_ssr.width() != old_width || g_water_ssr.height() != old_height) {
+        char text[200];
+        std::snprintf(text, sizeof(text),
+                      "Water reflections: %ux%u in %ux%u textures (%.0f MB) instead of the engine's %ux%u at %.0f%%",
+                      static_cast<unsigned>(std::lround(g_water_ssr.share_width())),
+                      static_cast<unsigned>(std::lround(g_water_ssr.share_height())), g_water_ssr.width(),
+                      g_water_ssr.height(), static_cast<double>(g_water_ssr.bytes()) / 1048576.0,
+                      static_cast<unsigned>(vp.width), static_cast<unsigned>(vp.height), px * 100.0f);
+        Log(reshade::log::level::info, text);
+      }
+      erdlss::Marker(native, L"ERDLSS water reflections");
+      chain = g_water_ssr.ConvertDepth(native, reinterpret_cast<ID3D12Resource*>(full), depth_param);
+      if (!chain) SsrMiss("the depth pass could not run");
+    } else if (g_water_ssr.ready() && !g_water_ssr.sized()) {
+      SsrMiss(g_water_ssr.status());
+    }
+  }
+  if (chain) {
+    RestoreTaaState(cmd_list, data);
+    g_ssr_linear = linear.handle;
+    g_ssr_chain_frame = g_frame.load();
+    ++g_ssr_chains;
+  }
+  g_ssr_chain = chain;
+}
+
+// The water's reflection draws (M[...]_FwdSsr), drawn again into the add-on's textures. The engine's draw runs as well:
+// it also writes the water's surface into the half-size depth, which later passes test against.
+template <typename Draw>
+void SsrWaterDraw(command_list* cmd_list, Draw draw) {
+  // The previous frame's image the rays sample (g_PrevFrameTexture): all of it after SampleColor1 filled it whole
+  // (CorrectPostPassImpl). SC_DynamicResolution_SecondaryScreenPercentage.zw (cbSceneParam, pixel b8, byte 1400)
+  // scales its UV; the allocation belongs to the water draws alone (tools/rdc_cbbinds.py).
+  const uint64_t full = g_ssr_prev_full.load(), frame = g_frame.load();
+  if (full != 0 && full + 2 >= frame)
+    EditBoundConstants(cmd_list, shader_stage::pixel, 8, 1392, 4, [](float* v) {
+      if (!IsShare(v[2]) || !IsShare(v[3])) return false;
+      v[2] = v[3] = 1.0f;
+      return true;
+    });
+  if (!g_ssr_chain.load()) return;
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  device* const dev = cmd_list->get_device();
+  if (state == nullptr || state->render_targets.empty() || state->render_targets[0] == 0) return;
+  std::lock_guard resource_lock(g_resource_cache_mutex);
+  const resource target = dev->get_resource_from_view(state->render_targets[0]);
+  if (g_ssr_reflection.load() == 0 && IsReflectionTexture(dev, target)) g_ssr_reflection = target.handle;
+  if (target.handle != g_ssr_reflection.load() ||
+      BoundResource(cmd_list, shader_stage::pixel, 27).handle != g_ssr_linear.load()) {  // g_ConvertedDepthTexture
+    SsrMiss("a water reflection draw with other targets or depth");
+    return;
+  }
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  {
+    std::lock_guard lock(g_ssr_mutex);
+    if (!g_water_ssr.sized() ||
+        !RedirectShaderResource(cmd_list, shader_stage::pixel, 27, g_water_ssr.LinearDepthSrv())) {
+      SsrMiss("could not point a water reflection draw at the linear depth");
+      return;
+    }
+    const viewport vp = state->viewports.empty() ? viewport{0, 0, 0, 0, 0, 1} : state->viewports[0];
+    g_water_ssr.BeginWater(native, vp.min_depth, vp.max_depth);
+    draw(native);
+    g_water_ssr.EndWater(native);
+  }
+  RestoreTargets(cmd_list);
+  ++g_ssr_water;
+}
+
+// The reflection's mips: GXSsrTexDownScale (mip k of the reflection from k - 1), then GXSsrTexBlur2 from the reflection
+// into the blur texture and back, at mip k. Drawn into the add-on's textures instead of the engine's; true if so.
+template <typename Draw>
+bool SsrMipDraw(command_list* cmd_list, const CmdData& data, Draw draw) {
+  using Target = erdlss::WaterSsr::Target;
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  if (!g_ssr_chain.load() || state == nullptr || state->render_targets.empty() || state->render_targets[0] == 0)
+    return false;
+  device* const dev = cmd_list->get_device();
+  std::lock_guard resource_lock(g_resource_cache_mutex);
+  const uint32_t mip = dev->get_resource_view_desc(state->render_targets[0]).texture.first_level;
+  const resource target = dev->get_resource_from_view(state->render_targets[0]);
+  const resource source = BoundResource(cmd_list, shader_stage::pixel, 11);  // g_PrevFrameTexture
+  const bool blur_pass = data.pass == Pass::kSsrBlur;
+  if (!blur_pass && g_ssr_reflection.load() == 0 && target == source && IsReflectionTexture(dev, target))
+    g_ssr_reflection = target.handle;
+  const uint64_t reflection = g_ssr_reflection.load();
+  if (blur_pass && reflection != 0 && source.handle == reflection && target.handle != reflection &&
+      IsReflectionTexture(dev, target))
+    g_ssr_blur = target.handle;
+  const uint64_t blur = g_ssr_blur.load();
+  const auto which = [&](resource res, Target* out) {
+    if (res.handle == reflection && reflection != 0) *out = Target::kReflection;
+    else if (res.handle == blur && blur != 0) *out = Target::kBlur;
+    else return false;
+    return true;
+  };
+  Target to, from;
+  if (!which(target, &to) || !which(source, &from) || mip == 0 || mip >= erdlss::WaterSsr::kMips) {
+    SsrMiss("a reflection mip draw with unknown textures");
+    return false;
+  }
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  {
+    std::lock_guard lock(g_ssr_mutex);
+    if (!g_water_ssr.sized()) return false;
+    // cbMipGenerate (pixel b0): textureSize (byte 0), the engine's mip size; mipLvF (byte 20), the level read;
+    // blurOffsetAndWeights[5] (byte 96: UV offset .xy, weight .z) in UV of the engine's mip. The add-on's mips are
+    // larger: the same offsets in texels keep the blur as wide on the screen as at native, where the engine's mip is
+    // the whole screen.
+    if (blur_pass) {
+      float size[2];
+      if (!ReadBoundConstants(cmd_list, shader_stage::pixel, 0, 0, size, sizeof(size)) || size[0] < 1 ||
+          size[1] < 1) {
+        SsrMiss("the blur constants were not readable");
+        return false;
+      }
+      const float sx = size[0] / static_cast<float>(g_water_ssr.MipWidth(mip));
+      const float sy = size[1] / static_cast<float>(g_water_ssr.MipHeight(mip));
+      const auto scale = [sx, sy](float* v, int count) {
+        for (int i = 0; i < count; ++i) v[4 * i] *= sx, v[4 * i + 1] *= sy;
+        return true;
+      };
+      EditBoundConstants(cmd_list, shader_stage::pixel, 0, 96, 16, [&](float* v) { return scale(v, 4); });
+      EditBoundConstants(cmd_list, shader_stage::pixel, 0, 160, 4, [&](float* v) { return scale(v, 1); });
+    }
+    if (from == Target::kBlur)  // the add-on's blur texture has no top mip: its levels are the engine's mips - 1
+      EditBoundConstants(cmd_list, shader_stage::pixel, 0, 20, 1, [](float* v) {
+        v[0] -= 1.0f;
+        return true;
+      });
+    if (!RedirectShaderResource(cmd_list, shader_stage::pixel, 11, g_water_ssr.Srv(from)) ||
+        !g_water_ssr.BeginChain(native, to, mip)) {
+      SsrMiss("could not draw a reflection mip into the add-on's textures");
+      return false;
+    }
+    draw(native);
+    g_water_ssr.EndChain(native, to, mip);
+  }
+  RestoreTargets(cmd_list);
+  ++g_ssr_steps;
+  return true;
+}
+
+// The forward pass: the water's lighting reads the reflection (g_RLRTexture, t44) at the scene's share; from the
+// add-on's textures while their chain runs.
+void SsrLitDraw(command_list* cmd_list) {
+  const uint64_t reflection = g_ssr_reflection.load(), frame = g_frame.load(), chain = g_ssr_chain_frame.load();
+  if (reflection == 0 || !g_ssr_chain.load() || chain == 0 || chain + 2 < frame) return;
+  std::lock_guard resource_lock(g_resource_cache_mutex);
+  if (BoundResource(cmd_list, shader_stage::pixel, 44).handle != reflection) return;
+  std::lock_guard lock(g_ssr_mutex);
+  if (g_water_ssr.sized() && RedirectShaderResource(cmd_list, shader_stage::pixel, 44,
+                                                    g_water_ssr.Srv(erdlss::WaterSsr::Target::kReflection)))
+    ++g_ssr_lit;
+}
+
 // Work at the draws after the TAA: learning the buffers the stretch needs, the pass log, and the composite.
 void OnPostPass(command_list* cmd_list, CmdData& data) {
   if (g_passlog_frame.load() != 0) LogPass(cmd_list, data);
@@ -3551,6 +3873,11 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
   ProfileWork(cmd_list, *data, 1);
+  if (data->pass == Pass::kSsrWater && !data->post_fix)
+    SsrWaterDraw(cmd_list, [&](ID3D12GraphicsCommandList* native) {
+      native->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
+    });
+  if (data->pass == Pass::kForward && !data->post_fix) SsrLitDraw(cmd_list);
   DrawFix fix;
   if (data->post_fix) CorrectPostPass(cmd_list, *data, false, &fix);
   OnPostPass(cmd_list, *data);
@@ -3882,6 +4209,15 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     }
     return false;
   }
+  if (!data->post_fix) {
+    if (data->pass == Pass::kDepthHalf && SsrWanted()) NoteHalfDepth(cmd_list);
+    if (data->pass == Pass::kSsrConvert) StartSsrChain(cmd_list, *data);
+    if ((data->pass == Pass::kSsrDown || data->pass == Pass::kSsrBlur) &&
+        SsrMipDraw(cmd_list, *data, [&](ID3D12GraphicsCommandList* native) {
+          native->DrawInstanced(vertex_count, instance_count, first_vertex, first_instance);
+        }))
+      return true;
+  }
   if (data->pass == Pass::kTaa && vertex_count == 3 && instance_count == 1) {
     data->has_taa = true;
     if (g_passlog_frame.load() != 0) LogPass(cmd_list, *data);
@@ -4022,6 +4358,18 @@ void OnDestroyResource(device*, resource res) {
       w.res = 0;
       w.usage = 0;
     }
+  }
+  bool ssr = false;
+  for (auto* cached : {&g_ssr_reflection, &g_ssr_blur, &g_ssr_linear}) {
+    uint64_t expected = res.handle;
+    ssr |= cached->compare_exchange_strong(expected, 0);
+  }
+  if (ssr) g_ssr_chain = false;
+  {
+    std::lock_guard sources_lock(g_ssr_sources_mutex);
+    std::erase_if(g_ssr_depth_sources, [res](const auto& entry) {
+      return entry.first == res.handle || entry.second == res.handle;
+    });
   }
   if (invalidated) {
     g_rr_active = false;
@@ -5066,6 +5414,26 @@ void OnReshadePresent(effect_runtime* runtime) {
       SaveConfig();
     }
     result = g_reflex.SleepStatus();
+  } else if (command == "ssr") {  // "ssr" alone reports; "ssr on|off" switches (and saves)
+    if (!arg.empty()) {
+      g_config.water_reflections = arg == "on";
+      SaveConfig();
+    }
+    std::lock_guard lock(g_ssr_mutex);
+    char text[400];
+    std::snprintf(text, sizeof(text),
+                  "%s, %s; textures %ux%u, share %.1fx%.1f, %.0f MB; chains %llu, water draws %llu, mip draws %llu, "
+                  "lit draws %llu, misses %llu; previous frame whole: %s",
+                  g_config.water_reflections ? "on" : "off",
+                  g_ssr_failed ? g_water_ssr.status().c_str() : g_ssr_chain.load() ? "running" : "not running",
+                  g_water_ssr.width(), g_water_ssr.height(), g_water_ssr.share_width(), g_water_ssr.share_height(),
+                  static_cast<double>(g_water_ssr.bytes()) / 1048576.0,
+                  static_cast<unsigned long long>(g_ssr_chains.load()),
+                  static_cast<unsigned long long>(g_ssr_water.load()),
+                  static_cast<unsigned long long>(g_ssr_steps.load()), static_cast<unsigned long long>(g_ssr_lit.load()),
+                  static_cast<unsigned long long>(g_ssr_misses.load()),
+                  g_ssr_prev_full.load() + 2 >= g_frame.load() && g_ssr_prev_full.load() != 0 ? "yes" : "no");
+    result = text;
   } else if (command == "reflexlat") {  // the frame timeline; "reflexlat markers on|off" also marks with Reflex off
     if (arg == "markers") g_reflex.set_markers(arg2 == "on");
     result = g_reflex.Timeline();
@@ -5367,6 +5735,23 @@ void OnOverlay(effect_runtime*) {
     ImGui::Text("  rendering %ux%u of %ux%u", g_input_width.load(), g_input_height.load(), g_render_width.load(),
                 g_render_height.load());
   if (g_render_scale_missing) ImGui::Text("  the engine's scale control was not found; rendering at full size");
+  if (ImGui::Checkbox("Native-size water reflections", &g_config.water_reflections)) SaveConfig();
+  ImGui::SetItemTooltip("Below a 100%% render scale the game traces the water's reflections at the render scale too: "
+                        "on a 4K screen at 50%% in 960x540 pixels instead of 1920x1080, which makes them coarse and "
+                        "noisy. This traces them at the size the game uses at 100%%, in buffers of the add-on's own "
+                        "(about 190 MB of video memory on a 4K screen at 50%%, less at higher render scales).");
+  if (g_config.water_reflections && SsrWanted()) {
+    std::unique_lock lock(g_ssr_mutex, std::try_to_lock);
+    if (lock.owns_lock()) {
+      if (g_ssr_failed)
+        ImGui::Text("  unavailable: %s", g_water_ssr.status().c_str());
+      else if (g_water_ssr.sized() && g_ssr_chain.load())
+        ImGui::Text("  tracing %ldx%ld (%.0f MB)", std::lround(g_water_ssr.share_width()),
+                    std::lround(g_water_ssr.share_height()), static_cast<double>(g_water_ssr.bytes()) / 1048576.0);
+      else
+        ImGui::TextUnformatted("  waiting for the game's water reflections");
+    }
+  }
   if (ImGui::Checkbox("Game sharpening on top of DLSS", &g_config.game_sharpening)) SaveConfig();
   ImGui::SetItemTooltip("The game's TAA sharpening filter. Off shows DLSS's output as is.");
   if (g_config.game_sharpening) {

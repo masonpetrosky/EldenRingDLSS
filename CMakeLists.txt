@@ -87,6 +87,8 @@ shader(kWindMergePs wind_merge.hlsl ps_5_0 PSMain)
 shader(kStretchVs stretch.hlsl vs_5_0 VSMain)
 shader(kStretchPsColor stretch.hlsl ps_5_0 PSColor)
 shader(kStretchPsDepth stretch.hlsl ps_5_0 PSDepth)
+shader(kWaterSsrVs water_ssr.hlsl vs_5_0 VSMain)
+shader(kWaterSsrPs water_ssr.hlsl ps_5_0 PSMain)
 shader(kRrGuidesVs rr_guides.hlsl vs_5_0 VSMain)
 shader(kRrGuidesPs rr_guides.hlsl ps_5_0 PSMain)
 shader(kAoUpscaleVs ao_upscale.hlsl vs_5_0 VSMain)
@@ -133,7 +135,7 @@ dxil_library(kRtRayGen rt_raygen.hlsl)
 configure_file(src/version.rc.in ${CMAKE_BINARY_DIR}/version.rc @ONLY)
 
 set(ERDLSS_RUNTIME_SOURCES src/descriptors.cpp src/dlss.cpp src/wind.cpp src/wind_port.cpp
-            src/tree_dump.cpp src/engine_resolution.cpp src/render_scale.cpp src/stretch.cpp src/taa_jitter.cpp src/rr_guides.cpp src/ao_upscale.cpp
+            src/tree_dump.cpp src/engine_resolution.cpp src/render_scale.cpp src/stretch.cpp src/water_ssr.cpp src/taa_jitter.cpp src/rr_guides.cpp src/ao_upscale.cpp
             src/hw_breakpoints.cpp src/drs_probe.cpp src/rt_pipeline.cpp src/skin_motion.cpp src/dred.cpp src/object_blur.cpp src/reflex.cpp src/gpu_profiler.cpp)
 add_library(EldenRingDLSS SHARED src/addon.cpp ${ERDLSS_RUNTIME_SOURCES} ${CMAKE_BINARY_DIR}/version.rc ${SHADER_HEADERS})
 target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui ${SHADER_DIR})
