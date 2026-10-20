@@ -854,3 +854,24 @@ present; with it, that wait moves into the sleep before the frame starts, and th
 in the queue. PresentMon's CPU-start-to-GPU-start stays the same because it counts from the previous present, before
 the sleep. Whether input gets 8 ms fresher depends on where the game reads it (not measured: an input hook would tell).
 The user switched it live and noticed an improvement with it on. Cost about 3% frame rate.
+
+## Water reflections at render scales below 1 (2026-10-19)
+
+User report at night by a river (50%, RR): a fire's reflection in the water "in the wrong place", and the water
+sparkled. Burst captures per mode at that spot (`capture` x8 per state): the orange blob and star-like sparkles were
+in the water at 50% (RR and SR alike), fewer at 67%, gone at 100% and with the game's TAA (the region's mean luma
+14.5 at 50%, 7.8 at 100%). The blob was the lit pillar left of the player, sampled at half its screen coordinates.
+
+The chain (`tools/rdc_flow.py` on `er117_trees_f2056.rdc`; the scale from `er117_scale67_f2898.rdc`, no add-on):
+- After the depth of field, `ScreenSpaceQuadScaleShader` / `SampleColor1` copies the frame (65090, full size) into a
+  half-size R11G11B10 texture (65092). At 67% the engine draws it into the scene's share (viewport 1286x724 of
+  1920x1080) and reads the source's share (`cbPostProcessCommon` `g_dynamicScreenPercentage` = 0.67 in the vertex
+  shader; the pixel shader has no constants).
+- The next frame, before the TAA, the water's SSR draws (`M[Water]*_FwdSsr`, `M[PlacidLake]_FwdSsr`) read it as
+  `g_PrevFrameTexture` with the scene's percentages, write the reflection into a half-size target, and
+  `GXSsrTexDownScale` / `GXSsrTexBlur2` blur it for the water's forward draw.
+- The add-on corrected `SampleColor1` like every pass after the TAA (full viewport, percentages 1), so the copy held
+  the whole view in the whole texture and the water read its top-left share: the top-left part of the screen.
+
+Fix: `SampleColor1` keeps the engine's viewport (the share) and only gets the percentages set to 1, so it reads the
+whole full-size frame into the share, the layout the water expects.

@@ -185,7 +185,7 @@ struct Config {
   int wind_capacity = 8;  // stream output: millions of streamed vertices per frame
   // Ported path: SpeedTree trees and shrubs through the stream-output path, with last frame's tree wind rebuilt on the
   // GPU (tree_wind.hlsl); WindTreeCapacity is its millions of streamed vertices per frame.
-  bool wind_trees = true;
+  bool wind_trees = false;
   // DLSS Ray Reconstruction instead of super resolution (docs/raytracing.md): it denoises the game's ray traced
   // shadows and AO itself (the game's denoiser passes its input through while RR runs) and upscales.
   std::atomic<bool> ray_reconstruction{false};
@@ -539,9 +539,9 @@ void Log(reshade::log::level level, const std::string& message) {
 }
 
 // Which ray generation shader the sun shadow dispatch runs (rt_pipeline.hpp): 0 the game's, 1 our port, 2 our port
-// plus the AO at the render size (PCG noise), 3 (default) the same with blue noise, 4 with blue noise animated over
+// plus the AO at the render size (PCG noise), 3 the same with blue noise, 4 (default) with blue noise animated over
 // frames. Ini RtShadowRayGen (read only), remote "rtgen".
-std::atomic<int> g_rt_shadow_raygen{3};
+std::atomic<int> g_rt_shadow_raygen{4};
 
 // Modes 2-4 (1 AO and 1 sun shadow ray per pixel at the render size, unless rtsamples says otherwise) replace the
 // game's ray generation only while Ray Reconstruction runs, which denoises them; otherwise the game's own shaders run.
@@ -626,14 +626,14 @@ void LoadConfig() {
   g_config.wind_capacity = std::max(1, std::min(ReadInt(L"WindCapacity", 8), 24));
   g_config.wind_mode = ReadInt(L"WindMode", 1) == 0 ? 0 : 1;
   g_config.wind_prepass = ReadInt(L"WindPrepass", 0) != 0;
-  g_config.wind_trees = ReadInt(L"WindTrees", 1) != 0;
+  g_config.wind_trees = ReadInt(L"WindTrees", 0) != 0;
   g_config.npc_motion = ReadInt(L"NpcMotion", 0) != 0;
   g_config.object_blur = ReadInt(L"ObjectBlur", 0) != 0;
   g_config.reflex = ReadInt(L"Reflex", 0) != 0;
   g_npc_stage = std::clamp(ReadInt(L"NpcStage", 3), 1, 3);
   g_config.dred = ReadInt(L"Dred", 0) != 0;
   g_config.ray_reconstruction = ReadInt(L"RayReconstruction", 0) != 0;
-  g_rt_shadow_raygen = std::clamp(ReadInt(L"RtShadowRayGen", 3), 0, 4);
+  g_rt_shadow_raygen = std::clamp(ReadInt(L"RtShadowRayGen", 4), 0, 4);
   g_config.wind_tree_capacity = std::max(1, std::min(ReadInt(L"WindTreeCapacity", 4), 16));
   g_config.flip_jitter_x = ReadInt(L"FlipJitterX", 0) != 0;
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
@@ -1380,9 +1380,13 @@ void CorrectPostPassImpl(command_list* cmd_list, CmdData& data, bool compute, Dr
   const float sx = data.post_scale[0], sy = data.post_scale[1];
   const float out_w = static_cast<float>(data.out_width), out_h = static_cast<float>(data.out_height);
 
-  // The viewport: the scene's share of the target becomes the whole target.
+  // The viewport: the scene's share of the target becomes the whole target. Except for the water's screen-space
+  // reflection source (SampleColor1 after the depth of field: a half-size copy of the frame that the next frame's
+  // M[Water]*_FwdSsr draws read as g_PrevFrameTexture before the TAA, in the scene's share like everything there):
+  // it keeps the share and only reads the whole full-size frame (cbPostProcessCommon below). Filled whole, the water
+  // reflected the top-left part of the screen (a lit pillar, the stars) at render scales below 1.
   float old_vp[2] = {0, 0}, new_vp[2] = {0, 0};
-  if (!state->viewports.empty()) {
+  if (!state->viewports.empty() && name != "SampleColor1") {
     const viewport vp = state->viewports[0];
     resource target = {0};
     if (!state->render_targets.empty() && state->render_targets[0] != 0)
@@ -5322,6 +5326,8 @@ void OnOverlay(effect_runtime*) {
     else if (OurAoActive())
       state = "  running, with the add-on's rays";
     ImGui::TextUnformatted(state);
+  } else if (g_config.enabled && g_dlss.rr_available() && RayTracingActive()) {
+    ImGui::TextUnformatted("  recommended: the game's ray tracing is on");
   }
 
   // NVIDIA's default depends on the mode the render scale maps to.
@@ -5381,8 +5387,8 @@ void OnOverlay(effect_runtime*) {
   if (g_config.wind_motion && g_config.wind_mode == 1) {
     ImGui::Indent();
     if (ImGui::Checkbox("Tree motion vectors", &g_config.wind_trees)) SaveConfig();
-    ImGui::SetItemTooltip("Also gives SpeedTree trees and shrubs motion vectors. Costs about 1 ms more at 4K at a "
-                          "forest edge, and about %d MB of video memory.",
+    ImGui::SetItemTooltip("Also gives SpeedTree trees and shrubs motion vectors. Costs about 2 ms more at 4K with "
+                          "trees in view, and about %d MB of video memory.",
                           g_config.wind_tree_capacity * 32 + 13);
     ImGui::Unindent();
   }

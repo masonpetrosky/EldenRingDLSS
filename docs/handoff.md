@@ -15,7 +15,7 @@ for picking up.
 | 3. Upscaling (render below native, DLSS upscales) | Works; in the everyday install at 50% with preset M |
 | Ray tracing cost (distance-based BLAS refits) | Done, in the everyday install (halves the RT cost on Maximum) |
 | DLSS Ray Reconstruction | Everyday and dev installs (2026-10-11); with our own ray generation shaders (below) |
-| Own ray generation shaders (render-size AO, 1 ray, blue noise) | Everyday and dev installs (`RtShadowRayGen=3`) |
+| Own ray generation shaders (render-size AO, 1 ray, blue noise) | Everyday and dev installs (`RtShadowRayGen=3`); 0.2.0 defaults to 4 (temporal) |
 | 4. Release | v0.1.0 on GitHub (release zip) and Nexus Mods (2026-10-11) |
 | Motion vectors for enemies and animals | Everyday and dev installs (`NpcMotion=1`), +0.2-0.3 ms (2026-10-11) |
 | Tree motion vectors at 50% | Were lost from 2026-10-10 (resolve viewport); fixed, everyday install updated |
@@ -181,8 +181,9 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 - With RR (modes 2-4): 1 AO ray per pixel at the render size into the shadow output's unused 4th channel, copied
   after the dispatch and drawn into the game's AO target (`ao_upscale.hlsl` PSFull); the game's half-size AO dispatch
   is skipped; 1 sun shadow ray per pixel instead of 2. Cheaper than the game's path (about 1.6 ms at 4K/50%).
-- The game's sin hash made a "mirage" wave in distant grass under RR; PCG or blue noise fixed it. Blue noise (mode
-  3) is the default; temporal blue noise (mode 4, a frame index written into `g_sceneCB`'s padding) looked the same.
+- The game's sin hash made a "mirage" wave in distant grass under RR; PCG or blue noise fixed it. Temporal blue
+  noise (mode 4, a frame index written into `g_sceneCB`'s padding) is the default since 2026-10-19, the user's pick
+  ("it looks great"); plain blue noise (mode 3) looked the same in a live A/B.
 - Noise the user still sees in grass at 50% is the upscale, not the ray tracing (it stays with the game's AO, with
   the shadow denoiser on and with RR off; calmer at 67% and DLAA). The user keeps 50% for the frame rate (50% 58,
   58% 49, 67% 46 fps at that spot with RR).

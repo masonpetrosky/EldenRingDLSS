@@ -308,13 +308,13 @@ shaders share local root signature 6723 (`l_rayGenCB` b16, normal t67, depth t68
   `tools/blue_noise.py`; DXIL keeps it a global constant, no per-thread copy). Per frame and stream the tiles get a
   random toroidal shift and a random value rotation (Cranley-Patterson) from `frameRandom`, so every frame is
   spatially blue and frames differ. Same cost as PCG (12.68 ms both). User, switching live: "not a big difference
-  but I think blue is a little less noisy". Dev install default: `RtShadowRayGen=3`; the add-on's default since
-  0.2.0, when modes 2-4 also stopped routing the shadow dispatch through the port without RR (the game's own shaders
+  but I think blue is a little less noisy". Dev install default: `RtShadowRayGen=3`; the add-on's default in
+  0.2.0 until mode 4 replaced it (below). Since 0.2.0 modes 2-4 also stopped routing the shadow dispatch through the port without RR (the game's own shaders
   run then).
 - Temporal blue noise (`rtgen 4`, `ErdlssShadowAoTemporalRayGen`): the add-on writes the frame number into
   `g_sceneCB`'s padding after `frameRandom` (`padd4`, byte 244) at the shadow dispatch; each pixel steps its
   blue-noise value along the R2 sequence (fixed point, exact for any frame). Same cost; the user saw no difference
-  from mode 3 ("they look the same"). Kept as an option; mode 3 stays the default.
+  from mode 3 ("they look the same"). The add-on's default since 2026-10-19 (0.2.0): the user picked it, as in the FF7 Rebirth SSGI work.
 - A spot the user found noisy at 50% stayed noisy with the game's AO (`rtgen 0`), with the game's shadow denoiser
   back on (`rrraw none`) and with RR off (DLSS SR, preset M): not the ray traced signals. Calmer at full size
   (DLAA) and mostly calmer at 67%: the 50% upscale of fine grass. Cost there (RR, ray tracing Maximum): 50% 58.2

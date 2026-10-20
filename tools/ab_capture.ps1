@@ -31,12 +31,18 @@
 # the game's denoisers, Ray Reconstruction with the add-on's rays and with the game's rays, and the game's TAA at full
 # size; each a screenshot and a 5 s frame-time log, the DLSS ones also a 30-frame GPU profile. Then back to the ini's
 # RayReconstruction and RtShadowRayGen; ends at 0.50.
+# -Round vanilla: the unmodified game for the README's tables: the game's TAA at full size with the add-on's motion
+# vectors, object blur and Reflex off, chromatic aberration on and the game's refit schedule (every structure every
+# frame); a screenshot and a 5 s frame-time log. Then back to the ini's settings and the default schedule; ends at
+# 0.50 with DLSS on.
+# -Round mvcost: what the add-on's motion vectors cost at the current DLSS settings: 5 s frame-time logs with
+# everything on, tree motion off, wind (grass and trees) off, and wind and NPC motion off; then back to the ini.
 # -Round rtfoliage: GPU profiles and screenshots of our rays with and without the foliage alpha test, shorter AO rays
 # and nearer opaque shadows (see the round); restores the defaults.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
                'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe', 'upscale',
-               'showcase', 'showcasert', 'rrshow', 'rtfoliage')][string]$Round = 'sharpen',
+               'showcase', 'showcasert', 'rrshow', 'vanilla', 'mvcost', 'rtfoliage')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\Tools\PresentMon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -269,6 +275,29 @@ if ($Round -eq 'sharpen') {
   Send "rtgen $rtgen"; Send "rr $rr"
   Send 'scale 1' 5.0; Send 'dlss off' 2.0; Send 'capture rr_taa'; LogFrames 'rr_taa'
   Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'
+} elseif ($Round -eq 'vanilla') {
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $state = @{}
+  foreach ($key in 'WindMotion', 'NpcMotion', 'ObjectBlur', 'Reflex', 'ChromaticAberration') {
+    $state[$key] = if ($ini -match "^$key=0") { 'off' } else { 'on' }
+  }
+  Send 'dlss on'; Send 'scale 1' 5.0; Send 'dlss off'; Send 'wind off'; Send 'npc off'; Send 'objblur off'
+  Send 'reflex off'; Send 'ca on'; Send 'rtdist 0'; Send 'rtrefit 1' 3.0
+  Send 'capture vanilla'; LogFrames 'vanilla'
+  Send 'rtdist 20 50'; Send 'rtrefit 2'; Send "wind $($state.WindMotion)"; Send "npc $($state.NpcMotion)"
+  Send "objblur $($state.ObjectBlur)"; Send "reflex $($state.Reflex)"; Send "ca $($state.ChromaticAberration)"
+  Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'
+} elseif ($Round -eq 'mvcost') {
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $wind = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
+  $trees = if ($ini -match '^WindTrees=0') { 'off' } else { 'on' }
+  $npc = if ($ini -match '^NpcMotion=1') { 'on' } else { 'off' }
+  Send 'dlss on'; Send 'wind on'; Send 'windtrees on'; Send 'npc on' 3.0; LogFrames 'mv_all'
+  Send 'windtrees off' 2.0; LogFrames 'mv_notrees'
+  Send 'wind off' 2.0; LogFrames 'mv_nowind'
+  Send 'npc off' 2.0; LogFrames 'mv_none'
+  Send 'wind on'; Send 'windtrees on'; Send 'npc on' 3.0; LogFrames 'mv_all2'
+  Send "windtrees $trees"; Send "wind $wind"; Send "npc $npc"
 } elseif ($Round -eq 'rtfoliage') {
   # The cost of alpha-tested foliage in our rays: a 30-frame GPU profile and a screenshot per setting (the game's;
   # AO, shadow or both rays without the alpha test; AO rays at 1/2 and 1/4 of the game's length; shadows opaque

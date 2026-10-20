@@ -1,10 +1,10 @@
 """Compose a labeled comparison sheet from add-on screenshots: one column per shot, one row per crop, pixels 1:1.
 
 usage: compare_crops.py <shots dir> <out.jpg> --col <name> <title> <subtitle> [--col ...] --crop x y w h
-                        [--crop ...] [--pq] [--quality N]
+                        [--crop ...] [--zoom N] [--pq] [--quality N]
 Columns are shots (shots/<name>.bin + .txt, as tools/shots.py reads them); rows are crop rectangles in the shots'
-pixels, all the same size. --pq decodes HDR captures the add-on tagged as sRGB (see shots.load). Prints the
-sharpness and fine-noise figures of tools/shots.py per tile.
+pixels, all the same size, shown 1:1 or enlarged N times without filtering (--zoom). --pq decodes HDR captures the
+add-on tagged as sRGB (see shots.load). Prints the sharpness and fine-noise figures of tools/shots.py per tile.
 """
 import os
 import sys
@@ -29,7 +29,7 @@ def font(name, size):
 def main():
     args = sys.argv[1:]
     shots_dir, out = args[0], args[1]
-    cols, crops, space, quality = [], [], None, 90
+    cols, crops, space, quality, zoom = [], [], None, 90, 1
     i = 2
     while i < len(args):
         if args[i] == "--col":
@@ -41,6 +41,9 @@ def main():
         elif args[i] == "--pq":
             space = shots.HDR10_PQ
             i += 1
+        elif args[i] == "--zoom":
+            zoom = int(args[i + 1])
+            i += 2
         elif args[i] == "--quality":
             quality = int(args[i + 1])
             i += 2
@@ -48,7 +51,7 @@ def main():
             sys.exit("unknown argument " + args[i])
     if not cols or not crops or len({(w, h) for _, _, w, h in crops}) != 1:
         sys.exit(__doc__)
-    cw, ch = crops[0][2:]
+    cw, ch = crops[0][2] * zoom, crops[0][3] * zoom
     sheet = Image.new("RGB", (len(cols) * cw + (len(cols) - 1) * GAP, HEADER + len(crops) * ch + (len(crops) - 1) * GAP),
                       BACKGROUND)
     draw = ImageDraw.Draw(sheet)
@@ -63,7 +66,8 @@ def main():
             sharp, noise = shots.metrics(part)
             print("%-16s crop %d: sharpness %6.2f  fine noise %7.2f  brightness %4.1f" % (
                 name, r, sharp, noise, part.mean() * 100))
-            sheet.paste(Image.fromarray((part * 255 + 0.5).astype(np.uint8)), (x0, HEADER + r * (ch + GAP)))
+            tile = Image.fromarray((part * 255 + 0.5).astype(np.uint8)).resize((cw, ch), Image.NEAREST)
+            sheet.paste(tile, (x0, HEADER + r * (ch + GAP)))
     sheet.save(out, quality=quality, subsampling=0)
     print("wrote", out, sheet.size)
 

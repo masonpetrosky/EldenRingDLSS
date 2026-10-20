@@ -5,6 +5,8 @@
 Fixes:
 - Upscaling only lasted until the first loading screen: after fast travel, death or any other loading screen, 0.1.0
   fell back to native resolution with the game's TAA until the game was restarted.
+- Water reflected the wrong part of the screen while upscaling (render scale below 1): the reflections came from the
+  top-left of the view, so a fire or the stars could shine in the water far from where they are.
 - Tree motion vectors were missing while upscaling (render scale below 1).
 - With ray tracing on, leaf shadows near the player could pop: the add-on's refit schedule now follows each group's
   animation.
@@ -23,10 +25,15 @@ New:
 - NVIDIA Reflex low-latency mode (`Reflex`, experimental, off).
 - Ray Reconstruction in the overlay: a checkbox, with a line that says whether it runs or what it waits for (DLSS,
   the game's ray tracing).
-- Under Ray Reconstruction the add-on now traces the ambient occlusion and sun shadows itself (`RtShadowRayGen=3`, the
-  new default): one ray each per pixel at the render size with blue noise, where the game traces AO at a quarter of
-  the pixels. Sharper contact shadows in grass, no wave pattern in distant grass (the game's random numbers made one
-  that its denoisers had hidden), and cheaper. Without Ray Reconstruction the game's own rays run, as before.
+- Under Ray Reconstruction the add-on now traces the ambient occlusion and sun shadows itself (`RtShadowRayGen=4`, the
+  new default): one ray each per pixel at the render size with temporal blue noise, where the game traces AO at a
+  quarter of the pixels. Sharper contact shadows in grass, no wave pattern in distant grass (the game's random
+  numbers made one that its denoisers had hidden), and cheaper. Without Ray Reconstruction the game's own rays run,
+  as before.
+
+Changed:
+- Tree motion vectors are off by default (`WindTrees=0`, a checkbox in the overlay): they cost about 2 ms at 4K with
+  trees in view. Turn them on if swaying canopies smear. Grass and bushes keep theirs.
 
 ## 0.1.0 (2026-10-11)
 

@@ -47,7 +47,8 @@ measurements.
 - **Correct jitter**: a longer jitter cycle while upscaling (the game cycles 8 positions), taken from the TAA
   filter's own counter (the scene constants are sometimes a frame stale, which presets M and L show as judder).
 - **Motion vectors for wind-animated vegetation** (grass, bushes, SpeedTree trees), which the game does not write and
-  DLSS therefore smears: a port of the game's grass wind shader and a stream-output replay of the tree shaders.
+  DLSS therefore smears: a port of the game's grass wind shader and a stream-output replay of the tree shaders. The
+  trees are off by default (`WindTrees=1` or the overlay turns them on, about 2 ms at 4K with trees in view).
 - **Motion vectors for enemies, NPCs and animals**: the game only draws velocity for the player's character. The
   add-on replays the other skinned characters' G-buffer draws with last frame's bones, matched per mesh part.
 - **Object-only motion blur** (optional): with the game's Motion Blur on, enemies, animals and swings blur, camera
@@ -60,9 +61,9 @@ measurements.
   replaces the game's denoisers, which blur the sun shadows of grass and leaves and ghost under trees. The add-on
   draws RR's guide buffers (world normals, roughness, diffuse and specular albedo) from the game's G-buffer and
   passes the ray traced signals in raw. See [Ray tracing](#ray-tracing).
-- **Its own rays under Ray Reconstruction** (`RtShadowRayGen=3`, the default): a ray generation shader added to the
+- **Its own rays under Ray Reconstruction** (`RtShadowRayGen=4`, the default): a ray generation shader added to the
   game's ray tracing pipeline traces ambient occlusion and the sun shadows with one ray each per pixel at the render
-  size, with blue noise. The game traces AO at a quarter of the pixels, and its random numbers form a wave pattern
+  size, with temporal blue noise (even over neighboring pixels and over frames). The game traces AO at a quarter of the pixels, and its random numbers form a wave pattern
   that its denoisers hid and RR showed in distant grass.
 - Removes the game's chromatic aberration (optional), texture LOD bias for the upscale, fixes for the heat
   distortion, sparks and grace flames at reduced render sizes.
@@ -79,7 +80,7 @@ changes three things:
   history, then two à-trous blurs at half size). It keeps the shadows of grass blades and leaves sharp and ghosts
   less under trees. Tick "Ray Reconstruction" in the overlay; it runs while the game's ray tracing is on.
 - **The add-on's own rays** under Ray Reconstruction: one AO ray and one sun shadow ray per pixel at the render size
-  with blue noise. On Maximum the game traces 4 AO rays per pixel at half size and 2 shadow rays per pixel; the same
+  with temporal blue noise. On Maximum the game traces 4 AO rays per pixel at half size and 2 shadow rays per pixel; the same
   number of AO rays spread over every pixel gives per-pixel contact shadows, and one shadow ray saved 1.4 ms with no
   visible difference.
 
@@ -151,12 +152,12 @@ documents each key.
 | `ChromaticAberration` | 1 | Keep the game's chromatic aberration (0 removes it). |
 | `WindMotion` | 0 | Motion vectors for wind-animated vegetation. |
 | `WindMode` | 1 | 1 = ported grass shader plus tree replay; 0 = stream output for everything. |
-| `WindTrees` | 1 | Include SpeedTree trees and shrubs (`WindTreeCapacity`, millions of vertices per frame). |
+| `WindTrees` | 0 | Include SpeedTree trees and shrubs, about 2 ms at 4K with trees in view (`WindTreeCapacity`: millions of vertices per frame). |
 | `NpcMotion` | 0 | Motion vectors for enemies, NPCs and animals. |
 | `ObjectBlur` | 0 | With the game's Motion Blur on, blur only moving objects, not camera turns. |
 | `Reflex` | 0 | NVIDIA Reflex low-latency mode (experimental). |
 | `RayReconstruction` | 0 | DLSS Ray Reconstruction while the game's ray tracing is on (overlay checkbox). |
-| `RtShadowRayGen` | 3 | Under Ray Reconstruction: 3 = the add-on's own AO and sun shadow rays (blue noise), 0 = the game's rays (1, 2 and 4 are development options). |
+| `RtShadowRayGen` | 4 | Under Ray Reconstruction: 4 = the add-on's own AO and sun shadow rays (temporal blue noise), 3 = the same with blue noise that does not spread over frames, 0 = the game's rays (1 and 2 are development options). |
 | `ToggleKey` | 120 | Virtual key code for the DLSS toggle (120 = F9; ignored while Alt, Ctrl or Shift is held). |
 
 `VegetationMask`, `WindPrepass`, `WindCapacity`, `FlipJitterX/Y`, `FlipMotion` and `UseDepthCopy` are development
@@ -206,7 +207,7 @@ hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale
 - Tested on one GPU, at 4K and in HDR. Some corrections depend on exact sizes (render sizes are rounded by the engine
   to 4 or 8 pixels).
 - Ray Reconstruction at 50-67% shows more shimmer in grass than at DLAA. It comes from the upscale (it stays with the
-  game's own rays and with RR off); the add-on's own rays (`RtShadowRayGen=3`, the default) remove the wave pattern
+  game's own rays and with RR off); the add-on's own rays (`RtShadowRayGen`, on by default) remove the wave pattern
   the game's noise made in distant grass under RR.
 - Every normal exit of the game ends in a harmless WER crash report (an allocator check at shutdown); it predates
   this add-on.
