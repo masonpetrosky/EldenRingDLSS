@@ -20,20 +20,32 @@ between shots). The game's TAA sharpens its output, which reads as crisper in a 
 in motion; DLSS drops that noise, and detail of 4 px and coarser is the same. `GameSharpening=1` puts the game's
 sharpening back on top of DLSS if you prefer that look.
 
-Frame rates at the same spot (RTX 5070 Ti, 3840x2160, HDR, Maximum settings with ray tracing on Maximum, frame cap
-removed; 5 s each with PresentMon, released add-on):
+Frame rates with the release settings (RTX 5070 Ti, 3840x2160, HDR, Maximum settings, frame cap removed; 5 s each
+with PresentMon; the add-on's default motion vectors: grass, bushes and characters, trees off):
 
-| | Render size | Average fps | 1% low | GPU time per frame |
+| Ray tracing Maximum, one spot at sunset | Render size | Average fps | 1% low | GPU time per frame |
 | --- | --- | --- | --- | --- |
-| Unmodified game (its TAA and ray tracing) | 3840x2160 | 41.7 | 40.0 | 23.9 ms |
-| Game TAA + the add-on's cheaper ray tracing | 3840x2160 | 48.4 | 45.5 | 20.6 ms |
-| DLAA | 3840x2160 | 45.3 | 43.1 | 22.1 ms |
-| DLSS Quality (67%) | 2572x1448 | 62.0 | 58.2 | 16.1 ms |
-| DLSS Performance (50%) | 1920x1080 | 69.8 | 64.3 | 14.3 ms |
+| Unmodified game (its TAA and ray tracing) | 3840x2160 | 40.2 | 38.1 | 24.8 ms |
+| Game TAA + the add-on (cheaper ray tracing, motion vectors) | 3840x2160 | 47.0 | 44.4 | 21.2 ms |
+| DLAA | 3840x2160 | 44.2 | 42.0 | 22.6 ms |
+| DLSS Quality (67%) | 2572x1448 | 58.8 | 55.0 | 17.0 ms |
+| DLSS Performance (50%) | 1920x1080 | 65.5 | 60.8 | 15.2 ms |
+| DLSS Performance + Ray Reconstruction | 1920x1080 | 60.6 | 56.8 | 16.5 ms |
 
-The ray tracing savings stay on with F9 (game TAA), so the first row was measured with the add-on's refit schedule
-switched off (remote `rtdist 0`, `rtrefit 1`); `tools/ab_capture.ps1 -Round showcase` and `showcasert` repeat the
-measurements.
+| Ray tracing off, another spot in daylight | Render size | Average fps | 1% low | GPU time per frame |
+| --- | --- | --- | --- | --- |
+| Unmodified game (its TAA) | 3840x2160 | 110.5 | 92.1 | 9.0 ms |
+| Game TAA + the add-on (motion vectors) | 3840x2160 | 98.2 | 87.4 | 10.1 ms |
+| DLAA | 3840x2160 | 85.3 | 78.3 | 11.7 ms |
+| DLSS Quality (67%) | 2572x1448 | 103.7 | 84.3 | 9.6 ms |
+| DLSS Performance (50%) | 1920x1080 | 107.7 | 97.3 | 9.2 ms |
+
+"Unmodified game" is the game's TAA with every part of the add-on switched off (remote `rtdist 0`, `rtrefit 1`, no
+motion vectors; `tools/ab_capture.ps1 -Round vanilla`); the other rows are `-Round showcase` (`tools/frames.py`
+summarizes the logs). With ray tracing off a 4K frame is already cheap on this card, and the DLSS model plus the
+motion vectors cost about what the lower render size saves. The motion vectors cost about 0.5-0.7 ms for grass and
+bushes and 0.3-0.4 ms for characters at 4K and 50%; tree motion vectors (off by default) about 2 ms
+(`-Round mvcost`). Presets at 50% with ray tracing on (another spot): E 78.1 fps, K 73.3, M 70.5, L 67.6.
 
 ## Features
 
@@ -74,8 +86,8 @@ ELDEN RING ray traces sun shadows and ambient occlusion (Ray Tracing Quality in 
 changes three things:
 
 - **Cheaper acceleration structures**: the game re-animates and refits about 200 bottom-level structures every
-  frame. The add-on refits distant vegetation every 2nd or 4th frame, which took 3.3 ms off a 23.9 ms frame on
-  Maximum (the first two rows of the table above).
+  frame. The add-on refits distant vegetation every 2nd or 4th frame, which with the game's TAA took the frame on
+  Maximum from 24.8 to 21.2 ms, the motion vectors' cost included (the first two rows of the table above).
 - **DLSS Ray Reconstruction** replaces the game's shadow and AO denoisers (a temporal filter with about 10 frames of
   history, then two à-trous blurs at half size). It keeps the shadows of grass blades and leaves sharp and ghosts
   less under trees. Tick "Ray Reconstruction" in the overlay; it runs while the game's ray tracing is on.
@@ -209,6 +221,8 @@ hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale
 - Ray Reconstruction at 50-67% shows more shimmer in grass than at DLAA. It comes from the upscale (it stays with the
   game's own rays and with RR off); the add-on's own rays (`RtShadowRayGen`, on by default) remove the wave pattern
   the game's noise made in distant grass under RR.
+- Water reflections are coarse at render scales below 1: the game computes its screen-space reflections at half
+  the render size, so at 50% they are much rougher than at native resolution with the game's TAA. A fix is planned.
 - Every normal exit of the game ends in a harmless WER crash report (an allocator check at shutdown); it predates
   this add-on.
 

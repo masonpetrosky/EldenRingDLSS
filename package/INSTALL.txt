@@ -38,7 +38,8 @@ Using it
   motion vectors, ...). They are saved to EldenRingDLSS\EldenRingDLSS.ini, which documents each one.
 - Upscaling: set RenderScale (0.67 Quality, 0.58 Balanced, 0.50 Performance) and restart the game. It is tested at
   4K; other output resolutions may show problems in some post-processing effects.
-- Ray tracing: with the game's Ray Tracing Quality on (graphics settings), tick "Ray Reconstruction" in the overlay.
+- Ray tracing: if you play with it, use Ray Reconstruction; it looks far better than the game's own denoisers. With
+  the game's Ray Tracing Quality on (graphics settings), tick "Ray Reconstruction" in the overlay.
   DLSS Ray Reconstruction then replaces the game's ray tracing denoisers (sharper shadows of grass and leaves, less
   ghosting under trees), and the add-on traces the sun shadows and ambient occlusion itself. Best with upscaling: at
   4K on an RTX 5070 Ti it takes about 4 ms at RenderScale 0.50 and 12 ms at 1.00.
@@ -71,6 +72,8 @@ Known limitations
 - Tested on one machine: RTX 5070 Ti, 4K, HDR. Game updates can break it (it then falls back and logs it).
 - With Ray Reconstruction, fine grass shimmers more at low render scales (from the upscale, not the ray tracing);
   0.67 is calmer than 0.50.
+- Water reflections are coarse at render scales below 1.00: the game computes them at half the render size, so at
+  0.50 they are much rougher than at native resolution. A fix is planned.
 - Every normal exit of the game ends in a crash report (a check at shutdown); it predates the add-on and is
   harmless.
 

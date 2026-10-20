@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0
+## 0.2.0 (2026-10-19)
 
 Fixes:
 - Upscaling only lasted until the first loading screen: after fast travel, death or any other loading screen, 0.1.0
