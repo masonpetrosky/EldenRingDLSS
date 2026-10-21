@@ -3,10 +3,10 @@
 // skinned G-buffer draw that the game gives no velocity draw, this writes a previous-pose copy of the draw's bone
 // window (cbObjMatrix) with each character's bones from last frame (skin_motion.hlsl); the wind module's stream
 // output (wind.hpp) then replays the game's vertex shader with it and with last frame's camera, and its resolve at the
-// TAA writes the difference into the motion texture. The patches run in a command list of their own just before the
-// game's list is executed: in the middle of the G-buffer pass, each patch's barriers stalled the GPU (1.8 ms for 80
-// draws). There, all lookups run together and one pass per bone window writes the previous poses: with a barrier after
-// each patch, 300 draws at a castle courtyard took 5.3 ms.
+// TAA writes the difference into the motion texture. The patches run in a command list of the add-on's just before
+// the game's list is executed (pre_lists.hpp): in the middle of the G-buffer pass, each patch's barriers stalled the
+// GPU (1.8 ms for 80 draws). There, all lookups run together and one pass per bone window writes the previous poses:
+// with a barrier after each patch, 300 draws at a castle courtyard took 5.3 ms.
 // SPDX-License-Identifier: MIT
 
 #pragma once
@@ -20,6 +20,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "pre_lists.hpp"
+
 namespace erdlss {
 
 class SkinMotion {
@@ -32,7 +34,7 @@ class SkinMotion {
   // Unique scope for one command-list recording. Lists can be recorded and submitted in different orders.
   uint64_t BeginList() { return next_scope_.fetch_add(1); }
 
-  // A skinned draw's previous-pose patch, planned at the draw and run before its command list (SubmitJobs).
+  // A skinned draw's previous-pose patch, planned at the draw and run before its command list (RecordJobs).
   struct Job {
     D3D12_GPU_VIRTUAL_ADDRESS bones = 0, instances = 0, idx_param = 0, index_buffer = 0;
     D3D12_GPU_VIRTUAL_ADDRESS prev = 0;  // the previous-pose window: bind it as cbObjMatrix for the previous pose
@@ -46,9 +48,9 @@ class SkinMotion {
   bool PrepareJob(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t bones_size, D3D12_GPU_VIRTUAL_ADDRESS instances,
                   uint32_t instances_size, D3D12_GPU_VIRTUAL_ADDRESS idx_param, D3D12_GPU_VIRTUAL_ADDRESS index_buffer,
                   uint64_t index_size, uint32_t instance_count, uint32_t part, uint64_t frame, uint64_t scope, Job* job);
-  // Runs `jobs` on `queue` (a direct queue) in a command list of the add-on's own; call right before the command
-  // list that drew them is executed there.
-  bool SubmitJobs(ID3D12CommandQueue* queue, const std::vector<Job>& jobs);
+  // Records `jobs` into `cmd`, a PreLists list (`slot` its index) that runs right before the command list that drew
+  // them. Leaves its compute root signature and pipeline bound.
+  bool RecordJobs(ID3D12GraphicsCommandList* cmd, int slot, const std::vector<Job>& jobs);
   // Counts a frame on the GPU (once per frame at the TAA, after the last NPC draw) and copies the statistics for
   // Stats(). Leaves its compute root signature and pipeline bound.
   void RecordFrameEnd(ID3D12GraphicsCommandList* cmd);
@@ -85,21 +87,8 @@ class SkinMotion {
   };
   bool WindowFor(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t size, uint64_t frame, uint64_t scope, Window* out);
 
-  // The add-on's command lists for the patches, reused once the GPU is done with them (fence values). Each has its
-  // own part of the lookup results.
-  static constexpr int kLists = 16;
+  // Lookup results per PreLists slot: a slot's part stays its recording's until the GPU is done with it.
   static constexpr uint32_t kResultsPerList = 4096;
-  struct Submission {
-    ID3D12CommandAllocator* allocator = nullptr;
-    ID3D12GraphicsCommandList* list = nullptr;
-    uint64_t done = 0;
-  };
-  std::mutex submit_mutex_;
-  Submission lists_[kLists];
-  int next_list_ = 0;
-  ID3D12Fence* fence_ = nullptr;
-  uint64_t fence_value_ = 0;
-  void* event_ = nullptr;
 
   ID3D12Device* device_ = nullptr;
   std::string status_ = "off";

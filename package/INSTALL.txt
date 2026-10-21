@@ -59,8 +59,8 @@ Not getting more frames?
   upscale: RenderScale 0.67, 0.58 or 0.50.
 - If your CPU is the limit (common at 1440p and below), a lower render resolution cannot help much.
 - Presets M and L cost more than K, much more on RTX 20 and 30 cards; preset E (Preset=5) costs about half of K.
-- The motion vectors for swaying grass cost about 1 ms at 4K in dense grass. Trees are off by default (about 2 ms more
-  at 4K with trees in view); WindTrees=1 or the overlay turns them on.
+- The motion vectors for swaying grass cost about 1 ms at 4K in dense grass. Trees are off by default (about 0.5 ms
+  more in a forest at 4K and 50%); WindTrees=1 or the overlay turns them on.
 
 Troubleshooting
 ---------------

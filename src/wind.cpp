@@ -8,6 +8,7 @@
 #include <climits>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 #include "d3d12_util.hpp"
 #include "dred.hpp"
@@ -18,6 +19,7 @@
 #include "kTreeWindAdvanceCs.h"
 #include "kTreeWindClearCs.h"
 #include "kTreeWindPatchCs.h"
+#include "kTreeWindVerifyCs.h"
 
 namespace erdlss {
 namespace {
@@ -31,7 +33,12 @@ constexpr D3D12_RESOURCE_STATES kShaderResource =
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr uint32_t kTreeSlots = 8192;  // trees per wind table (a power of two); one table per frame parity
 constexpr uint64_t kTreeTableSize = 256 + 2ull * kTreeSlots * (32 + 272);
-constexpr uint64_t kTreeRingSize = 8ull << 20;  // patched cbSpeedTreeWind copies
+// Patched cbSpeedTreeWind copies. The patches of a whole submission run before its lists read any copy, so the ring
+// must hold every copy of a submission (the game submits a frame's G-buffer lists together): about 0.2 MB per frame
+// in a Limgrave forest (2026-10-21).
+constexpr uint64_t kTreeRingSize = 8ull << 20;
+constexpr uint32_t kTreeCounts = 64;  // table header bytes read back: the frame counter and tree_wind.hlsl's Verify counts
+constexpr UINT kTreeArgCount = 6;     // tree_wind.hlsl's Args
 constexpr uint32_t kDebugVertices = 64;
 constexpr uint32_t kDebugFilled = 0, kDebugPrev = 256, kDebugCur = kDebugPrev + kDebugVertices * 16,
                    kDebugSlot = kDebugCur + kDebugVertices * 16, kDebugSize = kDebugSlot + 4096;
@@ -81,7 +88,7 @@ bool WindMotion::Init(ID3D12Device* device, uint32_t capacity) {
   }
 
   // Tree wind: wind, instance data and index offset as root CBVs, the index buffer as a root SRV, the table and the
-  // output copy as root UAVs, then the instance count, shader and table mask as root constants.
+  // output copy as root UAVs, then the instance count, shader, table mask and window sizes as root constants.
   D3D12_ROOT_PARAMETER tree_params[7] = {};
   for (UINT i = 0; i < 3; ++i) {
     tree_params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -94,7 +101,7 @@ bool WindMotion::Init(ID3D12Device* device, uint32_t capacity) {
   tree_params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
   tree_params[5].Descriptor = {1, 0};
   tree_params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  tree_params[6].Constants = {3, 0, 3};
+  tree_params[6].Constants = {3, 0, kTreeArgCount};
   const D3D12_ROOT_SIGNATURE_DESC tree_desc = {7, tree_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
   tree_rs_ = CreateRootSignature(device, tree_desc);
   compute.pRootSignature = tree_rs_;
@@ -113,11 +120,17 @@ bool WindMotion::Init(ID3D12Device* device, uint32_t capacity) {
     status_ = "tree wind pipeline creation failed";
     return false;
   }
+  compute.CS = {kTreeWindVerifyCs, sizeof(kTreeWindVerifyCs)};
+  if (FAILED(device->CreateComputePipelineState(&compute, IID_PPV_ARGS(&tree_verify_pso_)))) {
+    status_ = "tree wind pipeline creation failed";
+    return false;
+  }
   tree_table_ = CreateBuffer(device, kTreeTableSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   tree_ring_ = CreateBuffer(device, kTreeRingSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-  if (tree_table_ == nullptr || tree_ring_ == nullptr) {
+  tree_counts_ = CreateBuffer(device, kTreeCounts, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (tree_table_ == nullptr || tree_ring_ == nullptr || tree_counts_ == nullptr) {
     status_ = "tree wind buffer creation failed";
     return false;
   }
@@ -210,6 +223,7 @@ void WindMotion::Shutdown() {
   Release(patch_pso_);
   Release(patch_rs_);
   Release(tree_patch_pso_);
+  Release(tree_verify_pso_);
   Release(tree_advance_pso_);
   Release(tree_clear_pso_);
   Release(tree_rs_);
@@ -219,6 +233,8 @@ void WindMotion::Shutdown() {
   Release(args_rs_);
   Release(tree_table_);
   Release(tree_ring_);
+  Release(tree_counts_);
+  tree_counts_copied_ = false;
   Release(srv_heap_);
   Release(rtv_heap_);
   Release(dsv_heap_);
@@ -452,17 +468,62 @@ D3D12_GPU_VIRTUAL_ADDRESS WindMotion::RecordPrevious(ID3D12GraphicsCommandList* 
   return slot;
 }
 
-D3D12_GPU_VIRTUAL_ADDRESS WindMotion::RecordTreeWind(ID3D12GraphicsCommandList* cmd, D3D12_GPU_VIRTUAL_ADDRESS wind,
-                                                     uint32_t wind_size, D3D12_GPU_VIRTUAL_ADDRESS instances,
-                                                     D3D12_GPU_VIRTUAL_ADDRESS idx_param,
-                                                     D3D12_GPU_VIRTUAL_ADDRESS index_buffer, uint32_t instance_count,
-                                                     uint32_t model, bool first_in_list) {
+bool WindMotion::PrepareTreeJob(D3D12_GPU_VIRTUAL_ADDRESS wind, uint32_t wind_size, D3D12_GPU_VIRTUAL_ADDRESS instances,
+                                uint32_t instances_size, D3D12_GPU_VIRTUAL_ADDRESS idx_param,
+                                D3D12_GPU_VIRTUAL_ADDRESS index_buffer, uint64_t index_size, uint32_t instance_count,
+                                uint32_t model, TreeJob* job) {
+  // Constant buffer views are 256-byte multiples of at most 64 KB.
   const uint64_t size = (static_cast<uint64_t>(wind_size) + 255) & ~255ull;
-  if (size == 0 || size > 65536) return 0;
+  const uint32_t instance_slots = std::min<uint32_t>(instances_size, 65536) / (13 * 16);
+  const uint32_t index_entries = static_cast<uint32_t>(std::min<uint64_t>(index_size / 4, UINT32_MAX));
+  if (size == 0 || size > 65536 || instance_count == 0 || instance_count > 65535 || instance_slots == 0 ||
+      index_entries == 0)
+    return false;
   uint64_t offset = tree_ring_next_.fetch_add(size);
   if (offset % kTreeRingSize + size > kTreeRingSize) offset = tree_ring_next_.fetch_add(size);  // skip the wrap
-  const D3D12_GPU_VIRTUAL_ADDRESS copy = tree_ring_->GetGPUVirtualAddress() + offset % kTreeRingSize;
+  job->wind = wind;
+  job->instances = instances;
+  job->idx_param = idx_param;
+  job->index_buffer = index_buffer;
+  job->copy = tree_ring_->GetGPUVirtualAddress() + offset % kTreeRingSize;
+  job->instance_count = instance_count;
+  job->model = model;
+  job->wind_entries = wind_size / (17 * 16);
+  job->instance_slots = instance_slots;
+  job->index_entries = index_entries;
+  return true;
+}
+
+void WindMotion::BindTreeJob(ID3D12GraphicsCommandList* cmd, const TreeJob& job) {
+  cmd->SetComputeRootConstantBufferView(0, job.wind);
+  cmd->SetComputeRootConstantBufferView(1, job.instances);
+  cmd->SetComputeRootConstantBufferView(2, job.idx_param);
+  cmd->SetComputeRootShaderResourceView(3, job.index_buffer);
+  cmd->SetComputeRootUnorderedAccessView(5, job.copy);
+  const uint32_t args[kTreeArgCount] = {job.instance_count, job.model,          kTreeSlots - 1,
+                                        job.wind_entries,   job.instance_slots, job.index_entries};
+  cmd->SetComputeRoot32BitConstants(6, kTreeArgCount, args, 0);
+}
+
+bool WindMotion::RecordTreeJobs(ID3D12GraphicsCommandList* cmd, const std::vector<TreeJob>& jobs) {
+  if (jobs.empty() || tree_patch_pso_ == nullptr) return false;
+  // The table and the ring start in the common state and are promoted to unordered access; after the submission they
+  // decay back, and the game's list reads the copies as constant buffers. A patch reads last frame's table, which
+  // nothing writes this frame, and adds to this frame's with atomics, so the patches need no barriers between them.
   Marker(cmd, L"ERDLSS tree wind");
+  cmd->SetComputeRootSignature(tree_rs_);
+  cmd->SetPipelineState(tree_patch_pso_);
+  cmd->SetComputeRootUnorderedAccessView(4, tree_table_->GetGPUVirtualAddress());
+  for (const TreeJob& job : jobs) {
+    BindTreeJob(cmd, job);
+    cmd->Dispatch((job.instance_count + 63) / 64, 1, 1);
+  }
+  tree_patches_ += jobs.size();
+  return true;
+}
+
+void WindMotion::RecordTreeWind(ID3D12GraphicsCommandList* cmd, const TreeJob& job, bool first_in_list, bool verify) {
+  Marker(cmd, verify ? L"ERDLSS tree verify" : L"ERDLSS tree wind (inline)");
   // Buffers start every command list in the common state and are promoted implicitly on their first use, so the ring
   // only needs to be taken out of the constant-buffer state after an earlier patch of the same list.
   if (!first_in_list) {
@@ -471,24 +532,17 @@ D3D12_GPU_VIRTUAL_ADDRESS WindMotion::RecordTreeWind(ID3D12GraphicsCommandList* 
     cmd->ResourceBarrier(1, &to);
   }
   cmd->SetComputeRootSignature(tree_rs_);
-  cmd->SetPipelineState(tree_patch_pso_);
-  cmd->SetComputeRootConstantBufferView(0, wind);
-  cmd->SetComputeRootConstantBufferView(1, instances);
-  cmd->SetComputeRootConstantBufferView(2, idx_param);
-  cmd->SetComputeRootShaderResourceView(3, index_buffer);
+  cmd->SetPipelineState(verify ? tree_verify_pso_ : tree_patch_pso_);
   cmd->SetComputeRootUnorderedAccessView(4, tree_table_->GetGPUVirtualAddress());
-  cmd->SetComputeRootUnorderedAccessView(5, copy);
-  const uint32_t args[3] = {instance_count, model, kTreeSlots - 1};
-  cmd->SetComputeRoot32BitConstants(6, 3, args, 0);
-  cmd->Dispatch((instance_count + 63) / 64, 1, 1);
+  BindTreeJob(cmd, job);
+  cmd->Dispatch((job.instance_count + 63) / 64, 1, 1);
   D3D12_RESOURCE_BARRIER after[2] = {};
   after[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;  // the next patch may see the same trees
   after[0].UAV.pResource = tree_table_;
   after[1] =
       Transition(tree_ring_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
   cmd->ResourceBarrier(2, after);
-  ++tree_patches_;
-  return copy;
+  if (!verify) ++tree_patches_;
 }
 
 void WindMotion::RecordFrameEnd(ID3D12GraphicsCommandList* cmd) {
@@ -499,14 +553,36 @@ void WindMotion::RecordFrameEnd(ID3D12GraphicsCommandList* cmd) {
   cmd->ResourceBarrier(1, &uav);
   cmd->SetComputeRootSignature(tree_rs_);
   cmd->SetComputeRootUnorderedAccessView(4, tree_table_->GetGPUVirtualAddress());
-  const uint32_t args[3] = {0, 0, kTreeSlots - 1};
-  cmd->SetComputeRoot32BitConstants(6, 3, args, 0);
+  const uint32_t args[kTreeArgCount] = {0, 0, kTreeSlots - 1};
+  cmd->SetComputeRoot32BitConstants(6, kTreeArgCount, args, 0);
   cmd->SetPipelineState(tree_clear_pso_);  // empty the next frame's table ...
   cmd->Dispatch(kTreeSlots / 64, 1, 1);
   cmd->ResourceBarrier(1, &uav);
   cmd->SetPipelineState(tree_advance_pso_);  // ... and move on to it
   cmd->Dispatch(1, 1, 1);
   cmd->ResourceBarrier(1, &uav);
+  if (tree_verify_.load()) {  // development: the frame counter and Verify's counts for TreeVerifyCounts
+    D3D12_RESOURCE_BARRIER copy =
+        Transition(tree_table_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmd->ResourceBarrier(1, &copy);
+    cmd->CopyBufferRegion(tree_counts_, 0, tree_table_, 0, kTreeCounts);
+    std::swap(copy.Transition.StateBefore, copy.Transition.StateAfter);
+    cmd->ResourceBarrier(1, &copy);
+    tree_counts_copied_ = true;
+  }
+}
+
+bool WindMotion::TreeVerifyCounts(uint32_t counts[7]) {
+  if (tree_counts_ == nullptr || !tree_counts_copied_.load()) return false;
+  void* mapped = nullptr;
+  const D3D12_RANGE all = {0, kTreeCounts};
+  if (FAILED(tree_counts_->Map(0, &all, &mapped)) || mapped == nullptr) return false;
+  const auto* const words = static_cast<const uint32_t*>(mapped);
+  counts[0] = words[0];
+  for (int i = 1; i < 7; ++i) counts[i] = words[3 + i];  // bytes 16-39
+  const D3D12_RANGE none = {0, 0};
+  tree_counts_->Unmap(0, &none);
+  return true;
 }
 
 void WindMotion::BindStreams(ID3D12GraphicsCommandList* cmd) {

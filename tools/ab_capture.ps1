@@ -43,12 +43,15 @@
 # shots\water; ends with DLSS at 0.50 and the ini's setting.
 # -Round perf: where the frame goes at a slow spot (see the round); restores the ini's settings.
 # -Round fg: frame generation off, 2x, 3x and 4x at the current spot (see the round); restores the ini's setting.
+# -Round treebatch: tree wind patches before their lists, inline, and trees off at the current spot (see the round).
+# -Round treecheck: checks the tree wind patches that run before their lists at their draws, and an A/B of both
+# placements in neighboring frames (see the round).
 # -Round rtfoliage: GPU profiles and screenshots of our rays with and without the foliage alpha test, shorter AO rays
 # and nearer opaque shadows (see the round); restores the defaults.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
                'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe', 'upscale',
-               'showcase', 'showcasert', 'rrshow', 'vanilla', 'mvcost', 'rtfoliage', 'water', 'perf', 'fg')][string]$Round = 'sharpen',
+               'showcase', 'showcasert', 'rrshow', 'vanilla', 'mvcost', 'rtfoliage', 'water', 'perf', 'fg', 'treebatch', 'treecheck')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\Tools\PresentMon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -378,6 +381,41 @@ if ($Round -eq 'sharpen') {
   Send 'ssr on' 1.5; Send 'ssr'; LogFrames 'water_on'; Send 'gpuprofile 30 water_on' 2.0; Burst 'on2'
   Send 'scale 1' 5.0; Send 'dlss off' 3.0; Send 'scale'; Burst 'taa'
   Send 'dlss on'; Send 'scale 0.5' 5.0; Send "ssr $restore"; Send 'scale'; Send 'ssr'
+} elseif ($Round -eq 'treebatch') {
+  # Tree wind patches before their command lists (treebatch on) against inline in the game's lists (off), and trees
+  # off: per mode the wind stats, an 8-frame motion dump (the vegetation's motion should match between the modes), a
+  # 5 s frame-time log and a 60-frame GPU profile. Frame generation off meanwhile. Summarize with tools\frames.py
+  # shots\tb_*.csv and tools\gpu_profile.py shots\gpuprofile_tb_on.csv --compare shots\gpuprofile_tb_off.csv.
+  # Restores the ini's settings.
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $trees = if ($ini -match '^WindTrees=1') { 'on' } else { 'off' }
+  $fg = ($ini | Where-Object { $_ -match '^FrameGeneration=' }) -replace '^FrameGeneration=', ''
+  if ($fg -and $fg -ne '0') { Send 'fg 0' 2.0 }
+  Send 'dlss on'; Send 'windtrees on' 3.0
+  foreach ($pass in @(('on', 'tb_on'), ('off', 'tb_off'), ('on', 'tb_on2'))) {
+    $mode, $name = $pass
+    Send "treebatch $mode" 3.0; Send 'windstats' 1.0; Send 'windstats'
+    Send "mv 8 $name" 1.0; LogFrames $name; Send "gpuprofile 60 $name" 3.0
+  }
+  Send 'windtrees off' 3.0; LogFrames 'tb_notrees'; Send 'gpuprofile 60 tb_notrees' 3.0
+  Send 'treebatch on'; Send "windtrees $trees"
+  if ($fg -and $fg -ne '0') { Send "fg $fg" }
+} elseif ($Round -eq 'treecheck') {
+  # Whether the tree wind patches that run before their command lists are still right at the draws: "treebatch
+  # verify" checks every patch at its draw (windstats: copies and entries that differ and trees not in the table
+  # should all be 0). Then "treebatch alternate" places the patches before their lists in odd frames and inline in
+  # even ones for two 16-frame motion dumps (tools\tree_alternate.py shots tc_alt1 tc_alt2: the canopy motion of both
+  # placements in neighboring frames). Frame generation off meanwhile. Restores the ini's settings.
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $trees = if ($ini -match '^WindTrees=1') { 'on' } else { 'off' }
+  $fg = ($ini | Where-Object { $_ -match '^FrameGeneration=' }) -replace '^FrameGeneration=', ''
+  if ($fg -and $fg -ne '0') { Send 'fg 0' 2.0 }
+  Send 'dlss on'; Send 'windtrees on' 3.0
+  Send 'treebatch verify' 2.0; Send 'windstats' 3.0; Send 'windstats' 3.0; Send 'windstats'
+  Send 'treebatch alternate' 2.0; Send 'windstats' 1.0; Send 'mv 16 tc_alt1' 1.0; Send 'mv 16 tc_alt2' 1.0
+  Send 'treebatch on' 2.0; Send 'windstats' 1.0; Send 'windstats'
+  Send "windtrees $trees"
+  if ($fg -and $fg -ne '0') { Send "fg $fg" }
 } elseif ($Round -eq 'treecost') {
   # Where the trees' cost goes: grass and trees with and without the resolve draw, grass only.
   Send 'dlss on'; Send 'wind on'; Send 'windtrees on' 3.0; LogFrames 'tc_trees'

@@ -104,6 +104,7 @@ shader(kTreeDumpCs tree_dump.hlsl cs_5_0 main)
 shader(kTreeWindPatchCs tree_wind.hlsl cs_5_0 Patch)
 shader(kTreeWindClearCs tree_wind.hlsl cs_5_0 Clear)
 shader(kTreeWindAdvanceCs tree_wind.hlsl cs_5_0 Advance)
+shader(kTreeWindVerifyCs tree_wind.hlsl cs_5_0 Verify)
 shader(kObjectBlurVs object_blur.hlsl vs_5_0 VSMain)
 shader(kObjectBlurPs object_blur.hlsl ps_5_0 PSMain)
 shader(kSkinMotionLookupCs skin_motion.hlsl cs_5_0 Lookup)
@@ -143,7 +144,7 @@ configure_file(src/version.rc.in ${CMAKE_BINARY_DIR}/version.rc @ONLY)
 
 set(ERDLSS_RUNTIME_SOURCES src/descriptors.cpp src/dlss.cpp src/wind.cpp src/wind_port.cpp
             src/tree_dump.cpp src/engine_resolution.cpp src/render_scale.cpp src/stretch.cpp src/water_ssr.cpp src/taa_jitter.cpp src/rr_guides.cpp src/ao_upscale.cpp
-            src/hw_breakpoints.cpp src/drs_probe.cpp src/rt_pipeline.cpp src/skin_motion.cpp src/dred.cpp src/object_blur.cpp src/reflex.cpp src/gpu_profiler.cpp src/frame_generation.cpp)
+            src/hw_breakpoints.cpp src/drs_probe.cpp src/rt_pipeline.cpp src/skin_motion.cpp src/dred.cpp src/object_blur.cpp src/reflex.cpp src/gpu_profiler.cpp src/frame_generation.cpp src/pre_lists.cpp)
 add_library(EldenRingDLSS SHARED src/addon.cpp ${ERDLSS_RUNTIME_SOURCES} ${CMAKE_BINARY_DIR}/version.rc ${SHADER_HEADERS})
 target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui ${SHADER_DIR})
 target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include ${NVAPI_DIR} ${STREAMLINE_DIR}/include)

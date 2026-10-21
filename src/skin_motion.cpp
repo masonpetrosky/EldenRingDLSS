@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
 #include "skin_motion.hpp"
-
-#include <windows.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -86,28 +82,11 @@ bool SkinMotion::Init(ID3D12Device* device) {
                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   prev_ = CreateBuffer(device, kRingSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-  results_ = CreateBuffer(device, uint64_t{kLists} * kResultsPerList * kResultSize, D3D12_HEAP_TYPE_DEFAULT,
+  results_ = CreateBuffer(device, uint64_t{PreLists::kLists} * kResultsPerList * kResultSize, D3D12_HEAP_TYPE_DEFAULT,
                           D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   readback_ = CreateBuffer(device, 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
   if (table_ == nullptr || store_ == nullptr || prev_ == nullptr || results_ == nullptr || readback_ == nullptr) {
     status_ = "buffer creation failed";
-    Shutdown();
-    return false;
-  }
-  for (Submission& sub : lists_) {
-    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&sub.allocator))) ||
-        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, sub.allocator, nullptr,
-                                         IID_PPV_ARGS(&sub.list))) ||
-        FAILED(sub.list->Close())) {
-      status_ = "command list creation failed";
-      Shutdown();
-      return false;
-    }
-    sub.list->SetName(L"EldenRingDLSS NPC patches");
-  }
-  event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-  if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_))) || event_ == nullptr) {
-    status_ = "fence creation failed";
     Shutdown();
     return false;
   }
@@ -120,15 +99,6 @@ bool SkinMotion::Init(ID3D12Device* device) {
 }
 
 void SkinMotion::Shutdown() {
-  for (Submission& sub : lists_) {
-    Release(sub.list);
-    Release(sub.allocator);
-    sub.done = 0;
-  }
-  Release(fence_);
-  fence_value_ = 0;
-  if (event_ != nullptr) CloseHandle(event_);
-  event_ = nullptr;
   Release(lookup_pso_);
   Release(resolve_pso_);
   Release(clear_pso_);
@@ -212,18 +182,8 @@ bool SkinMotion::PrepareJob(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t bones_size
   return true;
 }
 
-bool SkinMotion::SubmitJobs(ID3D12CommandQueue* queue, const std::vector<Job>& jobs) {
-  if (jobs.empty() || fence_ == nullptr || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
-  std::lock_guard lock(submit_mutex_);
-  const int index = next_list_;
-  Submission& sub = lists_[index];
-  next_list_ = (next_list_ + 1) % kLists;
-  if (fence_->GetCompletedValue() < sub.done) {  // only with 16 submissions in flight
-    fence_->SetEventOnCompletion(sub.done, event_);
-    if (WaitForSingleObject(event_, 2000) != WAIT_OBJECT_0) return false;  // device lost: leave the list alone
-  }
-  if (FAILED(sub.allocator->Reset()) || FAILED(sub.list->Reset(sub.allocator, nullptr))) return false;
-  ID3D12GraphicsCommandList* const cmd = sub.list;
+bool SkinMotion::RecordJobs(ID3D12GraphicsCommandList* cmd, int slot, const std::vector<Job>& jobs) {
+  if (jobs.empty() || lookup_pso_ == nullptr || slot < 0 || slot >= PreLists::kLists) return false;
   Marker(cmd, L"ERDLSS npc patches");
   // The buffers start in the common state and are promoted to unordered access; after the submission they decay
   // back, and the game's list reads the windows as constant buffers.
@@ -231,7 +191,7 @@ bool SkinMotion::SubmitJobs(ID3D12CommandQueue* queue, const std::vector<Job>& j
   cmd->SetComputeRootUnorderedAccessView(kTable, table_->GetGPUVirtualAddress());
   cmd->SetComputeRootUnorderedAccessView(kStore, store_->GetGPUVirtualAddress());
   cmd->SetComputeRootUnorderedAccessView(kResults,
-                                         results_->GetGPUVirtualAddress() + uint64_t{kResultsPerList} * kResultSize * index);
+                                         results_->GetGPUVirtualAddress() + uint64_t{kResultsPerList} * kResultSize * slot);
   const float max_distance = max_distance_.load();
   const float max_distance2 = max_distance * max_distance;
   const float test_offset = test_offset_.load();
@@ -286,12 +246,6 @@ bool SkinMotion::SubmitJobs(ID3D12CommandQueue* queue, const std::vector<Job>& j
     bind(job, window.base, window.count);
     cmd->Dispatch((job.window_bones * 3 + 63) / 64, 1, 1);
   }
-  Marker(cmd, L"ERDLSS <end>");  // the GPU profiler's end of this list
-  if (FAILED(cmd->Close())) return false;
-  ID3D12CommandList* const lists[] = {cmd};
-  queue->ExecuteCommandLists(1, lists);
-  queue->Signal(fence_, ++fence_value_);
-  sub.done = fence_value_;
   ++submissions_;
   return true;
 }

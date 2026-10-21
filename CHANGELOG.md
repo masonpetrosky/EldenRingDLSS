@@ -14,6 +14,10 @@ Fixes:
 - Places with many enemies or NPCs in view ran slowly with `NpcMotion=1`: each character's previous pose waited for
   the one before, so 300 of them at a castle courtyard took 5.3 ms per frame. They now run together in 0.2 ms; that
   courtyard went from 52 to 70 fps (4K at 50%, Ray Reconstruction, RTX 5070 Ti).
+- Tree motion vectors (`WindTrees=1`) cost about 2 ms in forests: each tree draw's wind patch made the GPU wait in
+  the middle of the game's G-buffer pass. The patches now run together before it, and the trees cost about 0.5 ms:
+  in a Limgrave forest 48.8 fps instead of 45.6, against 49.7 with the trees off (4K at 50%, Ray Reconstruction,
+  RTX 5070 Ti).
 - Under Proton the game could stay on a black screen at start-up (GitHub issue #1): the add-on started DLSS inside
   the game's device creation, and under Proton that start never returned. DLSS and Reflex now start on a thread of
   their own once the device exists, and the game keeps its TAA until DLSS is ready. Not yet confirmed on Linux.

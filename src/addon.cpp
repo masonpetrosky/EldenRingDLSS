@@ -40,6 +40,7 @@
 #include "engine_resolution.hpp"
 #include "frame_generation.hpp"
 #include "hw_breakpoints.hpp"
+#include "pre_lists.hpp"
 #include "render_scale.hpp"
 #include "rr_guides.hpp"
 #include "rt_pipeline.hpp"
@@ -151,8 +152,10 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   // Wind: the game's cbSceneParam/cbPerFrame addresses last patched in this command list and the patched slot.
   uint64_t wind_scene = 0, wind_frame = 0, wind_prev = 0;
   bool wind_streams_bound = false;  // the wind stream buffers are bound as stream-output targets
-  bool tree_wind_patched = false;   // a tree wind copy was written in this command list
-  std::vector<erdlss::SkinMotion::Job> skin_jobs;  // NPC patches, run right before this list is executed
+  bool tree_wind_patched = false;   // a tree wind copy was written in this command list (inline patches)
+  int tree_batch = -1;  // this list's tree patches: before it (1, or 2 also checked at the draws), inline (0)
+  std::vector<erdlss::WindMotion::TreeJob> tree_jobs;  // tree wind patches, run right before this list is executed
+  std::vector<erdlss::SkinMotion::Job> skin_jobs;  // NPC patches, likewise
   uint64_t skin_scope = 0;  // bone windows belong to this recording, not to another parallel list
   uint64_t index_va = 0;            // GPU address of the bound index buffer view (identifies NPC mesh parts)
   // GPU profiler (dev): the next draw or dispatch starts a segment; draws in the current one, its kind (1 draws,
@@ -267,6 +270,13 @@ std::atomic<bool> g_port_ready{false};
 std::atomic<bool> g_wind_failed{false};
 std::atomic<bool> g_trees_failed{false};
 erdlss::SkinMotion g_skin;  // NPC motion vectors: previous-pose bones for the stream-output path
+erdlss::PreLists g_pre;     // the tree wind and NPC patches, run right before the command list that planned them
+// Development (remote "treebatch"): where tree wind patches run. 1 (default): before the command list that drew them;
+// 0 ("off"): inline at their draws, as before 2026-10-21; 2 ("verify"): before the list and checked at each draw;
+// 3 ("alternate"): before the list in odd frames and inline in even ones, for A/B dumps of neighboring frames.
+std::atomic<int> g_tree_mode{1};
+std::atomic<uint64_t> g_tree_jobs_before{0}, g_tree_jobs_inline{0};    // tree patches recorded, by placement
+std::atomic<uint64_t> g_tree_frame_before{0}, g_tree_frame_inline{0};  // of those, the frame's (at its TAA)
 std::atomic<bool> g_skin_failed{false};
 std::atomic<int> g_npc_stage{3};  // development (ini NpcStage, remote "npcstage"): see StreamSkinDraw
 // Development counts of skinned main-camera draws: seen, left to the game (velocity), and where the others stopped.
@@ -531,6 +541,7 @@ struct Readback {
   format fmt;
   uint64_t frame;
   std::string name;
+  std::string note;  // appended to the .txt line
 };
 std::mutex g_dump_mutex;
 std::atomic<int> g_dump_remaining{0};
@@ -994,6 +1005,7 @@ void DumpTaaInputs(command_list* cmd_list) {
     return;
   if (g_dump_last == 0) g_dump_start = frame;  // the request may arrive while this frame's draw is already recorded
   const int index = static_cast<int>(frame - g_dump_start);
+  const size_t first = g_dumps.size();
   char suffix[16];
   std::snprintf(suffix, sizeof(suffix), "_%02d", index);
   if (!CopyToReadback(cmd_list, motion, frame, g_dump_name + "_mv" + suffix) ||
@@ -1010,12 +1022,16 @@ void DumpTaaInputs(command_list* cmd_list) {
     if (g_mask != 0 && g_config.vegetation_mask > 0.0f)
       CopyToReadback(cmd_list, g_mask, frame, g_dump_name + "_mask" + suffix, resource_usage::unordered_access);
   }
+  // The frame's tree wind patches by placement (before their lists, inline), for "treebatch alternate" dumps.
+  const std::string note = std::to_string(g_tree_frame_before.load()) + " " + std::to_string(g_tree_frame_inline.load());
+  for (size_t i = first; i < g_dumps.size(); ++i) g_dumps[i].note = note;
   g_dump_last = frame;
   --g_dump_remaining;
 }
 
 // Saves the dumped frames once the GPU has finished them: raw rows without padding plus a .txt with
-// width, height, format, frame index and the scene exposure. Returns the result line for remote.done.
+// width, height, format, frame index, the scene exposure and the frame's tree wind patches recorded before their lists
+// and inline. Returns the result line for remote.done.
 std::string WriteDumps(command_queue* queue) {
   queue->wait_idle();
   std::lock_guard lock(g_dump_mutex);
@@ -1037,7 +1053,8 @@ std::string WriteDumps(command_queue* queue) {
                   static_cast<std::streamsize>(r.width) * r.bytes_per_pixel);
       g_device->unmap_buffer_region(r.buffer);
       std::ofstream(dir / (r.name + ".txt")) << r.width << " " << r.height << " " << static_cast<int>(r.fmt) << " "
-                                             << (r.frame - g_dump_start) << " " << exposure << "\n";
+                                             << (r.frame - g_dump_start) << " " << exposure
+                                             << (r.note.empty() ? "" : " ") << r.note << "\n";
       frames += r.fmt == format::r16g16_float;
       stencils += r.bytes_per_pixel == 1 && r.fmt != format::r8_unorm;
       masks += r.fmt == format::r8_unorm;
@@ -2142,6 +2159,7 @@ void OnDestroyDevice(device* dev) {
     g_port_ready = false;
     g_wind_port.Shutdown();
     g_skin.Shutdown();
+    g_pre.Shutdown();
   }
   g_object_blur.Shutdown();
   {
@@ -2255,8 +2273,8 @@ void ProfileMarker(ID3D12GraphicsCommandList* cmd, const wchar_t* text) {
   const std::wstring_view t(text);
   static const wchar_t* const kPasses[] = {L"ERDLSS stream resolve", L"ERDLSS npc frame end", L"ERDLSS tree frame end",
                                            L"ERDLSS object blur motion", L"ERDLSS camera motion copy",
-                                           L"ERDLSS npc patches", L"ERDLSS DLSS", L"ERDLSS stretch",
-                                           L"ERDLSS water reflections", L"ERDLSS <end>"};
+                                           L"ERDLSS tree wind", L"ERDLSS npc patches", L"ERDLSS DLSS",
+                                           L"ERDLSS stretch", L"ERDLSS water reflections", L"ERDLSS <end>"};
   if (std::none_of(std::begin(kPasses), std::end(kPasses), [&](const wchar_t* p) { return t == p; })) return;
   std::string label;
   for (const wchar_t c : t) label.push_back(static_cast<char>(c));  // the markers are ASCII
@@ -2870,11 +2888,12 @@ bool FindInputs(device* dev, pipeline_layout layout, const std::vector<descripto
   return true;
 }
 
-// GPU addresses of a SpeedTree draw's wind inputs: cbSpeedTreeWind (vertex b13, and its size), cbInstanceData (pixel
-// b4), cbInstanceIdxParam (vertex b10) and g_InstanceIndexBuffer (vertex t25).
+// GPU addresses of a SpeedTree draw's wind inputs: cbSpeedTreeWind (vertex b13), cbInstanceData (pixel b4),
+// cbInstanceIdxParam (vertex b10) and g_InstanceIndexBuffer (vertex t25), with the sizes of their views.
 struct TreeInputs {
   D3D12_GPU_VIRTUAL_ADDRESS wind = 0, instances = 0, idx_param = 0, index_buffer = 0;
-  uint32_t wind_size = 0;
+  uint32_t wind_size = 0, instances_size = 0;
+  uint64_t index_size = 0;
 };
 bool FindTreeInputs(device* dev, pipeline_layout layout, const std::vector<descriptor_table>& tables,
                     TreeInputs* out) {
@@ -2886,6 +2905,8 @@ bool FindTreeInputs(device* dev, pipeline_layout layout, const std::vector<descr
   uint64_t sizes[4] = {};
   if (!FindInputs(dev, layout, tables, kSources, va, sizes)) return false;
   out->wind_size = static_cast<uint32_t>(sizes[0]);
+  out->instances_size = static_cast<uint32_t>(sizes[1]);
+  out->index_size = sizes[3];
   out->wind = va[0];
   out->instances = va[1];
   out->idx_param = va[2];
@@ -3045,11 +3066,31 @@ bool StreamWindDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
   TreeInputs tree;
   if (IsTreeMaterial(name) && FindTreeInputs(dev, draw.layout, draw.tables, &tree)) {
     wind = tree.wind;
-    prev_wind = g_wind.RecordTreeWind(native, tree.wind, tree.wind_size, tree.instances, tree.idx_param,
-                                      tree.index_buffer, instance_count,
-                                      static_cast<uint32_t>(std::hash<std::string>()(name)), !data.tree_wind_patched);
-    data.tree_wind_patched = true;
-    RestoreCompute(cmd_list);
+    prev_wind = tree.wind;  // without a patch: no wind motion, but the camera's
+    erdlss::WindMotion::TreeJob job;
+    if (g_wind.PrepareTreeJob(tree.wind, tree.wind_size, tree.instances, tree.instances_size, tree.idx_param,
+                              tree.index_buffer, tree.index_size, instance_count,
+                              static_cast<uint32_t>(std::hash<std::string>()(name)), &job)) {
+      prev_wind = job.copy;
+      if (data.tree_batch < 0) {
+        const int mode = g_tree_mode.load();
+        data.tree_batch = mode == 3 ? static_cast<int>(g_frame.load() & 1) : mode;
+      }
+      if (data.tree_batch != 0) {
+        data.tree_jobs.push_back(job);  // runs when the list is executed (OnExecuteCommandList)
+        ++g_tree_jobs_before;
+        if (data.tree_batch == 2) {  // development: whether the copy is still right at the draw
+          g_wind.RecordTreeWind(native, job, !data.tree_wind_patched, true);
+          data.tree_wind_patched = true;
+          RestoreCompute(cmd_list);
+        }
+      } else {
+        g_wind.RecordTreeWind(native, job, !data.tree_wind_patched);
+        data.tree_wind_patched = true;
+        RestoreCompute(cmd_list);
+        ++g_tree_jobs_inline;
+      }
+    }
   } else {
     // Other shaders may still read b13, which the copies take out of the table.
     wind = FindWind(dev, draw.layout, draw.tables);
@@ -3343,6 +3384,14 @@ void ResolveWind(command_list* cmd_list, const CmdData& data) {
     scene = g_scene;
   }
   auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  {  // the frame's tree patches by placement, for the TAA dump
+    static uint64_t last_before = 0, last_inline = 0;
+    const uint64_t before = g_tree_jobs_before.load(), inlined = g_tree_jobs_inline.load();
+    g_tree_frame_before = before - last_before;
+    g_tree_frame_inline = inlined - last_inline;
+    last_before = before;
+    last_inline = inlined;
+  }
   g_wind.RecordFrameEnd(native);  // the tree wind table counts frames here, whether or not trees are drawn
   if (g_skin.ready()) g_skin.RecordFrameEnd(native);  // so does the NPC table
   // Below full size the scene fills the top-left render-size part of the full-size motion and depth textures; the
@@ -3475,20 +3524,34 @@ std::string PortStats() {
 }
 
 std::string TreeStats() {
-  static uint64_t last_frame = 0, last_draws = 0, last_patches = 0, last_vertices = 0;
+  static uint64_t last_frame = 0, last_draws = 0, last_patches = 0, last_vertices = 0, last_ring = 0;
+  static uint32_t last_counts[7] = {};
+  static const char* const kModes[] = {"inline", "before their lists", "before their lists, checked", "alternating"};
   const uint64_t frame = g_frame.load(), draws = g_wind.streamed_draws(), patches = g_wind.tree_patches();
-  const uint64_t vertices = g_wind.streamed_vertices();
+  const uint64_t vertices = g_wind.streamed_vertices(), ring = g_wind.tree_ring_bytes();
   const double frames = static_cast<double>(std::max<uint64_t>(1, frame - last_frame));
-  char text[192];
-  std::snprintf(text, sizeof(text), "; trees (%s): %zu pipelines, %.0f draws, %.0f wind patches and %.2f M vertices "
-                "streamed per frame", g_config.wind_trees ? "on" : "off", g_wind.pipeline_count(),
-                (draws - last_draws) / frames, (patches - last_patches) / frames,
+  char text[320];
+  std::snprintf(text, sizeof(text), "; trees (%s): %zu pipelines, %.0f draws, %.0f wind patches (%s, %.2f MB of "
+                "copies) and %.2f M vertices streamed per frame", g_config.wind_trees ? "on" : "off",
+                g_wind.pipeline_count(), (draws - last_draws) / frames, (patches - last_patches) / frames,
+                kModes[std::clamp(g_tree_mode.load(), 0, 3)], (ring - last_ring) / frames / 1048576.0,
                 (vertices - last_vertices) / frames / 1e6);
+  std::string out = text;
+  uint32_t counts[7];
+  if (g_wind.tree_verify() && g_wind.TreeVerifyCounts(counts)) {
+    const auto delta = [&](int i) { return counts[i] - last_counts[i]; };
+    std::snprintf(text, sizeof(text), "; check over %u frames: %u trees, %u with last frame's entry, %u copies "
+                  "differ (%u with an entry), %u entries differ from the draw's wind, %u trees not in the table",
+                  delta(0), delta(1), delta(2), delta(3), delta(4), delta(5), delta(6));
+    out += text;
+    std::copy(counts, counts + 7, last_counts);
+  }
   last_frame = frame;
   last_draws = draws;
   last_patches = patches;
   last_vertices = vertices;
-  return text;
+  last_ring = ring;
+  return out;
 }
 
 std::string WindStats() {
@@ -3633,10 +3696,23 @@ void OnExecuteCommandList(command_queue* queue, command_list* cmd_list) {
   else
     g_reflex.OnSubmit();
   auto* const data = cmd_list->get_private_data<CmdData>();
-  // The previous poses its NPC draws read, written just before them on the same queue.
-  if (data != nullptr && !data->skin_jobs.empty() && g_skin.ready() &&
-      !g_skin.SubmitJobs(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()), data->skin_jobs))
-    ++g_npc_counts.patch;
+  // The trees' previous wind and the NPCs' previous poses its draws read, written just before them on the same queue.
+  if (data != nullptr && (!data->tree_jobs.empty() || !data->skin_jobs.empty())) {
+    const bool skin = !data->skin_jobs.empty() && g_skin.ready();
+    const bool ran = g_pre.Run(reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()),
+                               [&](ID3D12GraphicsCommandList* cmd, int slot) {
+                                 bool any = !data->tree_jobs.empty() && g_wind.RecordTreeJobs(cmd, data->tree_jobs);
+                                 if (skin) any = g_skin.RecordJobs(cmd, slot, data->skin_jobs) || any;
+                                 return any;
+                               });
+    if (!ran) {
+      if (skin) ++g_npc_counts.patch;
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true))
+        Log(reshade::log::level::warning, "The tree wind and NPC patches could not run before a command list: the "
+                                          "motion vectors of its trees and characters can be wrong.");
+    }
+  }
   if (g_config.render_scale >= 1.0f) return;
   if (data == nullptr || !data->signed_) return;
   std::lock_guard lock(g_kinds_mutex);
@@ -5734,6 +5810,15 @@ void OnReshadePresent(effect_runtime* runtime) {
     g_skin.set_max_bones(static_cast<uint32_t>(std::clamp(std::atoi(arg.c_str()), 1, 1365)));
   } else if (command == "windtrees") {
     g_config.wind_trees = arg != "off";
+  } else if (command == "treebatch") {  // "on", "off" (inline, as before), "verify", "alternate": see g_tree_mode
+    if (!arg.empty()) {
+      g_tree_mode = arg == "off" ? 0 : arg == "verify" ? 2 : arg == "alternate" ? 3 : 1;
+      g_wind.set_tree_verify(g_tree_mode.load() == 2);
+    }
+    static const char* const kResults[] = {"tree wind patches inline", "tree wind patches run before their lists",
+                                           "tree wind patches run before their lists, checked at each draw",
+                                           "tree wind patches before their lists in odd frames, inline in even ones"};
+    result = kResults[std::clamp(g_tree_mode.load(), 0, 3)];
   } else if (command == "windprepass") {
     g_config.wind_prepass = arg != "off";
   } else if (command == "windcost") {

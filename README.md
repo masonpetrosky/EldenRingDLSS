@@ -64,7 +64,7 @@ bushes and 0.3-0.4 ms for characters at 4K and 50%; tree motion vectors (off by 
   the size the game uses at 100%: about 0.2 ms and 170 MB of video memory at 4K and 50%.
 - **Motion vectors for wind-animated vegetation** (grass, bushes, SpeedTree trees), which the game does not write and
   DLSS therefore smears: a port of the game's grass wind shader and a stream-output replay of the tree shaders. The
-  trees are off by default (`WindTrees=1` or the overlay turns them on, about 2 ms at 4K with trees in view).
+  trees are off by default (`WindTrees=1` or the overlay turns them on, about 0.5 ms in a forest at 4K and 50%).
 - **Motion vectors for enemies, NPCs and animals**: the game only draws velocity for the player's character. The
   add-on replays the other skinned characters' draws (in the G-buffer, and after the lighting for ghosts and other
   see-through characters) with last frame's bones, matched per mesh part.
@@ -131,11 +131,12 @@ pwsh build.ps1 -Tests             # also builds and runs standalone state/transi
 ```
 
 The SDK fetch uses pinned NVIDIA downloads and does not require GitHub CLI or a GitHub login. To run the additional
-NGX and NPC window checks on an RTX GPU after building with `-Tests`:
+NGX, NPC and tree wind checks on an RTX GPU after building with `-Tests`:
 
 ```
 build/erdlss_regressions.exe --gpu third_party/dlss/bin/rel
 build/erdlss_regressions.exe --npc     # NPC previous poses on the GPU: 16 characters, shuffled draws and bone pool
+build/erdlss_regressions.exe --trees   # tree wind patches: 24 trees regrouped every frame, before their lists and inline
 ```
 
 After a game update, this checks the version-specific lookups (see Limitations) against the game's executable
@@ -185,7 +186,7 @@ documents each key.
 | `ChromaticAberration` | 1 | Keep the game's chromatic aberration (0 removes it). |
 | `WindMotion` | 0 | Motion vectors for wind-animated vegetation. |
 | `WindMode` | 1 | 1 = ported grass shader plus tree replay; 0 = stream output for everything. |
-| `WindTrees` | 0 | Include SpeedTree trees and shrubs, about 2 ms at 4K with trees in view (`WindTreeCapacity`: millions of vertices per frame). |
+| `WindTrees` | 0 | Include SpeedTree trees and shrubs, about 0.5 ms in a forest at 4K and 50% (`WindTreeCapacity`: millions of vertices per frame). |
 | `NpcMotion` | 0 | Motion vectors for enemies, NPCs and animals. |
 | `ObjectBlur` | 0 | With the game's Motion Blur on, blur only moving objects, not camera turns. |
 | `Reflex` | 0 | NVIDIA Reflex low-latency mode (experimental). |

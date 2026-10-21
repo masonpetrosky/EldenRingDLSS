@@ -62,19 +62,39 @@ class WindMotion {
   D3D12_GPU_VIRTUAL_ADDRESS RecordPrevious(ID3D12GraphicsCommandList* cmd, D3D12_GPU_VIRTUAL_ADDRESS scene,
                                            D3D12_GPU_VIRTUAL_ADDRESS frame);
 
-  // SpeedTree: records a compute pass (tree_wind.hlsl) that writes a copy of a tree draw's cbSpeedTreeWind in which
-  // every tree has its wind from the previous frame, found in a table keyed by the tree's position. `wind` and
-  // `wind_size` are the draw's cbSpeedTreeWind, `instances` its cbInstanceData (pixel stage), `idx_param` its
-  // cbInstanceIdxParam, `index_buffer` its g_InstanceIndexBuffer; `model` identifies the drawing shader.
-  // `first_in_list`: the first tree patch of this command list. Returns the copy's address (0 if `wind_size` is too
-  // large). Leaves its compute root signature and pipeline bound; the caller restores the game's.
-  D3D12_GPU_VIRTUAL_ADDRESS RecordTreeWind(ID3D12GraphicsCommandList* cmd, D3D12_GPU_VIRTUAL_ADDRESS wind,
-                                           uint32_t wind_size, D3D12_GPU_VIRTUAL_ADDRESS instances,
-                                           D3D12_GPU_VIRTUAL_ADDRESS idx_param, D3D12_GPU_VIRTUAL_ADDRESS index_buffer,
-                                           uint32_t instance_count, uint32_t model, bool first_in_list);
+  // SpeedTree: a tree draw's wind patch (tree_wind.hlsl), a copy of its cbSpeedTreeWind in which every tree has its
+  // wind from the previous frame, found in a table keyed by the tree's position.
+  struct TreeJob {
+    D3D12_GPU_VIRTUAL_ADDRESS wind = 0, instances = 0, idx_param = 0, index_buffer = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS copy = 0;  // the patched copy: bind it as cbSpeedTreeWind for the previous pose
+    uint32_t instance_count = 0, model = 0, wind_entries = 0, instance_slots = 0, index_entries = 0;
+  };
+  // Plans the patch for a tree draw: `wind` and `wind_size` are the draw's cbSpeedTreeWind, `instances` and
+  // `instances_size` its cbInstanceData (pixel stage), `idx_param` its cbInstanceIdxParam, `index_buffer` and
+  // `index_size` its g_InstanceIndexBuffer view; `model` identifies the drawing shader. False for unusable sizes.
+  bool PrepareTreeJob(D3D12_GPU_VIRTUAL_ADDRESS wind, uint32_t wind_size, D3D12_GPU_VIRTUAL_ADDRESS instances,
+                      uint32_t instances_size, D3D12_GPU_VIRTUAL_ADDRESS idx_param,
+                      D3D12_GPU_VIRTUAL_ADDRESS index_buffer, uint64_t index_size, uint32_t instance_count,
+                      uint32_t model, TreeJob* job);
+  // Records `jobs` into `cmd`, a PreLists list (pre_lists.hpp) that runs right before the command list that drew
+  // them: all patches together, without barriers between them. Leaves its compute root signature and pipeline bound.
+  bool RecordTreeJobs(ID3D12GraphicsCommandList* cmd, const std::vector<TreeJob>& jobs);
+  // Development (remote "treebatch off"): records a patch in the game's command list at its draw instead, with
+  // barriers around it, as before 2026-10-21. `first_in_list`: the first tree patch or check of this command list.
+  // `verify` (remote "treebatch verify") records tree_wind.hlsl's Verify instead, right before a draw whose patch ran
+  // before its list: it counts the trees whose copy is not what a patch at the draw would write (TreeVerifyCounts).
+  // Leaves its compute root signature and pipeline bound; the caller restores the game's.
+  void RecordTreeWind(ID3D12GraphicsCommandList* cmd, const TreeJob& job, bool first_in_list, bool verify = false);
   // Counts a frame for the tree wind table; once per frame after its last tree draw (at the TAA). Leaves its compute
   // root signature and pipeline bound.
   void RecordFrameEnd(ID3D12GraphicsCommandList* cmd);
+  // Development (remote "treebatch verify"): while on, RecordFrameEnd copies the tree frame counter and Verify's counts
+  // for reading back. TreeVerifyCounts gives, as of a frame or two ago, the frame counter and then the totals of trees
+  // checked, with last frame's entry, with a differing copy, of those with last frame's entry, with this frame's entry
+  // differing from the draw's wind, and missing from this frame's table. False before the first copy.
+  void set_tree_verify(bool on) { tree_verify_ = on; }
+  bool tree_verify() const { return tree_verify_.load(); }
+  bool TreeVerifyCounts(uint32_t counts[7]);
 
   // Binds both stream buffers (previous to slot 0, current to slot 1) for the rest of a command list. Call once per
   // command list before its first RecordStreams: re-binding between draws reloads the fill counters from memory
@@ -116,7 +136,9 @@ class WindMotion {
   uint64_t replaced_draws() const { return replaced_draws_.load(); }
   uint64_t patches() const { return patches_.load(); }
   uint64_t tree_patches() const { return tree_patches_.load(); }
+  uint64_t tree_ring_bytes() const { return tree_ring_next_.load(); }  // ring space handed out so far
   uint64_t streamed_vertices() const { return streamed_vertices_.load(); }
+  ID3D12Resource* tree_ring_buffer() const { return tree_ring_; }  // tests: the ring TreeJob::copy points into
   size_t pipeline_count() const;
   size_t full_pipeline_count() const;
   size_t skin_pipeline_count() const;
@@ -137,6 +159,7 @@ class WindMotion {
   };
 
   bool RootFor(uint64_t layout_key, const std::vector<RootParam>& layout, bool skin, Root* root);
+  void BindTreeJob(ID3D12GraphicsCommandList* cmd, const TreeJob& job);
   ID3D12PipelineState* ResolvePipeline(DXGI_FORMAT dsv_format);
 
   ID3D12Device* device_ = nullptr;
@@ -165,11 +188,14 @@ class WindMotion {
   // UAV), and a ring of patched cbSpeedTreeWind copies (written as UAV, read as CBV).
   ID3D12RootSignature* tree_rs_ = nullptr;
   ID3D12PipelineState* tree_patch_pso_ = nullptr;
+  ID3D12PipelineState* tree_verify_pso_ = nullptr;
   ID3D12PipelineState* tree_clear_pso_ = nullptr;
   ID3D12PipelineState* tree_advance_pso_ = nullptr;
   ID3D12Resource* tree_table_ = nullptr;
   ID3D12Resource* tree_ring_ = nullptr;
   std::atomic<uint64_t> tree_ring_next_{0};  // bytes
+  ID3D12Resource* tree_counts_ = nullptr;     // readback of the table header (TreeVerifyCounts)
+  std::atomic<bool> tree_verify_{false}, tree_counts_copied_{false};
   ID3D12Resource* debug_ = nullptr;    // readback: fill counters, first streamed vertices, last patched slot
   std::atomic<bool> debug_request_{false};
   std::atomic<bool> debug_captured_{false};

@@ -1109,4 +1109,43 @@ Running the lookups together opened two races in the table:
   frames, the draws and the bone pool shuffled every frame, each character's previous pose checked bone by bone) still
   failed 14 of 25 runs: a lookup could also read a position that was half written. Now the claim word is the entry's
   key, a hash of its part and position written in the one atomic operation, and a duplicate is recognized by the claim
-  alone; `Clear` empties only the claims again. 40 of 40 runs pass. This last build has not run in game yet.
+  alone; `Clear` empties only the claims again. 40 of 40 runs pass. In game at the courtyard: 385 characters patched
+  and 385 matched per frame, and a 16-frame `mv` dump with the camera still showed no jumps, only the base game's
+  reduced-rate animation of two distant soldiers (1-2 px every fifth frame).
+
+## The tree wind patches stalled the G-buffer (2026-10-21)
+
+In a Limgrave forest (4K, 50%, RR, frame generation off; `ab_capture.ps1 -Round treebatch`): 180 tree draws and 112
+wind patches per frame. Each patch (`RecordTreeWind`) was a compute dispatch between the game's G-buffer draws, with a
+UAV barrier and two ring transitions around it, so the GPU drained its graphics work about 110 times per frame. The
+patches now run like the NPC lookups (`src/pre_lists.*`, shared by both): a draw records its job, and when the game
+submits the command list the add-on first submits a list of its own on the same queue with all of that list's
+patches, without barriers between them. The copies decay to the common state after that submission and are promoted
+to constant buffers in the game's list. Two patches adding the same tree at once can leave a duplicate table entry,
+which is harmless: entries match exactly (position and shader), and both hold the same wind.
+
+| | fps | GPU busy |
+| --- | --- | --- |
+| patches before their lists (two runs) | 48.8, 48.5 | 20.4, 20.5 ms |
+| inline, as before (`treebatch off`) | 45.6 | 21.9 ms |
+| trees off | 49.7 | 20.0 ms |
+
+GPU profile: the G-buffer lists went from 4.61 to 3.13 ms, and the patches' own lists take 0.14 ms (4.8 submissions
+per frame). The copies take about 0.2 MB per frame of the 8 MB ring.
+
+Whether the patches are still right when they run before the list:
+- The order on the GPU (from the profile): the game submits a frame's lists from the shadow maps to the HUD together,
+  and the add-on's lists run right before them, after the previous frame's TAA, where the table's frame counter
+  advances.
+- Comparing 8-frame motion dumps taken seconds apart misled: the canopy moved about 1.5 times as much in the two dumps
+  with the patches before their lists as in the inline one between them (distant trees 2.5-3 times), but the wind
+  gusts that much: within one dump the canopy's motion grew 1.6 times in 8 frames. Distant trees seem to get new wind
+  only every fourth or fifth frame (one-frame bursts of motion in both placements), like distant enemies' animation.
+- `treebatch verify` checks every patch at its draw (`Verify` in `tree_wind.hlsl`: the copy recomputed from the draw's
+  inputs as they are at the draw, and this frame's table entry against the draw's wind). Over 140 frames, 48,000
+  trees, 99.8% of them with last frame's entry: no copy or entry differed and no tree was missing.
+  `erdlss_regressions --trees` covers `Verify` too: it must count a wind value and a tree position changed between
+  the patches and the draws.
+- `treebatch alternate` places the patches before their lists in odd frames and inline in even ones, and the dump's
+  `.txt` files name each frame's placement. Two 16-frame dumps (`ab_capture.ps1 -Round treecheck`,
+  `tools/tree_alternate.py`): canopy motion inline / before their lists 1.001, from neighboring frames (0.989-1.007).

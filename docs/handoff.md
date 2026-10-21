@@ -31,6 +31,7 @@ for picking up.
 | Game update 1.17.2 moved the TAA filter's vtable | Fixed (RTTI lookup) in 0.3.0: GitHub release and everyday install (2026-10-20) |
 | DLSS Frame Generation (Streamline DLSS-G, `FrameGeneration`) | Done (2026-10-21), test copy `dist/test-0.4.0-fg` only; the user played 2x-4x ("working correctly"); with the faster NPC path they prefer it off |
 | Castle courtyard at 52 fps: NPC patches took 5.3 ms | Fixed (2026-10-21): lookups run together, 0.2 ms, 70 fps there; verified in game; `docs/recon.md` |
+| Tree wind patches stalled the G-buffer (trees about 2 ms) | Fixed (2026-10-21): patches run before their lists, trees about 0.5 ms, forest 45.6 -> 48.8 fps; checked in game (`treebatch verify`, alternating A/B); test copy |
 | The game's anisotropic filtering | Already 16x (2026-10-21; `docs/recon.md`) |
 | GitHub issue #1, Proton black screen | NGX and NVAPI start on a thread of their own (2026-10-21); untested under Proton |
 
@@ -152,7 +153,9 @@ pwsh -NoProfile -File tools/package.ps1               # release zip in dist\ (ve
   `rtgen [0-4]` (sun shadow ray generation: game's, port, port + render-size AO with PCG, blue noise, temporal blue
   noise), `rtsamples <ao> <shadow>` (0 = game's/default), `rr`, `rrraw none|shadows|all`, `rrpreset`, `rtinfo`.
 - NPC motion (dev remote): `npc` (stats; `npc on|off` switches and saves), `npcstage 1|2|3`, `npctest <m>` (shifts
-  every previous pose so everything the path draws shows motion), `npcdist`, `npcbones`. `Dred=1` in the ini turns on
+  every previous pose so everything the path draws shows motion), `npcdist`, `npcbones`. Trees: `windstats`,
+  `windtrees on|off`, `treebatch on|off|verify|alternate` (where the wind patches run; `verify` checks each one at its
+  draw and adds counts to `windstats`). `Dred=1` in the ini turns on
   D3D12 crash breadcrumbs; after a GPU hang the report is in the log and `shots/dred.txt`.
 - `tools/mem.py` reads, searches and writes the running game's memory from outside; works under RenderDoc too.
 - Analysis scripts in `tools/` (Python venv at `.tools\venv`): `mv_check.py` (motion dumps), `shots.py`,
@@ -212,15 +215,14 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 **Done 2026-10-21 (the user's requests of 2026-10-20):** the castle courtyard (52 -> 70 fps: the NPC patches' barriers,
 `docs/recon.md`, "The castle courtyard"), DLSS Frame Generation (`docs/recon.md`, "DLSS Frame Generation"; the user
 preferred 2x at first, and off once the courtyard ran at 70 fps) and the anisotropic filtering check (the game already
-uses 16x).
+uses 16x). Then, on the user's request, the trees the same way (`docs/recon.md`, "The tree wind patches stalled the
+G-buffer"): about 1.5 ms saved in a forest.
 
 **Next:**
 - **Waiting for the user's OK:** the everyday install with this build and `FrameGeneration=0`, their choice (back up
   first, game closed; `deploy.ps1` also copies the Streamline DLLs and `nvngx_dlssg.dll`), and a 0.4.0 release
-  (GitHub and Nexus; `CHANGELOG.md` "Unreleased" has the notes).
-- **The NPC table's atomic key** (the last race fix) has passed the GPU test but not run in game; it is in the test
-  copy since 2026-10-21 12:24 (SHA-256 `AD747432...`). At the courtyard, `mv` dumps with the camera still should show
-  no one-frame jumps on distant soldiers (`npc` stats: matched close to patched).
+  (GitHub and Nexus; `CHANGELOG.md` "Unreleased" has the notes). With trees at about 0.5 ms, whether `WindTrees`
+  should be on by default is theirs to decide too.
 - Streamline logged "ERROR RSYNC: Flip queue is empty!!!" once at the title screen (2026-10-21); harmless so far,
   not looked into.
 - **Nexus report (answered 2026-10-20, waiting for their tests):** light particles under upscaling sometimes move

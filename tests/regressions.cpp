@@ -363,37 +363,89 @@ void CheckWaterSsr() {
   ssr.Shutdown();
 }
 
+// A D3D12 device with the debug layer when it is installed, a direct queue and one list for the GPU checks below.
+struct GpuTest {
+  bool validated = false;
+  Microsoft::WRL::ComPtr<ID3D12Device> device;
+  Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+  Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+  Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+  HANDLE event = nullptr;
+  uint64_t fence_value = 0;
+
+  GpuTest() {
+    Microsoft::WRL::ComPtr<ID3D12Debug> debug;
+    validated = SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)));
+    if (validated) debug->EnableDebugLayer();
+    Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    Check(SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))), "create DXGI factory");
+    Check(SUCCEEDED(factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                       IID_PPV_ARGS(&adapter))), "select GPU");
+    Check(SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device))),
+          "create D3D12 device");
+    const D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+    Check(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))), "create queue");
+    Check(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))),
+          "create allocator");
+    Check(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                             IID_PPV_ARGS(&list))), "create list");
+    Check(SUCCEEDED(list->Close()), "close the new list");
+    Check(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))), "create fence");
+    event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    Check(event != nullptr, "create completion event");
+  }
+  ~GpuTest() {
+    if (event != nullptr) CloseHandle(event);
+  }
+
+  ID3D12GraphicsCommandList* Begin() {
+    Check(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.Get(), nullptr)), "reset the list");
+    return list.Get();
+  }
+  // Closes and executes the list, then waits until the GPU is done with everything on the queue.
+  void Finish(const char* what) {
+    Check(SUCCEEDED(list->Close()), "close the list");
+    ID3D12CommandList* lists[] = {list.Get()};
+    queue->ExecuteCommandLists(1, lists);
+    Wait(what);
+  }
+  // Waits until the GPU is done with everything on the queue.
+  void Wait(const char* what) {
+    ++fence_value;
+    Check(SUCCEEDED(queue->Signal(fence.Get(), fence_value)) &&
+              SUCCEEDED(fence->SetEventOnCompletion(fence_value, event)) &&
+              WaitForSingleObject(event, 10000) == WAIT_OBJECT_0,
+          what);
+  }
+  void CheckDebugLayer() {
+    if (!validated) return;
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue> info;
+    if (FAILED(device.As(&info))) return;
+    uint64_t errors = 0;
+    for (UINT64 i = 0, n = info->GetNumStoredMessages(); i < n; ++i) {
+      SIZE_T size = 0;
+      info->GetMessage(i, nullptr, &size);
+      std::vector<uint8_t> buffer(size);
+      auto* const message = reinterpret_cast<D3D12_MESSAGE*>(buffer.data());
+      if (FAILED(info->GetMessage(i, message, &size)) || message->Severity > D3D12_MESSAGE_SEVERITY_ERROR) continue;
+      std::fprintf(stderr, "D3D12: %s\n", message->pDescription);
+      ++errors;
+    }
+    Check(errors == 0, "the D3D12 debug layer must report no errors");
+  }
+};
+
 // The NPC previous poses on the GPU (skin_motion.hlsl). 16 characters of one model share a bone window and stand still
 // 1.5 m apart, each drawn as two mesh parts in a shuffled order, while the bone pool lists them in a new order every
 // frame. Every character must get its own bones from the frame before. The lookups of a list run together, so this
 // also catches entries lost between them (2026-10-21: soldiers at a castle took their neighbors' poses).
 void CheckSkinMotion() {
-  Microsoft::WRL::ComPtr<ID3D12Debug> debug;
-  const bool validated = SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)));
-  if (validated) debug->EnableDebugLayer();
-  Microsoft::WRL::ComPtr<IDXGIFactory6> factory;
-  Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-  Microsoft::WRL::ComPtr<ID3D12Device> device;
-  Check(SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))), "create DXGI factory");
-  Check(SUCCEEDED(factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                                                     IID_PPV_ARGS(&adapter))), "select GPU");
-  Check(SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device))), "create D3D12 device");
-  Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
-  Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
-  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
-  Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-  const D3D12_COMMAND_QUEUE_DESC queue_desc = {};
-  Check(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))), "create queue");
-  Check(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))), "create allocator");
-  Check(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
-                                           IID_PPV_ARGS(&list))), "create list");
-  Check(SUCCEEDED(list->Close()), "close the new list");
-  Check(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))), "create fence");
-  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-  Check(event != nullptr, "create completion event");
-
+  GpuTest gpu;
   erdlss::SkinMotion skin;
-  Check(skin.Init(device.Get()), skin.status().c_str());
+  Check(skin.Init(gpu.device.Get()), skin.status().c_str());
+  erdlss::PreLists pre;
 
   // Per frame in an upload buffer: the bone window (cbObjMatrix), the instance data (cbInstanceData, 13 float4s per
   // character), one cbInstanceIdxParam per character and the index buffer (g_InstanceIndexBuffer).
@@ -403,9 +455,10 @@ void CheckSkinMotion() {
   constexpr uint32_t kFrameBytes = kIndexAt + 256;
   static_assert(kWindow % 256 == 0 && kInstanceData % 256 == 0, "constant buffer views start at multiples of 256");
   Microsoft::WRL::ComPtr<ID3D12Resource> inputs, readback;
-  inputs.Attach(erdlss::CreateBuffer(device.Get(), uint64_t{kFrames} * kFrameBytes, D3D12_HEAP_TYPE_UPLOAD,
+  inputs.Attach(erdlss::CreateBuffer(gpu.device.Get(), uint64_t{kFrames} * kFrameBytes, D3D12_HEAP_TYPE_UPLOAD,
                                      D3D12_RESOURCE_STATE_GENERIC_READ));
-  readback.Attach(erdlss::CreateBuffer(device.Get(), kWindow, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST));
+  readback.Attach(erdlss::CreateBuffer(gpu.device.Get(), kWindow, D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_STATE_COPY_DEST));
   Check(inputs != nullptr && readback != nullptr, "create the NPC input and readback buffers");
   uint8_t* mapped = nullptr;
   const D3D12_RANGE none = {0, 0};
@@ -456,19 +509,16 @@ void CheckSkinMotion() {
     std::shuffle(jobs.begin(), jobs.end(), random);
     Check(std::all_of(jobs.begin(), jobs.end(), [&](const auto& job) { return job.prev == jobs[0].prev; }),
           "the draws of one window and list share its previous pose");
-    Check(skin.SubmitJobs(queue.Get(), jobs), "submit the NPC jobs");
+    Check(pre.Run(gpu.queue.Get(),
+                  [&](ID3D12GraphicsCommandList* cmd, int slot) { return skin.RecordJobs(cmd, slot, jobs); }),
+          "submit the NPC jobs");
 
     // The frame's end (the add-on records it at the TAA), and the previous-pose window for checking.
-    Check(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.Get(), nullptr)), "reset the list");
-    skin.RecordFrameEnd(list.Get());
+    ID3D12GraphicsCommandList* const list = gpu.Begin();
+    skin.RecordFrameEnd(list);
     list->CopyBufferRegion(readback.Get(), 0, skin.prev_buffer(),
                            jobs[0].prev - skin.prev_buffer()->GetGPUVirtualAddress(), kWindow);
-    Check(SUCCEEDED(list->Close()), "close the frame end");
-    ID3D12CommandList* lists[] = {list.Get()};
-    queue->ExecuteCommandLists(1, lists);
-    Check(SUCCEEDED(queue->Signal(fence.Get(), frame + 1)) && SUCCEEDED(fence->SetEventOnCompletion(frame + 1, event)) &&
-              WaitForSingleObject(event, 10000) == WAIT_OBJECT_0,
-          "wait for the NPC frame");
+    gpu.Finish("wait for the NPC frame");
 
     void* data = nullptr;
     const D3D12_RANGE all = {0, kWindow};
@@ -487,26 +537,162 @@ void CheckSkinMotion() {
     readback->Unmap(0, &none);
   }
   inputs->Unmap(0, nullptr);
-  CloseHandle(event);
   std::printf("NPC previous poses: %u of %u characters wrong over %u frames\n", mismatches, kChars * kFrames, kFrames);
   Check(mismatches == 0, "every character must get its own bones from the frame before");
-  if (validated) {
-    Microsoft::WRL::ComPtr<ID3D12InfoQueue> info;
-    if (SUCCEEDED(device.As(&info))) {
-      uint64_t errors = 0;
-      for (UINT64 i = 0, n = info->GetNumStoredMessages(); i < n; ++i) {
-        SIZE_T size = 0;
-        info->GetMessage(i, nullptr, &size);
-        std::vector<uint8_t> buffer(size);
-        auto* const message = reinterpret_cast<D3D12_MESSAGE*>(buffer.data());
-        if (FAILED(info->GetMessage(i, message, &size)) || message->Severity > D3D12_MESSAGE_SEVERITY_ERROR) continue;
-        std::fprintf(stderr, "D3D12: %s\n", message->pDescription);
-        ++errors;
+  gpu.CheckDebugLayer();
+  pre.Shutdown();
+  skin.Shutdown();
+}
+
+// The SpeedTree wind patches (tree_wind.hlsl). 24 trees of one shader stand still 7 m apart and are drawn in four draws
+// that group and order them anew every frame, each tree at a shuffled place of its draw's windows (through the index
+// buffer at an offset). The patches of a frame run together before its lists, as the add-on runs them, and every third
+// frame inline with barriers ("treebatch off"). Every tree's patched entry must be its wind from the frame before.
+// The patches that run before their lists are checked at their draws ("treebatch verify"), which must find nothing
+// wrong, except in one frame where the game's wind and a tree's position change between the patches and the draws.
+void CheckTreeWind() {
+  GpuTest gpu;
+  erdlss::WindMotion wind;
+  Check(wind.Init(gpu.device.Get(), 3000), wind.status().c_str());
+  wind.set_tree_verify(true);
+  erdlss::PreLists pre;
+  uint32_t counts[7] = {}, last_counts[7] = {};
+
+  constexpr uint32_t kTrees = 24, kDraws = 4, kPerDraw = kTrees / kDraws, kFrames = 12, kEntry = 17 * 16;
+  constexpr uint32_t kIdxOffset = 3, kIndexEntries = 16, kModel = 0x5EED, kChangedFrame = 7;
+  // Per draw: its cbSpeedTreeWind and cbInstanceData windows, cbInstanceIdxParam and g_InstanceIndexBuffer.
+  constexpr uint32_t kWindBytes = (kPerDraw * kEntry + 255) & ~255u, kInstanceBytes = (kPerDraw * 13 * 16 + 255) & ~255u;
+  constexpr uint32_t kInstancesAt = kWindBytes, kIdxAt = kInstancesAt + kInstanceBytes, kIndexAt = kIdxAt + 256;
+  constexpr uint32_t kDrawBytes = kIndexAt + 256, kFrameBytes = kDraws * kDrawBytes;
+  Microsoft::WRL::ComPtr<ID3D12Resource> inputs, readback;
+  inputs.Attach(erdlss::CreateBuffer(gpu.device.Get(), uint64_t{kFrames} * kFrameBytes, D3D12_HEAP_TYPE_UPLOAD,
+                                     D3D12_RESOURCE_STATE_GENERIC_READ));
+  readback.Attach(erdlss::CreateBuffer(gpu.device.Get(), kDraws * kWindBytes, D3D12_HEAP_TYPE_READBACK,
+                                       D3D12_RESOURCE_STATE_COPY_DEST));
+  Check(inputs != nullptr && readback != nullptr, "create the tree input and readback buffers");
+  uint8_t* mapped = nullptr;
+  const D3D12_RANGE none = {0, 0};
+  Check(SUCCEEDED(inputs->Map(0, &none, reinterpret_cast<void**>(&mapped))), "map the tree inputs");
+  const auto wind_value = [](uint32_t frame, uint32_t tree, uint32_t value) {
+    return static_cast<float>(frame * 100000 + tree * 1000 + value);
+  };
+
+  {
+    erdlss::WindMotion::TreeJob job;
+    const D3D12_GPU_VIRTUAL_ADDRESS va = inputs->GetGPUVirtualAddress();
+    Check(!wind.PrepareTreeJob(va, kWindBytes, va + kInstancesAt, kInstanceBytes, va + kIdxAt, va + kIndexAt,
+                               kIndexEntries * 4, 0, kModel, &job) &&
+              !wind.PrepareTreeJob(va, 65536 + 256, va + kInstancesAt, kInstanceBytes, va + kIdxAt, va + kIndexAt,
+                                   kIndexEntries * 4, kPerDraw, kModel, &job),
+          "tree jobs without instances or with a window over 64 KB are refused");
+  }
+
+  std::mt19937 random(11);
+  uint32_t mismatches = 0;
+  for (uint32_t frame = 0; frame < kFrames; ++frame) {
+    std::vector<uint32_t> order(kTrees);  // the trees of draw d are order[d * kPerDraw ...]
+    std::iota(order.begin(), order.end(), 0u);
+    std::shuffle(order.begin(), order.end(), random);
+    std::vector<std::vector<uint32_t>> place(kDraws, std::vector<uint32_t>(kPerDraw));  // instance -> window index
+    std::vector<erdlss::WindMotion::TreeJob> jobs(kDraws);
+    const D3D12_GPU_VIRTUAL_ADDRESS frame_va = inputs->GetGPUVirtualAddress() + uint64_t{frame} * kFrameBytes;
+    for (uint32_t d = 0; d < kDraws; ++d) {
+      uint8_t* const base = mapped + static_cast<size_t>(frame) * kFrameBytes + static_cast<size_t>(d) * kDrawBytes;
+      std::iota(place[d].begin(), place[d].end(), 0u);
+      std::shuffle(place[d].begin(), place[d].end(), random);
+      std::memset(base, 0, kDrawBytes);
+      for (uint32_t k = 0; k < kPerDraw; ++k) {
+        const uint32_t tree = order[d * kPerDraw + k], idx = place[d][k];
+        auto* const entry = reinterpret_cast<float*>(base) + static_cast<size_t>(idx) * 17 * 4;
+        for (uint32_t v = 0; v < 17 * 4; ++v) entry[v] = wind_value(frame, tree, v);
+        // PerInstanceData: the tree's position in the .w of mWorld's rows.
+        auto* const instance = reinterpret_cast<float*>(base + kInstancesAt) + static_cast<size_t>(idx) * 13 * 4;
+        instance[3] = static_cast<float>(tree % 6) * 7.0f;
+        instance[7] = 0.5f;
+        instance[11] = static_cast<float>(tree / 6) * 7.0f;
+        std::memcpy(base + kIndexAt + (kIdxOffset + k) * 4, &idx, 4);
       }
-      Check(errors == 0, "the D3D12 debug layer must report no errors");
+      const int32_t offset = kIdxOffset;  // VC_InstanceIdxOffset
+      std::memcpy(base + kIdxAt, &offset, 4);
+      const D3D12_GPU_VIRTUAL_ADDRESS va = frame_va + uint64_t{d} * kDrawBytes;
+      Check(wind.PrepareTreeJob(va, kWindBytes, va + kInstancesAt, kInstanceBytes, va + kIdxAt, va + kIndexAt,
+                                kIndexEntries * 4, kPerDraw, kModel, &jobs[d]),
+            "plan a tree job");
+    }
+
+    const bool inline_patches = frame % 3 == 2;
+    if (!inline_patches)
+      Check(pre.Run(gpu.queue.Get(),
+                    [&](ID3D12GraphicsCommandList* cmd, int) { return wind.RecordTreeJobs(cmd, jobs); }),
+            "submit the tree jobs");
+    if (frame == kChangedFrame) {
+      // After the patches, before the draws: draw 1's wind and the position of draw 2's first tree change.
+      gpu.Wait("wait for the tree patches");
+      uint8_t* const base = mapped + static_cast<size_t>(frame) * kFrameBytes;
+      for (uint32_t idx = 0; idx < kPerDraw; ++idx)
+        reinterpret_cast<float*>(base + kDrawBytes + idx * kEntry)[0] += 0.5f;
+      reinterpret_cast<float*>(base + 2 * kDrawBytes + kInstancesAt + place[2][0] * 13 * 16)[3] += 100.0f;
+    }
+    // Each draw: an inline patch, or the check of its patch from before the list.
+    ID3D12GraphicsCommandList* const list = gpu.Begin();
+    for (uint32_t d = 0; d < kDraws; ++d) wind.RecordTreeWind(list, jobs[d], d == 0, !inline_patches);
+    // The frame's end (the add-on records it at the TAA), and the patched copies for checking. Inline patches and
+    // checks leave the ring as constant buffers.
+    wind.RecordFrameEnd(list);
+    ID3D12Resource* const ring = wind.tree_ring_buffer();
+    {
+      const D3D12_RESOURCE_BARRIER to = erdlss::Transition(ring, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list->ResourceBarrier(1, &to);
+    }
+    for (uint32_t d = 0; d < kDraws; ++d)
+      list->CopyBufferRegion(readback.Get(), uint64_t{d} * kWindBytes, ring,
+                             jobs[d].copy - ring->GetGPUVirtualAddress(), kPerDraw * kEntry);
+    gpu.Finish("wait for the tree frame");
+
+    void* data = nullptr;
+    const D3D12_RANGE all = {0, kDraws * kWindBytes};
+    Check(SUCCEEDED(readback->Map(0, &all, &data)) && data != nullptr, "map the readback");
+    for (uint32_t d = 0; d < kDraws; ++d)
+      for (uint32_t k = 0; k < kPerDraw; ++k) {
+        const uint32_t tree = order[d * kPerDraw + k];
+        const float* const entry =
+            static_cast<const float*>(data) + (static_cast<size_t>(d) * kWindBytes + place[d][k] * kEntry) / 4;
+        for (uint32_t v = 0; v < 17 * 4; ++v)
+          if (entry[v] != wind_value(frame > 0 ? frame - 1 : 0, tree, v)) {
+            std::fprintf(stderr, "frame %u (%s): tree %u has %.0f where %.0f belongs (frame * 100000 + tree * 1000)\n",
+                         frame, inline_patches ? "inline" : "batched", tree, entry[v],
+                         wind_value(frame > 0 ? frame - 1 : 0, tree, v));
+            ++mismatches;
+            break;
+          }
+      }
+    readback->Unmap(0, &none);
+
+    // The checks of this frame's patches: trees checked, with last frame's entry, with a differing copy (and an
+    // entry), with this frame's entry differing from the draw's wind, missing from this frame's table.
+    Check(wind.TreeVerifyCounts(counts), "read the check counts");
+    uint32_t delta[7];
+    for (int i = 0; i < 7; ++i) delta[i] = counts[i] - last_counts[i];
+    std::copy(counts, counts + 7, last_counts);
+    const uint32_t checked = inline_patches ? 0 : kTrees, found = frame == 0 ? 0 : checked;
+    const bool changed = frame == kChangedFrame;
+    const uint32_t expected[7] = {1, checked, found - (changed ? 1 : 0), changed ? 1u : 0u, 0, changed ? kPerDraw : 0,
+                                  changed ? 1u : 0u};
+    if (!std::equal(delta, delta + 7, expected)) {
+      std::fprintf(stderr, "frame %u: check counts %u %u %u %u %u %u %u, expected %u %u %u %u %u %u %u\n", frame,
+                   delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], expected[0], expected[1],
+                   expected[2], expected[3], expected[4], expected[5], expected[6]);
+      ++mismatches;
     }
   }
-  skin.Shutdown();
+  inputs->Unmap(0, nullptr);
+  std::printf("tree wind: %u of %u trees wrong over %u frames (with the checks)\n", mismatches, kTrees * kFrames,
+              kFrames);
+  Check(mismatches == 0, "every tree must get its own wind from the frame before, and the checks must agree");
+  gpu.CheckDebugLayer();
+  pre.Shutdown();
+  wind.Shutdown();
 }
 
 // After a game update: the version-specific lookups (the TAA filter's vtable through the RTTI, the resolution
@@ -536,10 +722,11 @@ int wmain(int argc, wchar_t** argv) {
     if (argc == 3 && std::wstring_view(argv[1]) == L"--gpu") CheckGpuWrappers(fs::absolute(argv[2]).wstring());
     else if (argc == 2 && std::wstring_view(argv[1]) == L"--water") CheckWaterSsr();
     else if (argc == 2 && std::wstring_view(argv[1]) == L"--npc") CheckSkinMotion();
+    else if (argc == 2 && std::wstring_view(argv[1]) == L"--trees") CheckTreeWind();
     else if (argc == 3 && std::wstring_view(argv[1]) == L"--exe") CheckGameExe(fs::absolute(argv[2]).wstring());
     else if (argc != 1)
       throw std::runtime_error(
-          "usage: erdlss_regressions [--gpu <SDK DLL directory> | --water | --npc | --exe <eldenring.exe>]");
+          "usage: erdlss_regressions [--gpu <SDK DLL directory> | --water | --npc | --trees | --exe <eldenring.exe>]");
     std::printf("PASS: %d regression checks\n", checks);
     return 0;
   } catch (const std::exception& error) {
