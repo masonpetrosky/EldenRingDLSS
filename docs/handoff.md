@@ -208,6 +208,12 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 - **DLSS Frame Generation:** look into adding it. First questions: Streamline or NGX directly, keeping the HUD out
   of the generated frames, frame pacing with UnlockTheFps, and Reflex (frame generation needs it; ours is injected
   at the present). A Nexus visitor asked for it too (2026-10-19).
+- **Anisotropic filtering:** find out which level the game uses. `OnCreateSampler` (`src/addon.cpp`) already sees
+  every sampler the game creates (for the mip bias); log `filter`, `max_anisotropy` and the address modes once.
+  Static samplers in root signatures would not pass through `create_sampler`. FF7 Rebirth asked for 4x, and our
+  FF7RebirthAnisotropic add-on raises that to 16x: it leaves 1x samplers alone, and the level changes only on a
+  restart because the samplers are made at start-up. If Elden Ring is below 16x, add an ini option here or a
+  standalone add-on like that one.
 - **Nexus report (answered 2026-10-20, waiting for their tests):** light particles under upscaling sometimes move
   the wrong way for a moment and then snap back, with occasional artifacts around them (easy to see after burning
   the Erdtree). Asked whether it happens at DLAA and with F9, which preset, and for a clip. The same player sees no
