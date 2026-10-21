@@ -1,5 +1,5 @@
-# Installs the built add-on, ReShade and the DLSS runtime into ModEngine3's profile folder. Nothing is written
-# to the game folder.
+# Installs the built add-on, ReShade and NVIDIA's DLSS and Streamline runtimes into ModEngine3's profile folder.
+# Nothing is written to the game folder.
 #   -Target main  natives\EldenRingDLSS with the release DLSS DLL, added to the everyday `eldenring-default`
 #                 profile (Start menu "ELDEN RING (me3)") after UnlockTheFps.
 #   -Target dev   natives\EldenRingDLSS-dev with NVIDIA's developer DLSS DLL, in its own `eldenring-dlss-dev`
@@ -25,6 +25,11 @@ Copy-Item (Join-Path $root "third_party\dlss\bin\$dlssBuild\nvngx_dlss.dll") $ds
 # Ray Reconstruction (RayReconstruction=1 in the add-on's ini)
 $rr = Join-Path $root "third_party\dlss\bin\$dlssBuild\nvngx_dlssd.dll"
 if (Test-Path $rr) { Copy-Item $rr $dst -Force }
+# Frame generation (FrameGeneration in the add-on's ini): Streamline's signed DLLs and DLSS-G's runtime, which has to
+# lie next to nvngx_dlss.dll.
+foreach ($dll in 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss_g.dll', 'sl.reflex.dll', 'sl.pcl.dll', 'nvngx_dlssg.dll') {
+  Copy-Item (Join-Path $root "third_party\streamline\bin\$dll") $dst -Force
+}
 
 $reshadeIni = Join-Path $dst 'ReShade.ini'
 if (-not (Test-Path $reshadeIni)) {
