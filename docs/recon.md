@@ -909,6 +909,22 @@ user: "Reflection looks great now", "it's night and day" (no A/B needed). Cost a
 74.0 fps. Whole-frame temporal noise (8-shot bursts, `tools/flicker.py`): 6.9 with and without, 9.7 with the game's
 TAA at 100%.
 
+The water then flickered while the user ran through it, and sometimes while standing still: "switching back and forth
+between what it looks like now and what it looked like before" (native and engine reflection). The chain ran every
+frame (2 water draws and 15 mip draws per chain, misses only at the start, nothing else in the log). Remote toggles at
+one spot: with `ssr off` the flicker was gone, with `rr off` (super resolution) it stayed. The cause was the add-on's
+own list handling. The hooks before the TAA (the half-depth note, the chain start, the mip draws, the water draws and
+the lit draws) only ran in lists not marked for the corrections after the TAA, and a list decided at submission (a
+kind seen on both sides of the TAA, recorded with predicated draws) is marked. About one such list per frame, nearly
+all landing before the TAA. A list's kind is its first draw (pipeline and target), and the water's lit draws
+sometimes record in a list that starts with a particle effect of such a kind, so that frame's water read the
+engine's reflection. With remote `dual off` (those lists back to the majority rule) the flicker was gone, and a flame
+glitched once, as expected without the predicates. The water hooks now also run in lists decided at submission
+(`BeforeTaaList`). The add-on's own draws there are not predicated, and the water draws' constant edit is written
+at once (only the corrections after the TAA wait for the submission). `ssr` counts the lit draws redirected in such
+lists: 612 in the first seconds after such lists started (about 25 s after loading in). The user, at the same spot
+and running through the water: "water is great now".
+
 ## The game update to App Ver. 1.17.2 (`eldenring.exe` 2.7.2.0, 2026-10-20)
 
 Steam replaced `eldenring.exe`, `regulation.bin` and parts of `Data0`/`Data3`. The shaders the add-on logs at

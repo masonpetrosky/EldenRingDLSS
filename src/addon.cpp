@@ -392,6 +392,7 @@ std::atomic<uint64_t> g_ssr_reflection{0}, g_ssr_blur{0}, g_ssr_linear{0};
 std::mutex g_ssr_sources_mutex;
 std::unordered_map<uint64_t, uint64_t> g_ssr_depth_sources;  // half-size depth -> the full-size depth it came from
 std::atomic<uint64_t> g_ssr_chains{0}, g_ssr_water{0}, g_ssr_steps{0}, g_ssr_lit{0}, g_ssr_misses{0};
+std::atomic<uint64_t> g_ssr_lit_dual{0};  // of g_ssr_lit, those in lists decided at submission
 
 // Development pass log (remote "passlog"): every draw after the TAA in one frame, with its viewport and targets.
 std::mutex g_passlog_mutex;
@@ -3571,6 +3572,12 @@ bool ReadBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg
 
 bool SsrWanted() { return g_config.water_reflections && g_config.enabled && g_config.render_scale < 0.99f; }
 
+// The water's reflection passes and lit draws come before the TAA: they run in lists before it and in lists decided
+// at submission (`dual`), which nearly always land before it. The water's lit draws sometimes record in a list whose
+// kind (its first draw, often a particle effect) also comes after the TAA; skipped there, that frame's water showed
+// the engine's coarse reflection, and the water flickered between the two (most while running through it).
+bool BeforeTaaList(const CmdData& data) { return !data.post_fix || data.dual; }
+
 void SsrMiss(const std::string& what) {
   if (g_ssr_misses++ < 4) Log(reshade::log::level::warning, "Water reflections: " + what);
 }
@@ -3837,15 +3844,17 @@ bool SsrMipDraw(command_list* cmd_list, const CmdData& data, Draw draw) {
 
 // The forward pass: the water's lighting reads the reflection (g_RLRTexture, t44) at the scene's share; from the
 // add-on's textures while their chain runs.
-void SsrLitDraw(command_list* cmd_list) {
+void SsrLitDraw(command_list* cmd_list, const CmdData& data) {
   const uint64_t reflection = g_ssr_reflection.load(), frame = g_frame.load(), chain = g_ssr_chain_frame.load();
   if (reflection == 0 || !g_ssr_chain.load() || chain == 0 || chain + 2 < frame) return;
   std::lock_guard resource_lock(g_resource_cache_mutex);
   if (BoundResource(cmd_list, shader_stage::pixel, 44).handle != reflection) return;
   std::lock_guard lock(g_ssr_mutex);
   if (g_water_ssr.sized() && RedirectShaderResource(cmd_list, shader_stage::pixel, 44,
-                                                    g_water_ssr.Srv(erdlss::WaterSsr::Target::kReflection)))
+                                                    g_water_ssr.Srv(erdlss::WaterSsr::Target::kReflection))) {
     ++g_ssr_lit;
+    if (data.dual) ++g_ssr_lit_dual;
+  }
 }
 
 // Work at the draws after the TAA: learning the buffers the stretch needs, the pass log, and the composite.
@@ -3882,11 +3891,11 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
   ProfileWork(cmd_list, *data, 1);
-  if (data->pass == Pass::kSsrWater && !data->post_fix)
+  if (data->pass == Pass::kSsrWater && BeforeTaaList(*data))
     SsrWaterDraw(cmd_list, [&](ID3D12GraphicsCommandList* native) {
       native->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
     });
-  if (data->pass == Pass::kForward && !data->post_fix) SsrLitDraw(cmd_list);
+  if (data->pass == Pass::kForward && BeforeTaaList(*data)) SsrLitDraw(cmd_list, *data);
   DrawFix fix;
   if (data->post_fix) CorrectPostPass(cmd_list, *data, false, &fix);
   OnPostPass(cmd_list, *data);
@@ -4218,7 +4227,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     }
     return false;
   }
-  if (!data->post_fix) {
+  if (BeforeTaaList(*data)) {
     if (data->pass == Pass::kDepthHalf && SsrWanted()) NoteHalfDepth(cmd_list);
     if (data->pass == Pass::kSsrConvert) StartSsrChain(cmd_list, *data);
     if ((data->pass == Pass::kSsrDown || data->pass == Pass::kSsrBlur) &&
@@ -5432,7 +5441,7 @@ void OnReshadePresent(effect_runtime* runtime) {
     char text[400];
     std::snprintf(text, sizeof(text),
                   "%s, %s; textures %ux%u, share %.1fx%.1f, %.0f MB; chains %llu, water draws %llu, mip draws %llu, "
-                  "lit draws %llu, misses %llu; previous frame whole: %s",
+                  "lit draws %llu (%llu in lists decided at submission), misses %llu; previous frame whole: %s",
                   g_config.water_reflections ? "on" : "off",
                   g_ssr_failed ? g_water_ssr.status().c_str() : g_ssr_chain.load() ? "running" : "not running",
                   g_water_ssr.width(), g_water_ssr.height(), g_water_ssr.share_width(), g_water_ssr.share_height(),
@@ -5440,6 +5449,7 @@ void OnReshadePresent(effect_runtime* runtime) {
                   static_cast<unsigned long long>(g_ssr_chains.load()),
                   static_cast<unsigned long long>(g_ssr_water.load()),
                   static_cast<unsigned long long>(g_ssr_steps.load()), static_cast<unsigned long long>(g_ssr_lit.load()),
+                  static_cast<unsigned long long>(g_ssr_lit_dual.load()),
                   static_cast<unsigned long long>(g_ssr_misses.load()),
                   g_ssr_prev_full.load() + 2 >= g_frame.load() && g_ssr_prev_full.load() != 0 ? "yes" : "no");
     result = text;
