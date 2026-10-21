@@ -29,11 +29,12 @@ for picking up.
 | Water flickered between the native and the engine's reflection | Fixed (hooks now run in lists decided at submission); user: "water is great now" |
 | A ghost had no motion vectors (drawn in the forward pass, which the NPC path skipped) | Fixed: characters' forward prepasses stream like G-buffer draws; user: "everything looks great" |
 | Game update 1.17.2 moved the TAA filter's vtable | Fixed (RTTI lookup) in 0.3.0: GitHub release and everyday install (2026-10-20) |
-| DLSS Frame Generation (Streamline DLSS-G, `FrameGeneration`) | Done (2026-10-21), test copy `dist/test-0.4.0-fg` only; the user played 2x-4x ("working correctly"); with the faster NPC path they prefer it off |
-| Castle courtyard at 52 fps: NPC patches took 5.3 ms | Fixed (2026-10-21): lookups run together, 0.2 ms, 70 fps there; verified in game; `docs/recon.md` |
-| Tree wind patches stalled the G-buffer (trees about 2 ms) | Fixed (2026-10-21): patches run before their lists, trees about 0.5 ms, forest 45.6 -> 48.8 fps; checked in game (`treebatch verify`, alternating A/B); test copy |
+| DLSS Frame Generation (Streamline DLSS-G, `FrameGeneration`) | Done (2026-10-21), in 0.4.0 (off by default) and the everyday install (off, the user's choice: they played 2x-4x, "working correctly", and prefer it off with the faster NPC path) |
+| Castle courtyard at 52 fps: NPC patches took 5.3 ms | Fixed (2026-10-21): lookups run together, 0.2 ms, 70 fps there; verified in game; in 0.4.0; `docs/recon.md` |
+| Tree wind patches stalled the G-buffer (trees about 2 ms) | Fixed (2026-10-21): patches run before their lists, trees about 0.5 ms, forest 45.6 -> 48.8 fps; checked in game (`treebatch verify`, alternating A/B); in 0.4.0, which turns the trees on by default |
 | The game's anisotropic filtering | Already 16x (2026-10-21; `docs/recon.md`) |
-| GitHub issue #1, Proton black screen | NGX and NVAPI start on a thread of their own (2026-10-21); untested under Proton |
+| GitHub issue #1, Proton black screen | NGX and NVAPI start on a thread of their own in 0.4.0; untested under Proton, the reporter was asked to try it (2026-10-21) |
+| 0.4.0 release (frame generation, the courtyard and forest speed-ups, trees on by default) | GitHub + Nexus, everyday install (2026-10-21) |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -74,9 +75,13 @@ frame whose lighting was already recorded; later frames restore the game's denoi
 Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
-  `natives\EldenRingDLSS` (release DLSS DLL). **Since 2026-10-20 the 0.3.0 release build** (0.2.0's from 2026-10-19
-  before it; undo copies in `Documents\Backups\EldenRing\2026-10-19-before-dlss-0.2.0` and
-  `2026-10-20-before-dlss-0.3.0`); its ini is the one below with `RtShadowRayGen=4`, water reflections on by default.
+  `natives\EldenRingDLSS` (release DLSS DLL). **Since 2026-10-21 the 0.4.0 release build** with the Streamline DLLs
+  and `nvngx_dlssg.dll`, frame generation off (the ini has no `FrameGeneration` line); 0.3.0 from 2026-10-20 and
+  0.2.0 from 2026-10-19 before it; undo copies in `Documents\Backups\EldenRing\2026-10-19-before-dlss-0.2.0`,
+  `2026-10-20-before-dlss-0.3.0` and `2026-10-21-before-dlss-0.4.0`. Its ini is the one below with
+  `RtShadowRayGen=4`, water reflections on by default. Its `ReShade.log` and NGX logs were last written 2026-10-12,
+  so nothing has started from this profile since (the in-game tests ran from the test copies) and 0.2.0 to 0.4.0
+  have not run here yet; check its log after the user's next session there.
   Earlier: the build of commit 6c124ae, installed 2026-10-12 morning with the user's
   OK: d0f03f5 (installed after midnight) plus the fast-travel fix and the dev-only GPU profiler. 50% with preset M, enemy and animal motion vectors (`NpcMotion=1`) and the trees' motion at 50% fixed,
   object-only motion blur (`ObjectBlur=1`) with the game's Motion Blur on: the user tried it in this install and
@@ -192,6 +197,15 @@ pwsh -NoProfile -File tools/package.ps1               # release zip in dist\ (ve
   notes in `dist\release-notes-0.3.0.md`, local); regression checks and the 2.7.2.0 executable check passed; its
   add-on is the build the user tested in game (`dist\test-0.3.0`) but for the version resource. Nexus: the file as
   the update of 0.2.0 and the page from `dist\nexus\page-0.3.0.bbcode` (local).
+- **0.4.0, released 2026-10-21** (the user OK'd the GitHub release, the Nexus update, the issue #1 comment, the
+  everyday install and trees on by default: "Yes to all 3"): frame generation, the NPC lookups run together, the tree
+  wind patches before their lists, NGX and NVAPI off the device thread, `WindTrees=1` by default (`CHANGELOG.md`).
+  Tag v0.4.0 at 45c49aa, GitHub release with `EldenRingDLSS-0.4.0.zip` (SHA-256 `667DF495...CC4A`; notes in
+  `dist\release-notes-0.4.0.md`, local); regression checks passed (NGX 57, NPC 497, trees 159, water 75, executable
+  29). Its add-on differs from the build the user played (`dist\test-0.4.0-fg`, 78C29770) only in the `WindTrees`
+  default, a tooltip and the version resource. Nexus: the file as the update of 0.3.0 (0.3.0 archived, virus scan
+  "Safe to use"), version 0.4.0, the summary (350 characters, now naming frame generation), the page from
+  `dist\nexus\page-0.4.0.bbcode` (local), and the sticky 177857019 announces 0.4.0.
 
 ## Ray tracing with our own ray generation shaders (dev)
 
@@ -216,25 +230,31 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 `docs/recon.md`, "The castle courtyard"), DLSS Frame Generation (`docs/recon.md`, "DLSS Frame Generation"; the user
 preferred 2x at first, and off once the courtyard ran at 70 fps) and the anisotropic filtering check (the game already
 uses 16x). Then, on the user's request, the trees the same way (`docs/recon.md`, "The tree wind patches stalled the
-G-buffer"): about 1.5 ms saved in a forest.
+G-buffer"): about 1.5 ms saved in a forest. All of it went out as 0.4.0 the same day.
 
 **Next:**
-- **0.4.0, OK'd by the user 2026-10-21** ("Yes to all 3"): the release on GitHub and Nexus with tree motion vectors
-  on by default (`WindTrees=1`), the everyday install from its zip with `FrameGeneration=0` (their choice; back up
-  first, game closed), and a comment on GitHub issue #1. Notes in `dist\release-notes-0.4.0.md` (local).
+- **Nexus replies waiting for the user's OK** (drafts in `dist\nexus\replies-2026-10-21.md`, local): Ver3ion's
+  particle details, Kagerrriter's laptop RTX 5060 without a gain at 1440p, and Maooq's thanks in the thread where we
+  promised to say when frame generation works (it is in 0.4.0).
 - Streamline logged "ERROR RSYNC: Flip queue is empty!!!" once at the title screen (2026-10-21); harmless so far,
   not looked into.
-- **Nexus report (answered 2026-10-20, waiting for their tests):** light particles under upscaling sometimes move
-  the wrong way for a moment and then snap back, with occasional artifacts around them (easy to see after burning
-  the Erdtree). Asked whether it happens at DLAA and with F9, which preset, and for a clip. The same player sees no
-  visible difference from the wind motion vectors (answered: subtle, mostly at 50-58%).
+- **Nexus report (Ver3ion, thread 177485424):** light particles under upscaling sometimes move the wrong way for a
+  moment and then snap back, with occasional artifacts around them (easy to see after burning the Erdtree). Their
+  answer of 2026-10-21 01:06: only while upscaling, too hard to film; easiest to see with an endgame save where fire
+  particles are dense, moving the camera. To reproduce, the user needs such a save. The same player sees no visible
+  difference from the wind motion vectors (answered: subtle, mostly at 50-58%).
 - **GitHub issue #1, Proton black screen (answered 2026-10-20):** the reporter's 0.1.0 log stops while NGX starts
   inside `OnInitDevice` (ReShade's init_device event): under Proton NGX finds the driver through
   `/run/host/usr/lib/nvidia/wine`, then nvapi64.dll creates a D3D11 device and a 1x1 swap chain on another thread,
   and nothing more is logged; likely a deadlock with the device setup. Since 0.2.0 `Reflex::Init` (NvAPI_Initialize)
   runs there too, even with Reflex off. Asked for a ReShade-alone test and a 0.3.0 log. Since 2026-10-21 NGX and
   NVAPI start on a thread the game does not wait on (`StartNvidia` in `src/addon.cpp`), and Streamline is skipped
-  under Wine; a comment on the issue once it is released needs the user's OK.
+  under Wine. The reporter answered 2026-10-21 06:10 UTC: ReShade alone runs; the 0.3.0 log stops in the same place.
+  Their Proton log (WINEDEBUG with seh and loaddll) shows the device thread loading `nvngx_dlss.dll` and
+  `nvngx_dlssd.dll`, then dxvk-nvapi's `NvAPI_D3D12_CreateCubinComputeShaderWithName` (and `...Ex`) returning
+  "Invalid argument", and nothing more from that thread. Our comment of 2026-10-21 (issuecomment-6323542495) asks
+  them to try 0.4.0: if NGX still hangs there, the game should run on its TAA and log "NGX and NVAPI have not
+  finished starting after 20 s".
 
 0. **Broader NPC motion checks, then test the 83545fe foliage changes** (game closed;
    targeted post-audit checks passed; original 50% DLSS/RR settings restored;
