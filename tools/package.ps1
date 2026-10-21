@@ -21,12 +21,20 @@ Copy-Item (Join-Path $package 'EldenRingDLSS.me3') $stage
   Set-Content (Join-Path $stage 'INSTALL.txt') -Encoding utf8NoBOM -NoNewline
 Copy-Item $addon, (Join-Path $package 'EldenRingDLSS.ini'), (Join-Path $package 'ReShade.ini') $folder
 Copy-Item (Join-Path $root 'third_party\dlss\bin\rel\nvngx_dlss.dll'), (Join-Path $root 'third_party\dlss\bin\rel\nvngx_dlssd.dll') $folder
+# Streamline for frame generation (tools\fetch_streamline.ps1): NVIDIA's signed DLLs as they come.
+$streamline = Join-Path $root 'third_party\streamline'
+foreach ($dll in 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss_g.dll', 'sl.reflex.dll', 'sl.pcl.dll', 'nvngx_dlssg.dll') {
+  Copy-Item (Join-Path $streamline "bin\$dll") $folder
+}
 
 Copy-Item (Join-Path $root 'LICENSE') (Join-Path $licenses 'LICENSE.txt')
 Copy-Item (Join-Path $root 'third_party\dlss\LICENSE.txt') (Join-Path $licenses 'NVIDIA-RTX-SDKs-LICENSE.txt')
 Copy-Item (Join-Path $root 'third_party\reshade\LICENSE.md') (Join-Path $licenses 'ReShade-LICENSE.md')
 Copy-Item (Join-Path $root 'third_party\imgui\LICENSE.txt') (Join-Path $licenses 'ImGui-LICENSE.txt')
 Copy-Item (Join-Path $root 'third_party\nvapi\License.txt') (Join-Path $licenses 'NVAPI-LICENSE.txt')
+# Streamline's own license; nvngx_dlssg.dll comes under the RTX SDKs license above, Reflex under its own.
+Copy-Item (Join-Path $streamline 'LICENSE.txt') (Join-Path $licenses 'Streamline-LICENSE.txt')
+Copy-Item (Join-Path $streamline 'reflex.license.txt') (Join-Path $licenses 'Reflex-LICENSE.txt')
 
 $zip = Join-Path $root "dist\$name.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }

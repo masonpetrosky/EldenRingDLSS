@@ -8,6 +8,9 @@ if (-not (Test-Path "$PSScriptRoot\third_party\dlss\lib\nvsdk_ngx_s.lib")) {
 if (-not (Test-Path "$PSScriptRoot\third_party\nvapi\amd64\nvapi64.lib")) {
   & "$PSScriptRoot\tools\fetch_nvapi.ps1" | Out-Null
 }
+if (-not (Test-Path "$PSScriptRoot\third_party\streamline\include\sl.h")) {
+  & "$PSScriptRoot\tools\fetch_streamline.ps1" | Out-Null
+}
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath

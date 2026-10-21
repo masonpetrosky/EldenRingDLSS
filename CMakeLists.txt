@@ -18,6 +18,12 @@ set(NVAPI_DIR ${CMAKE_SOURCE_DIR}/third_party/nvapi)
 if(NOT EXISTS ${NVAPI_DIR}/amd64/nvapi64.lib)
   message(FATAL_ERROR "NVAPI not found in ${NVAPI_DIR}. Run tools/fetch_nvapi.ps1 first.")
 endif()
+# NVIDIA's Streamline SDK (MIT; DLSS Frame Generation), downloaded by tools/fetch_streamline.ps1. Only its headers are
+# used at build time: the add-on loads sl.interposer.dll at run time.
+set(STREAMLINE_DIR ${CMAKE_SOURCE_DIR}/third_party/streamline)
+if(NOT EXISTS ${STREAMLINE_DIR}/include/sl.h)
+  message(FATAL_ERROR "Streamline not found in ${STREAMLINE_DIR}. Run tools/fetch_streamline.ps1 first.")
+endif()
 
 # ReShade's state tracking helper (BSD-3-Clause OR MIT).
 add_library(reshade_utils STATIC third_party/reshade/state_tracking.cpp)
@@ -104,6 +110,7 @@ shader(kSkinMotionLookupCs skin_motion.hlsl cs_5_0 Lookup)
 shader(kSkinMotionResolveCs skin_motion.hlsl cs_5_0 Resolve)
 shader(kSkinMotionClearCs skin_motion.hlsl cs_5_0 Clear)
 shader(kSkinMotionAdvanceCs skin_motion.hlsl cs_5_0 Advance)
+shader(kUiAlphaCs ui_alpha.hlsl cs_5_0 main)
 # Ported grass shaders: per material a fused (default), an unfused and a static vertex shader (the latter two for cost
 # measurements), and the alpha-tested pixel shaders.
 foreach(variant FUSED UNFUSED STATIC)
@@ -136,12 +143,12 @@ configure_file(src/version.rc.in ${CMAKE_BINARY_DIR}/version.rc @ONLY)
 
 set(ERDLSS_RUNTIME_SOURCES src/descriptors.cpp src/dlss.cpp src/wind.cpp src/wind_port.cpp
             src/tree_dump.cpp src/engine_resolution.cpp src/render_scale.cpp src/stretch.cpp src/water_ssr.cpp src/taa_jitter.cpp src/rr_guides.cpp src/ao_upscale.cpp
-            src/hw_breakpoints.cpp src/drs_probe.cpp src/rt_pipeline.cpp src/skin_motion.cpp src/dred.cpp src/object_blur.cpp src/reflex.cpp src/gpu_profiler.cpp)
+            src/hw_breakpoints.cpp src/drs_probe.cpp src/rt_pipeline.cpp src/skin_motion.cpp src/dred.cpp src/object_blur.cpp src/reflex.cpp src/gpu_profiler.cpp src/frame_generation.cpp)
 add_library(EldenRingDLSS SHARED src/addon.cpp ${ERDLSS_RUNTIME_SOURCES} ${CMAKE_BINARY_DIR}/version.rc ${SHADER_HEADERS})
 target_include_directories(EldenRingDLSS PRIVATE src third_party/imgui ${SHADER_DIR})
-target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include ${NVAPI_DIR})
+target_include_directories(EldenRingDLSS SYSTEM PRIVATE ${DLSS_SDK_DIR}/include ${NVAPI_DIR} ${STREAMLINE_DIR}/include)
 target_link_libraries(EldenRingDLSS PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib
-                      ${NVAPI_DIR}/amd64/nvapi64.lib d3d12)
+                      ${NVAPI_DIR}/amd64/nvapi64.lib d3d12 dxgi)
 set_target_properties(EldenRingDLSS PROPERTIES SUFFIX ".addon64")
 
 # Development tool: times DLSS outside the game (tools/dlss_bench/dlss_bench.cpp).
@@ -149,13 +156,20 @@ add_executable(dlss_bench tools/dlss_bench/dlss_bench.cpp)
 target_include_directories(dlss_bench SYSTEM PRIVATE ${DLSS_SDK_DIR}/include)
 target_link_libraries(dlss_bench PRIVATE ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib d3d12 dxgi)
 
+# Development tool: runs frame generation outside the game in a window of its own (tools/fg_smoke/fg_smoke.cpp).
+add_executable(fg_smoke tools/fg_smoke/fg_smoke.cpp src/frame_generation.cpp src/dlss.cpp ${SHADER_DIR}/kUiAlphaCs.h)
+target_include_directories(fg_smoke PRIVATE src third_party/reshade ${SHADER_DIR})
+target_include_directories(fg_smoke SYSTEM PRIVATE ${STREAMLINE_DIR}/include ${DLSS_SDK_DIR}/include)
+target_link_libraries(fg_smoke PRIVATE ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib d3d12 dxgi)
+
 # Opt-in regression checks exercise addon helpers without loading or controlling the game.
 option(ERDLSS_BUILD_TESTS "Build standalone addon regression checks" OFF)
 if(ERDLSS_BUILD_TESTS)
   enable_testing()
   add_executable(erdlss_regressions tests/regressions.cpp ${ERDLSS_RUNTIME_SOURCES} ${SHADER_HEADERS})
   target_include_directories(erdlss_regressions PRIVATE src third_party/imgui ${SHADER_DIR})
-  target_include_directories(erdlss_regressions SYSTEM PRIVATE ${DLSS_SDK_DIR}/include ${NVAPI_DIR})
+  target_include_directories(erdlss_regressions SYSTEM PRIVATE ${DLSS_SDK_DIR}/include ${NVAPI_DIR}
+                             ${STREAMLINE_DIR}/include)
   target_link_libraries(erdlss_regressions PRIVATE reshade_utils ${DLSS_SDK_DIR}/lib/nvsdk_ngx_s.lib
                         ${NVAPI_DIR}/amd64/nvapi64.lib d3d12 dxgi)
   add_test(NAME addon_regressions COMMAND erdlss_regressions)

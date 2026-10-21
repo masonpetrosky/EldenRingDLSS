@@ -49,7 +49,7 @@ class Reflex {
   bool active() const { return device_ != nullptr && (enabled_.load() || markers_.load()); }
   void Marker(int type);
 
-  ID3D12Device* device_ = nullptr;
+  std::atomic<ID3D12Device*> device_{nullptr};  // set by Init, on another thread than the presents
   std::string status_ = "off";
   std::atomic<bool> enabled_{false};
   std::atomic<uint64_t> frame_{1};

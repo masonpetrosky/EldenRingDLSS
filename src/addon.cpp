@@ -28,6 +28,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -37,6 +38,7 @@
 #include "drs_probe.hpp"
 #include "dlss.hpp"
 #include "engine_resolution.hpp"
+#include "frame_generation.hpp"
 #include "hw_breakpoints.hpp"
 #include "render_scale.hpp"
 #include "rr_guides.hpp"
@@ -89,6 +91,9 @@ constexpr uint32_t kSceneParamBytes = 1424;
 constexpr size_t kScreenSize = 16 / 4;           // float4 FC_ScreenSize
 constexpr size_t kCameraPos = 48 / 4;            // float4 SC_CameraPos (the map's coordinates)
 constexpr size_t kMatrixProj = 256 / 4;          // float4x4 FC_MatrixProj, column-major
+constexpr size_t kMatrixViewProj = 384 / 4;      // float4x4 VC_MatrixViewProj, relative to SC_CameraPos
+constexpr size_t kPrevCameraPos = 448 / 4;       // float4 SC_PrevCameraPos
+constexpr size_t kPrevMatrixViewProj = 464 / 4;  // float4x4 VC_PrevMatrixViewProj, relative to SC_PrevCameraPos
 constexpr size_t kSceneExposure = 1152 / 4;      // float SC_SceneExposure
 constexpr size_t kPreExposure = 1160 / 4;        // float SC_PreExposure
 constexpr size_t kScreenPercentage = 1376 / 4;   // float4 SC_DynamicResolution_ScreenPercentage
@@ -104,6 +109,7 @@ struct SceneParams {
   float camera[3] = {0, 0, 0};
   // FC_MatrixProj's depth terms (reversed Z): device depth = depth_scale + depth_bias / view depth.
   float depth_scale = 0, depth_bias = 0;
+  erdlss::FgCamera fg;  // the camera for frame generation
 };
 
 // A constant edit to apply when its command list is submitted after the TAA.
@@ -206,6 +212,9 @@ struct Config {
   // Object-only motion blur (object_blur.hpp): the game's motion blur without the camera's motion.
   bool object_blur = false;
   bool reflex = false;  // NVIDIA Reflex low-latency mode, injected at the present (reflex.hpp)
+  // DLSS Frame Generation (frame_generation.hpp): 0 off (Streamline is not loaded), 2 to 6 the frame multiplier, -1
+  // dynamic. Loading Streamline is decided at startup; the multiplier can change while the game runs.
+  int frame_generation = 0;
   // While upscaling, the water's screen-space reflections at the size the game uses at a 100% render scale
   // (water_ssr.hpp) instead of its share of it.
   bool water_reflections = true;
@@ -224,6 +233,13 @@ fs::path g_ini_path;
 
 device* g_device = nullptr;
 erdlss::Dlss g_dlss;
+
+// NGX (DLSS) and NVAPI (Reflex) start on a thread of their own once the game's device exists (StartNvidia). ReShade
+// reports the device from inside the game's D3D12CreateDevice, and under Proton NGX's start never returned there
+// (GitHub issue #1). Until g_nvidia_ready, g_dlss and g_reflex belong to that thread and the game keeps its TAA.
+std::thread g_nvidia_thread;
+std::atomic<bool> g_nvidia_ready{false};
+std::atomic<uint64_t> g_nvidia_start_ms{0};  // GetTickCount64() when the thread started
 
 // Wind motion vectors. Animated materials' G-buffer pipelines are kept from pipeline creation (shaders and states),
 // so the stream-output copies can be built whenever the feature is switched on.
@@ -272,6 +288,8 @@ std::unordered_map<uint64_t, std::string> g_stencil_writers;
 erdlss::ObjectBlur g_object_blur;
 std::atomic<bool> g_object_blur_failed{false};
 erdlss::Reflex g_reflex;
+// DLSS Frame Generation through Streamline (ini FrameGeneration); while Streamline runs, its Reflex replaces g_reflex.
+erdlss::FrameGeneration g_fg;
 erdlss::GpuProfiler g_profiler;  // dev remote "gpuprofile"
 std::atomic<uint64_t> g_blur_frame{0};  // g_frame of the game's last motion blur (0: not seen)
 std::atomic<uint64_t> g_wind_errors{0};
@@ -664,6 +682,8 @@ void LoadConfig() {
   g_config.npc_motion = ReadInt(L"NpcMotion", 0) != 0;
   g_config.object_blur = ReadInt(L"ObjectBlur", 0) != 0;
   g_config.reflex = ReadInt(L"Reflex", 0) != 0;
+  const int frame_generation = ReadInt(L"FrameGeneration", 0);
+  g_config.frame_generation = frame_generation < 0 ? -1 : frame_generation < 2 ? 0 : std::min(frame_generation, 6);
   g_config.water_reflections = ReadInt(L"WaterReflections", 1) != 0;
   g_npc_stage = std::clamp(ReadInt(L"NpcStage", 3), 1, 3);
   g_config.dred = ReadInt(L"Dred", 0) != 0;
@@ -674,7 +694,7 @@ void LoadConfig() {
   g_config.flip_jitter_y = ReadInt(L"FlipJitterY", 0) != 0;
   g_config.flip_motion = ReadInt(L"FlipMotion", 0) != 0;
   g_config.use_depth_copy = ReadInt(L"UseDepthCopy", 0) != 0;
-  g_track_resource_states = g_config.render_scale < 1.0f || g_config.object_blur;
+  g_track_resource_states = g_config.render_scale < 1.0f || g_config.object_blur || g_config.frame_generation != 0;
 }
 
 void SaveConfig() {
@@ -696,6 +716,7 @@ void SaveConfig() {
   WriteInt(L"NpcMotion", g_config.npc_motion);
   WriteInt(L"ObjectBlur", g_config.object_blur);
   WriteInt(L"Reflex", g_config.reflex);
+  WriteInt(L"FrameGeneration", g_config.frame_generation);
   WriteInt(L"WaterReflections", g_config.water_reflections);
   WriteInt(L"RayReconstruction", g_config.ray_reconstruction);
   WriteInt(L"WindTreeCapacity", g_config.wind_tree_capacity);
@@ -804,6 +825,11 @@ bool ReadSceneParams(command_list* cmd_list, SceneParams* out) {
   std::memcpy(out->camera, f + kCameraPos, sizeof(out->camera));
   out->depth_scale = proj[10];
   out->depth_bias = proj[11];
+  std::memcpy(out->fg.proj, proj, sizeof(out->fg.proj));
+  std::memcpy(out->fg.view_proj, f + kMatrixViewProj, sizeof(out->fg.view_proj));
+  std::memcpy(out->fg.prev_view_proj, f + kPrevMatrixViewProj, sizeof(out->fg.prev_view_proj));
+  std::memcpy(out->fg.position, f + kCameraPos, sizeof(out->fg.position));
+  std::memcpy(out->fg.prev_position, f + kPrevCameraPos, sizeof(out->fg.prev_position));
   return true;
 }
 
@@ -1561,6 +1587,33 @@ void CorrectPostPassImpl(command_list* cmd_list, CmdData& data, bool compute, Dr
   if (fixed) ++g_post_fixes;
 }
 
+// DLSS Frame Generation's inputs at the TAA: the frame's camera, depth and motion vectors (the same as DLSS's), in
+// the states the game left them in; skipped until those are known.
+void TagFrameGeneration(command_list* cmd_list, resource depth, resource motion, const SceneParams& scene,
+                        uint32_t height, uint32_t in_width, uint32_t in_height) {
+  Watch(depth.handle);
+  Watch(motion.handle);
+  const resource_usage depth_usage = WatchedUsage(depth.handle), motion_usage = WatchedUsage(motion.handle);
+  if (depth_usage == resource_usage::undefined || motion_usage == resource_usage::undefined) return;
+  erdlss::FgSceneInputs in;
+  in.cmd = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  in.depth = reinterpret_cast<ID3D12Resource*>(depth.handle);
+  in.motion = reinterpret_cast<ID3D12Resource*>(motion.handle);
+  in.depth_state = ToD3D12(depth_usage);
+  in.motion_state = ToD3D12(motion_usage);
+  in.width = in_width;
+  in.height = in_height;
+  // As for DLSS (ReplaceTaa), in UV units instead of render pixels.
+  const float mv_scale =
+      (g_config.flip_motion ? 1.0f : -1.0f) * static_cast<float>(g_mv_full_basis ? height : in_height);
+  in.mv_scale[0] = mv_scale / static_cast<float>(in_width);
+  in.mv_scale[1] = mv_scale / static_cast<float>(in_height);
+  in.jitter[0] = (g_config.flip_jitter_x ? -1.0f : 1.0f) * scene.jitter_ndc_x * 0.5f * in_width;
+  in.jitter[1] = (g_config.flip_jitter_y ? -1.0f : 1.0f) * -scene.jitter_ndc_y * 0.5f * in_height;
+  in.camera = scene.fg;
+  g_fg.TagScene(in);
+}
+
 // Returns true when DLSS replaced the draw. `screen` is CB_AA's g_vScreenPercentage: the share of the targets the
 // scene was rendered into (top-left), below 1 with the engine's dynamic resolution.
 bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
@@ -1629,7 +1682,9 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
                   valid ? "" : " - inputs incomplete, keeping the game's TAA");
     SetInfo(text);
   }
-  if (!g_config.enabled || !valid || !scene_ok) return false;
+  if (valid && scene_ok && g_fg.attached())
+    TagFrameGeneration(cmd_list, depth, motion, scene, height, in_width, in_height);
+  if (!g_config.enabled || !valid || !scene_ok || !g_nvidia_ready) return false;
 
   std::lock_guard lock(g_dlss_mutex);
   if (!g_dlss.available()) return false;
@@ -1788,6 +1843,7 @@ void FinishUpscale(command_list* cmd_list, CmdData& data) {
   if (scene == 0) return;
   Watch(scene.handle);  // a new texture's state is known once the game transitions it again
   const resource_usage scene_usage = WatchedUsage(scene.handle);
+  if (!g_nvidia_ready) return;
   std::lock_guard lock(g_dlss_mutex);
   if (g_upscale.frame != g_frame.load() || scene_usage == resource_usage::undefined || !g_dlss.available()) return;
   const UpscaleInputs in = g_upscale;
@@ -1968,25 +2024,72 @@ void RemoveChromaticAberration(command_list* cmd_list) {
 
 // --- Events ------------------------------------------------------------------------------------------------
 
-void OnInitDevice(device* dev) {
-  if (dev->get_api() != device_api::d3d12 || g_device != nullptr) return;
-  g_device = dev;
+// The thread that starts NGX and NVAPI (see g_nvidia_ready). It touches g_dlss and g_reflex without their locks:
+// nothing else does until it has finished.
+void StartNvidia(ID3D12Device* device) {
   const fs::path log_dir = g_addon_dir / L"ngx";
   std::error_code ec;
   fs::create_directories(log_dir, ec);
-  std::lock_guard lock(g_dlss_mutex);
-  if (g_dlss.Init(reinterpret_cast<ID3D12Device*>(dev->get_native()), g_addon_dir.wstring(), log_dir.wstring()))
+  Log(reshade::log::level::info, "Starting NGX ...");
+  if (g_dlss.Init(device, g_addon_dir.wstring(), log_dir.wstring()))
     Log(reshade::log::level::info, "DLSS is available.");
   else
     Log(reshade::log::level::warning, "DLSS unavailable: " + g_dlss.status());
-  if (g_reflex.Init(reinterpret_cast<ID3D12Device*>(dev->get_native()))) {
+  if (g_fg.loaded()) {
+    Log(reshade::log::level::info, "Reflex runs through Streamline (frame generation).");
+  } else if (g_reflex.Init(device)) {
     if (g_config.reflex) g_reflex.SetEnabled(true);
     Log(reshade::log::level::info, "Reflex available; low-latency mode " + g_reflex.status() + ".");
   } else {
     Log(reshade::log::level::warning, "Reflex unavailable: " + g_reflex.status());
   }
-  if (!erdlss::rt_pipeline::InstallHook(reinterpret_cast<ID3D12Device*>(dev->get_native())))
+  g_nvidia_ready = true;
+}
+
+// Streamline has to wrap the command queues and the swap chain the game creates right after its device, so it starts
+// here rather than on the NVIDIA thread; its NGX for DLSS-G starts before the add-on's. NGX keeps the DLL folder of
+// the first start for both (tools/fg_smoke: with separate folders the second one's feature is "not available"), so
+// nvngx_dlssg.dll lies next to nvngx_dlss.dll in the add-on's folder.
+void StartFrameGeneration(ID3D12Device* device) {
+  if (g_config.frame_generation == 0) return;
+  if (GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr) {
+    Log(reshade::log::level::warning, "Frame generation is not available under Wine or Proton.");
+    return;
+  }
+  const fs::path log_dir = g_addon_dir / L"streamline";
+  std::error_code ec;
+  fs::create_directories(log_dir, ec);
+  const auto log = [](int level, const char* text) {
+    Log(level == 1   ? reshade::log::level::error
+        : level == 2 ? reshade::log::level::warning
+                     : reshade::log::level::info,
+        text);
+  };
+  if (!g_fg.Init(device, g_addon_dir.wstring(), log_dir.wstring(), reshade::internal::get_reshade_module_handle(),
+                 log)) {
+    Log(reshade::log::level::warning, "Frame generation unavailable: " + g_fg.status());
+    return;
+  }
+  g_fg.SetMode(g_config.frame_generation);
+  g_fg.SetReflex(g_config.reflex);
+}
+
+void OnInitDevice(device* dev) {
+  if (dev->get_api() != device_api::d3d12 || g_device != nullptr) return;
+  g_device = dev;
+  auto* const native = reinterpret_cast<ID3D12Device*>(dev->get_native());
+  if (!erdlss::rt_pipeline::InstallHook(native))
     Log(reshade::log::level::warning, "Could not hook CreateStateObject; the shadow ray generation shaders are off.");
+  StartFrameGeneration(native);
+  g_nvidia_start_ms = GetTickCount64();
+  g_nvidia_thread = std::thread(StartNvidia, native);
+}
+
+// DLSS's state for the overlay and the remote control.
+std::string DlssStatus() {
+  if (!g_nvidia_ready) return "starting NVIDIA's libraries";
+  std::lock_guard lock(g_dlss_mutex);
+  return g_dlss.status();
 }
 
 void DestroyRayGenRing(device* dev);
@@ -1994,6 +2097,16 @@ void DestroyRayGenRing(device* dev);
 void OnDestroyDevice(device* dev) {
   if (dev != g_device) return;
   g_rr_active = false;
+  // A start that never finished keeps its thread (and NGX) to itself.
+  const bool nvidia = g_nvidia_ready.load();
+  if (g_nvidia_thread.joinable()) {
+    if (nvidia) {
+      g_nvidia_thread.join();
+    } else {
+      Log(reshade::log::level::warning, "NGX and NVAPI never finished starting.");
+      g_nvidia_thread.detach();
+    }
+  }
   std::lock_guard lock(g_dlss_mutex);
   RetireOutput();
   for (const Retired& r : g_retired) dev->destroy_resource(r.res);
@@ -2038,7 +2151,8 @@ void OnDestroyDevice(device* dev) {
   }
   g_tree_end = 0;
   g_tree_dump.Shutdown();
-  g_dlss.Shutdown();
+  if (nvidia) g_dlss.Shutdown();
+  g_fg.Shutdown();  // after DLSS: Streamline's shutdown ends NGX
   g_device = nullptr;
 }
 
@@ -3514,7 +3628,10 @@ void LearnListKindsLocked();
 // Command lists in GPU order: every list submitted after the one holding the TAA, until the UI composite, is
 // post-processing.
 void OnExecuteCommandList(command_queue* queue, command_list* cmd_list) {
-  g_reflex.OnSubmit();
+  if (g_fg.loaded())
+    g_fg.OnSubmit();
+  else
+    g_reflex.OnSubmit();
   auto* const data = cmd_list->get_private_data<CmdData>();
   // The previous poses its NPC draws read, written just before them on the same queue.
   if (data != nullptr && !data->skin_jobs.empty() && g_skin.ready() &&
@@ -4267,6 +4384,42 @@ void ObjectBlurTransform(command_list* cmd_list, const CmdData& data) {
     RestoreTaaState(cmd_list, data);
 }
 
+// DLSS Frame Generation's UI inputs at the game's final composite (GXSimple_BlendUI: the UI layer UIScene over the
+// finished scene, into the back buffer): the composite drawn once more without the UI into frame generation's own
+// target, and the UI's alpha. The game's draw then follows as usual.
+void CaptureUi(command_list* cmd_list, const CmdData& data, uint32_t vertex_count, uint32_t instance_count,
+               uint32_t first_vertex, uint32_t first_instance) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  if (state == nullptr || state->render_targets.size() != 1 || state->render_targets[0] == 0) return;
+  device* const dev = cmd_list->get_device();
+  resource ui = {0};
+  resource_usage usage = resource_usage::undefined;
+  {
+    std::lock_guard resource_lock(g_resource_cache_mutex);
+    ui = BoundResource(cmd_list, shader_stage::pixel, 1);  // UIScene
+    if (ui == 0) return;
+    Watch(ui.handle);  // its state is known from the game's next barrier on
+    usage = WatchedUsage(ui.handle);
+  }
+  const resource target = dev->get_resource_from_view(state->render_targets[0]);
+  if (usage == resource_usage::undefined || target == 0) return;
+  const resource_desc td = dev->get_resource_desc(target);
+  const format view_format = dev->get_resource_view_desc(state->render_targets[0]).format;
+  auto* const native = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd_list->get_native());
+  auto* const ui_texture = reinterpret_cast<ID3D12Resource*>(ui.handle);
+  const D3D12_RESOURCE_STATES ui_state = ToD3D12(usage);
+  D3D12_CPU_DESCRIPTOR_HANDLE hudless = {};
+  if (!g_fg.BeginUi(native, ui_texture, ui_state, static_cast<DXGI_FORMAT>(view_format), td.texture.width,
+                    td.texture.height, &hudless))
+    return;
+  RestoreState(cmd_list, data);
+  const D3D12_CPU_DESCRIPTOR_HANDLE dsv = {static_cast<SIZE_T>(state->depth_stencil.handle)};
+  native->OMSetRenderTargets(1, &hudless, FALSE, state->depth_stencil != 0 ? &dsv : nullptr);
+  native->DrawInstanced(vertex_count, instance_count, first_vertex, first_instance);
+  g_fg.EndUi(native, ui_texture, ui_state);
+  RestoreTargets(cmd_list);
+}
+
 bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
             uint32_t first_instance) {
   auto* const data = cmd_list->get_private_data<CmdData>();
@@ -4278,8 +4431,8 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   if (data->pass == Pass::kCameraMotion && g_config.object_blur && BlurRunning() &&
       CameraMotionDraw(cmd_list, vertex_count, instance_count, first_vertex, first_instance))
     return true;
-  if (data->pass == Pass::kLightDir && g_config.enabled && g_config.ray_reconstruction && g_dlss.rr_available() &&
-      RayTracingActive())
+  if (data->pass == Pass::kLightDir && g_config.enabled && g_config.ray_reconstruction && g_nvidia_ready &&
+      g_dlss.rr_available() && RayTracingActive())
     MakeRrGuides(cmd_list, *data);
   if (data->pass == Pass::kAoReproj && RawMode() == 2)
     EditBoundConstants(cmd_list, shader_stage::pixel, 2, 240, 1, [](float* v) {
@@ -4295,9 +4448,9 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
     data->depth_copy = BoundResource(cmd_list, shader_stage::pixel, 2);  // g_DepthTex
     if (data->depth != 0) g_depth = data->depth.handle;
     if (data->depth_copy != 0) g_depth_copy = data->depth_copy.handle;
-    if (g_config.render_scale < 1.0f || g_config.object_blur) {
+    if (g_config.render_scale < 1.0f || g_config.object_blur || g_config.frame_generation != 0) {
       // The scene's motion (g_MoveTex, R16G16_FLOAT), which the motion blur reads after the TAA. The depth buffers'
-      // states are tracked from here on for the stretch.
+      // states are tracked from here on for the stretch and frame generation.
       for (uint32_t reg = 0; reg < 4; ++reg) {
         const resource r = BoundResource(cmd_list, shader_stage::pixel, reg);
         if (r != 0 && cmd_list->get_device()->get_resource_desc(r).texture.format == format::r16g16_float) {
@@ -4348,6 +4501,8 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   }
   OnPostPass(cmd_list, *data);
   if (data->pass == Pass::kToneMap && !g_config.chromatic_aberration) RemoveChromaticAberration(cmd_list);
+  if (data->pass == Pass::kBlendUi && instance_count == 1 && g_fg.attached() && !g_upscale_at_composite)
+    CaptureUi(cmd_list, *data, vertex_count, instance_count, first_vertex, first_instance);
   return false;
 }
 
@@ -5092,7 +5247,7 @@ void LogOutputMode(swapchain* sc) {
 void ApplyRenderScale() {
   float scale = 1.0f;
   const uint64_t frame = g_frame.load();
-  if (g_config.enabled && g_config.render_scale < 1.0f &&
+  if (g_config.enabled && g_config.render_scale < 1.0f && g_nvidia_ready &&
       (frame <= g_last_upscale.load() + 4 || frame <= g_scale_requested.load() + 30)) {
     std::lock_guard lock(g_dlss_mutex);
     if (g_dlss.has_feature() && g_dlss.feature_hdr() != g_upscale_at_composite &&
@@ -5139,6 +5294,12 @@ void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, ui
   }
   CheckDeviceRemoved();
   if (sc != nullptr) LogOutputMode(sc);
+  static bool nvidia_late = false;
+  if (!nvidia_late && !g_nvidia_ready && g_nvidia_start_ms != 0 && GetTickCount64() > g_nvidia_start_ms + 20000) {
+    nvidia_late = true;
+    Log(reshade::log::level::warning, "NGX and NVAPI have not finished starting after 20 s; the game's TAA runs "
+                                      "until they do.");
+  }
   static LARGE_INTEGER frequency = {}, last = {};
   LARGE_INTEGER now;
   QueryPerformanceCounter(&now);
@@ -5156,7 +5317,7 @@ void OnPresent(command_queue* queue, swapchain* sc, const rect*, const rect*, ui
     Log(reshade::log::level::info, g_config.enabled ? "DLSS on." : "DLSS off (game TAA).");
   }
 
-  if (g_recreate.exchange(false)) {
+  if (g_recreate.exchange(false) && g_nvidia_ready) {
     g_rr_active = false;
     queue->wait_idle();
     std::lock_guard lock(g_dlss_mutex);
@@ -5512,10 +5673,24 @@ void OnReshadePresent(effect_runtime* runtime) {
   } else if (command == "reflex") {  // "reflex" alone reports; "reflex on|off" switches (and saves)
     if (!arg.empty()) {
       g_config.reflex = arg == "on";
-      g_reflex.SetEnabled(g_config.reflex);
+      if (g_fg.loaded())
+        g_fg.SetReflex(g_config.reflex);
+      else if (g_nvidia_ready)
+        g_reflex.SetEnabled(g_config.reflex);
       SaveConfig();
     }
-    result = g_reflex.SleepStatus();
+    result = g_fg.loaded()    ? "through Streamline: " + g_fg.status()
+             : g_nvidia_ready ? g_reflex.SleepStatus()
+                              : DlssStatus();
+  } else if (command == "fg") {  // "fg" alone reports; "fg 0|2-6|dynamic" switches (and saves)
+    if (!arg.empty()) {
+      const int mode = arg == "dynamic" ? -1 : std::atoi(arg.c_str());
+      g_config.frame_generation = mode < 0 ? -1 : mode < 2 ? 0 : std::min(mode, 6);
+      g_fg.SetMode(g_config.frame_generation);
+      SaveConfig();
+    }
+    result = "FrameGeneration=" + std::to_string(g_config.frame_generation) + ", " +
+             (g_fg.loaded() ? g_fg.status() : "Streamline not loaded: " + g_fg.status());
   } else if (command == "ssr") {  // "ssr" alone reports; "ssr on|off" switches (and saves)
     if (!arg.empty()) {
       g_config.water_reflections = arg == "on";
@@ -5539,7 +5714,7 @@ void OnReshadePresent(effect_runtime* runtime) {
     result = text;
   } else if (command == "reflexlat") {  // the frame timeline; "reflexlat markers on|off" also marks with Reflex off
     if (arg == "markers") g_reflex.set_markers(arg2 == "on");
-    result = g_reflex.Timeline();
+    result = g_nvidia_ready ? g_reflex.Timeline() : DlssStatus();
   } else if (command == "objblur") {  // "objblur" alone reports; "objblur on|off" switches (and saves)
     if (!arg.empty()) {
       SetObjectBlur(arg == "on");
@@ -5698,7 +5873,7 @@ void OnReshadePresent(effect_runtime* runtime) {
     static const char* const kRaw[3] = {"none", "shadows", "all"};
     result = std::string("raw ") + kRaw[std::clamp(g_rr_raw_mode.load(), 0, 2)] + " (stochastic AO upscales " +
              std::to_string(g_ao_upscales.load()) + ")" + ", RR preset " +
-             std::to_string(g_rr_preset.load()) + "; " + g_dlss.status();
+             std::to_string(g_rr_preset.load()) + "; " + DlssStatus();
   } else if (command == "rrdump") {
     std::lock_guard lock(g_dump_mutex);
     g_rr_dump_name = arg.empty() ? "rr" : arg;
@@ -5710,12 +5885,13 @@ void OnReshadePresent(effect_runtime* runtime) {
       SaveConfig();
     }
     result = std::string("Ray Reconstruction ") + (g_config.ray_reconstruction ? "on" : "off") +
-             (g_dlss.rr_available() ? "" : " (not available)") + ", ray tracing " +
+             (g_nvidia_ready && g_dlss.rr_available() ? "" : " (not available)") + ", ray tracing " +
              (RayTracingActive() ? "on" : "off") + ", feature " +
-             (g_dlss.has_feature() ? (g_dlss.feature_rr() ? "RR" : "SR") : "none") + ", guides drawn " +
+             (g_nvidia_ready && g_dlss.has_feature() ? (g_dlss.feature_rr() ? "RR" : "SR") : "none") +
+             ", guides drawn " +
              std::to_string(g_guides_runs.load()) + " times (last frame " + std::to_string(g_guides_frame.load()) +
              ", now " + std::to_string(g_frame.load()) + ")" + (g_rr_guides_failed ? ", guides failed" : "") +
-             "; " + g_dlss.status();
+             "; " + DlssStatus();
   } else if (command == "jitterinfo" || command == "jittersrc") {
     if (command == "jittersrc" && !arg.empty()) g_jitter_source = arg == "counter" ? 1 : 0;
     std::lock_guard lock(g_jitter_stats_mutex);
@@ -5763,6 +5939,41 @@ void OnReshadePresent(effect_runtime* runtime) {
   FinishRemote(command + " " + arg, result);
 }
 
+// DLSS Frame Generation (FrameGeneration in the ini). Streamline loads with the game, so switching it on from off
+// takes a restart; while it runs, the multiplier changes live.
+void FrameGenerationOverlay() {
+  const bool loaded = g_fg.loaded();
+  // Off, 2x up to the GPU's maximum (4x until Streamline has said), and dynamic where supported.
+  const int max = loaded ? std::clamp(g_fg.max_multiplier(), 2, 6) : 4;
+  const bool dynamic = loaded && g_fg.dynamic_supported();
+  const char* const names[] = {"Off", "2x", "3x", "4x", "5x", "6x", "Dynamic (up to the refresh rate)"};
+  const int values[] = {0, 2, 3, 4, 5, 6, -1};
+  int index = 0;
+  for (int i = 0; i < 7; ++i)
+    if (values[i] == g_config.frame_generation) index = i;
+  const char* const preview = names[index];
+  if (ImGui::BeginCombo("Frame generation", preview)) {
+    for (int i = 0; i < 7; ++i) {
+      if ((i >= 1 && i <= 5 && values[i] > max) || (i == 6 && !dynamic && g_config.frame_generation != -1)) continue;
+      if (ImGui::Selectable(names[i], i == index)) {
+        g_config.frame_generation = values[i];
+        g_fg.SetMode(values[i]);
+        SaveConfig();
+      }
+    }
+    ImGui::EndCombo();
+  }
+  ImGui::SetItemTooltip("NVIDIA DLSS Frame Generation: shows generated frames between the game's own, made from its "
+                        "depth, motion and the frame without the UI. RTX 40 or 50 series; more than 2x needs an RTX 50. "
+                        "Needs hardware-accelerated GPU scheduling (Windows graphics settings), and turns Reflex on. "
+                        "Loads when the game starts: switching it on from off takes effect at the next start.");
+  if (loaded)
+    ImGui::Text("  %s", g_fg.status().c_str());
+  else if (g_config.frame_generation != 0)
+    ImGui::Text("  %s", g_fg.status() == "off" ? "takes effect at the next start of the game"
+                                                 : ("unavailable: " + g_fg.status()).c_str());
+}
+
 void OnOverlay(effect_runtime*) {
   bool enabled = g_config.enabled;
   if (ImGui::Checkbox("Use DLSS instead of the game's TAA", &enabled)) {
@@ -5786,6 +5997,8 @@ void OnOverlay(effect_runtime*) {
     const char* state = "  running";
     if (!g_config.enabled)
       state = "  needs DLSS on";
+    else if (!g_nvidia_ready)
+      state = "  starting";
     else if (!g_dlss.rr_available())
       state = "  not available: nvngx_dlssd.dll is missing or the driver is too old";
     else if (g_rr_guides_failed)
@@ -5797,7 +6010,7 @@ void OnOverlay(effect_runtime*) {
     else if (OurAoActive())
       state = "  running, with the add-on's rays";
     ImGui::TextUnformatted(state);
-  } else if (g_config.enabled && g_dlss.rr_available() && RayTracingActive()) {
+  } else if (g_config.enabled && g_nvidia_ready && g_dlss.rr_available() && RayTracingActive()) {
     ImGui::TextUnformatted("  recommended: the game's ray tracing is on");
   }
 
@@ -5893,12 +6106,18 @@ void OnOverlay(effect_runtime*) {
   ImGui::SetItemTooltip("With the game's motion blur on (Low, Medium or High), blurs only what moves both on the screen "
                         "and in the world: enemies, animals, swings. Turning the camera no longer blurs the scene.");
   if (ImGui::Checkbox("NVIDIA Reflex low latency (experimental)", &g_config.reflex)) {
-    g_reflex.SetEnabled(g_config.reflex);
+    if (g_fg.loaded())
+      g_fg.SetReflex(g_config.reflex);
+    else if (g_nvidia_ready)
+      g_reflex.SetEnabled(g_config.reflex);
     SaveConfig();
   }
   ImGui::SetItemTooltip("Keeps the CPU from queuing frames ahead of the GPU, which lowers input latency when the GPU "
                         "is the bottleneck. Added by the add-on at the present, not by the game. %s",
-                        g_reflex.status().c_str());
+                        g_fg.loaded()        ? "Runs through Streamline, and always while frame generation is on."
+                        : g_nvidia_ready ? g_reflex.status().c_str()
+                                         : "Starting.");
+  FrameGenerationOverlay();
   if (g_config.wind_motion) {
     std::unique_lock lock(g_wind_mutex, std::try_to_lock);
     if (lock.owns_lock()) {
@@ -5921,7 +6140,9 @@ void OnOverlay(effect_runtime*) {
               "scale, set at startup)",
               g_applied_mip_bias, static_cast<unsigned long long>(g_biased_samplers.load()));
 
-  {
+  if (!g_nvidia_ready) {
+    ImGui::TextUnformatted("DLSS: starting NVIDIA's libraries");
+  } else {
     std::unique_lock lock(g_dlss_mutex, std::try_to_lock);
     if (lock.owns_lock()) ImGui::Text("DLSS: %s", g_dlss.status().c_str());
   }
@@ -6014,14 +6235,32 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       // After every other present callback, right before the swap chain presents, and right after it.
       reshade::register_event<reshade::addon_event::present>(
-          [](command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*) { g_reflex.BeforePresent(); });
-      reshade::register_event<reshade::addon_event::finish_present>(
-          [](command_queue*, swapchain*) { g_reflex.AfterPresent(); });
+          [](command_queue*, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
+            if (g_fg.loaded())
+              g_fg.BeforePresent();
+            else
+              g_reflex.BeforePresent();
+          });
+      reshade::register_event<reshade::addon_event::finish_present>([](command_queue*, swapchain*) {
+        if (g_fg.loaded())
+          g_fg.AfterPresent();
+        else
+          g_reflex.AfterPresent();
+      });
+      // Frame generation pauses around fullscreen changes and resizes.
+      reshade::register_event<reshade::addon_event::set_fullscreen_state>([](swapchain*, bool, void*) {
+        g_fg.HoldOff();
+        return false;
+      });
+      reshade::register_event<reshade::addon_event::destroy_swapchain>([](swapchain*, bool resize) {
+        if (resize) g_fg.HoldOff();
+      });
       reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
       reshade::register_overlay(nullptr, OnOverlay);
       break;
     case DLL_PROCESS_DETACH:
       erdlss::rt_pipeline::RemoveHook();
+      erdlss::FrameGeneration::RemoveHooks();
       reshade::unregister_addon(module);
       break;
   }

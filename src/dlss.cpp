@@ -89,6 +89,7 @@ bool Dlss::Init(ID3D12Device* device, const std::wstring& dll_dir, const std::ws
     return false;
   }
   initialized_ = true;
+  reshade::log::message(reshade::log::level::info, "[ERDLSS] NGX started; reading DLSS's capabilities ...");
 
   NVSDK_NGX_Parameter* caps = nullptr;
   result = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);

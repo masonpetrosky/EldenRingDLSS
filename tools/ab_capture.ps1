@@ -41,12 +41,14 @@
 # them on and off at the current render scale and with the game's TAA at full size (temporal noise: tools\flicker.py),
 # and a 5 s frame-time log and a 30-frame GPU profile on and off (tools\gpu_profile.py --compare). Shots go to
 # shots\water; ends with DLSS at 0.50 and the ini's setting.
+# -Round perf: where the frame goes at a slow spot (see the round); restores the ini's settings.
+# -Round fg: frame generation off, 2x, 3x and 4x at the current spot (see the round); restores the ini's setting.
 # -Round rtfoliage: GPU profiles and screenshots of our rays with and without the foliage alpha test, shorter AO rays
 # and nearer opaque shadows (see the round); restores the defaults.
 param(
   [ValidateSet('sharpen', 'presets', 'ca', 'mv', 'vmask', 'vmaskpresets', 'maskcheck', 'vegstats', 'wind',
                'winddiag', 'windopt', 'windport', 'windcov', 'windcost', 'windpixel', 'windprepass', 'survey', 'treedump', 'trees', 'treecost', 'drsprobe', 'upscale',
-               'showcase', 'showcasert', 'rrshow', 'vanilla', 'mvcost', 'rtfoliage', 'water')][string]$Round = 'sharpen',
+               'showcase', 'showcasert', 'rrshow', 'vanilla', 'mvcost', 'rtfoliage', 'water', 'perf', 'fg')][string]$Round = 'sharpen',
   [string]$Folder = "$env:LOCALAPPDATA\garyttierney\me3\config\profiles\natives\EldenRingDLSS-dev",
   [string]$PresentMon = "$env:USERPROFILE\Documents\Tools\PresentMon\2.5.1\PresentMon-2.5.1-x64.exe"
 )
@@ -291,6 +293,49 @@ if ($Round -eq 'sharpen') {
   Send 'rtdist 20 50'; Send 'rtrefit 2'; Send "wind $($state.WindMotion)"; Send "npc $($state.NpcMotion)"
   Send "objblur $($state.ObjectBlur)"; Send "reflex $($state.Reflex)"; Send "ca $($state.ChromaticAberration)"
   Send 'dlss on'; Send 'scale 0.5' 5.0; Send 'scale'
+} elseif ($Round -eq 'perf') {
+  # Where the frame goes at a slow spot: the ini's settings with a 5 s frame-time log and a 60-frame GPU profile, then
+  # one thing off at a time (a 5 s log each), then the same spot at render scale 0.33 (what still costs at a smaller
+  # render size) and with the game's TAA at full size. Summarize with tools\frames.py shots\perf_*.csv and
+  # tools\gpu_profile.py shots\gpuprofile_perf_base.csv. Restores the ini's settings; ends at 0.50.
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  function IniSwitch([string]$Key, [string]$Default = 'on') {
+    if ($ini -match "^$Key=1") { 'on' } elseif ($ini -match "^$Key=0") { 'off' } else { $Default }
+  }
+  $state = [ordered]@{ rr = IniSwitch 'RayReconstruction'; ssr = IniSwitch 'WaterReflections'
+    windtrees = IniSwitch 'WindTrees'; wind = IniSwitch 'WindMotion'; npc = IniSwitch 'NpcMotion'
+    objblur = IniSwitch 'ObjectBlur'; reflex = IniSwitch 'Reflex' }
+  $rtgen = ($ini | Where-Object { $_ -match '^RtShadowRayGen=' }) -replace '^RtShadowRayGen=', ''
+  if (-not $rtgen) { $rtgen = '4' }
+  $scale = ($ini | Where-Object { $_ -match '^RenderScale=' }) -replace '^RenderScale=', ''
+  if (-not $scale) { $scale = '0.5' }
+  # Rendered frames only: frame generation off meanwhile.
+  $fg = ($ini | Where-Object { $_ -match '^FrameGeneration=' }) -replace '^FrameGeneration=', ''
+  if ($fg -and $fg -ne '0') { Send 'fg 0' 2.0 }
+  Send 'dlss on' 3.0; Send 'rr'; Send 'scale'; LogFrames 'perf_base'; Send 'gpuprofile 60 perf_base' 3.0
+  Send 'reflex'
+  if ($state.rr -eq 'on') {
+    Send 'rtgen 0' 4.0; LogFrames 'perf_gamerays'; Send "rtgen $rtgen"
+    Send 'rr off' 5.0; LogFrames 'perf_norr'; Send 'gpuprofile 60 perf_norr' 3.0; Send 'rr on' 5.0
+  }
+  foreach ($key in 'ssr', 'windtrees', 'wind', 'npc', 'objblur', 'reflex') {
+    if ($state[$key] -ne 'on') { continue }
+    Send "$key off" 3.0; LogFrames "perf_no$key"; Send "$key on" 2.0
+  }
+  Send 'scale 0.33' 6.0; Send 'scale'; LogFrames 'perf_scale33'; Send 'gpuprofile 60 perf_scale33' 3.0
+  Send "scale $scale" 6.0; Send 'dlss off' 3.0; LogFrames 'perf_taa'
+  Send 'dlss on' 3.0; Send "scale $scale" 6.0; Send 'scale'; LogFrames 'perf_base2'
+  foreach ($key in $state.Keys) { Send "$key $($state[$key])" }
+  if ($fg -and $fg -ne '0') { Send "fg $fg" }
+} elseif ($Round -eq 'fg') {
+  # Frame generation at the current spot: a 5 s frame-time log each with it off, 2x, 3x and 4x, and DLSS-G's state
+  # (frames shown per rendered frame, status, inputs). Summarize with tools\frames.py shots\fg_*.csv. Restores the
+  # ini's setting.
+  $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
+  $fg = ($ini | Where-Object { $_ -match '^FrameGeneration=' }) -replace '^FrameGeneration=', ''
+  if (-not $fg) { $fg = '0' }
+  foreach ($mode in '0', '2', '3', '4') { Send "fg $mode" 4.0; Send 'fg'; LogFrames "fg_$mode" }
+  Send "fg $fg"
 } elseif ($Round -eq 'mvcost') {
   $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
   $wind = if ($ini -match '^WindMotion=1') { 'on' } else { 'off' }
