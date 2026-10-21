@@ -772,12 +772,55 @@ RR on:
 
 With `npctest 0.3` all soldiers and animals in view light up; without it the walking soldiers carry their real motion
 (the game's own data had them at exactly 0). The user toggled it while watching a torch-carrying soldier walk: "a
-noticeable improvement when it's on". Not covered: a part shared with the player's equipment keeps no motion (it is
-in the velocity set), two identical characters can swap previous poses if they cross within a frame's movement of
-each other (one frame of wrong motion). Cloth is not a gap for enemies as far as the capture shows: their `_cloth_`
-draws read all vertex streams from the model's own buffer (bone-driven, e.g. 105277 and 106085: vb0-2 in 110289 and
-99931), so the bone matching covers them; only the player's cape uses per-frame cloth buffers (111712: vb0 76484,
-vb2 76485), and the game draws the player's velocity itself.
+noticeable improvement when it's on". Not covered: a part shared with the player's equipment keeps no motion (it is in
+the velocity set; covered since 2026-10-20, below), two identical characters can swap previous poses if they cross
+within a frame's movement of each other (one frame of wrong motion). Cloth is not a gap for enemies as far as the
+capture shows: their `_cloth_` draws read all vertex streams from the model's own buffer (bone-driven, e.g. 105277 and
+106085: vb0-2 in 110289 and 99931), so the bone matching covers them; only the player's cape uses per-frame cloth
+buffers (111712: vb0 76484, vb2 76485), and the game draws the player's velocity itself.
+
+### A ghost without motion vectors (2026-10-20)
+
+The user, at night in Limgrave (4K at 50%, RR): a glowing ghost walking on a hill "might not have motion vectors". TAA
+dumps with the camera at rest (`mv 4 ghost`, `mv 4 ghost2` two seconds later): the ghost's silhouette (class 2 in the
+TAA's stencil copy, like the animals) moved about 0.8 render pixels per frame, and its motion vectors averaged 0.001 px
+(the animal in front of it 0.26-0.32 px). With `npctest 0.3` every streamed character lit up and the ghost stayed at the
+background's 0.01 px, so its draws never reached the NPC path. `vegstats 30` showed why: the ghost is not in the
+G-buffer. It is drawn after the lighting by the forward pass's skinned shaders (`C[DetailBlend]_Fwd_Skin`, 14 draws per
+frame there), and the NPC path only took `_Gbuf_Skin` shaders.
+
+Every skinned forward material comes as two pipelines (the skinned material log, one line per depth state: 186 lines in
+one session; `tools/rdc_fwdskin.py` on `er117_npcs_f978.rdc` for the player's hair): an alpha-tested prepass that writes
+depth and the stencil class (greater-equal, as in the G-buffer), then the shading pass, which blends where the depth is
+equal and writes none. Both draw into the lit image (two R11G11B10 targets) with the main depth buffer and bind the
+G-buffer's constant buffers (`cbSceneParam` b8, `cbInstanceData` b4, `cbObjMatrix` b5, `cbInstanceIdxParam` b10,
+`g_InstanceIndexBuffer` t25). The prepass makes the ghost's depth the scene's, so the G-buffer's rule (motion where the
+streamed depth matches the scene's) covers it: prepass pipelines get vertex-only copies (the game's draws stay as they
+are), shading passes get none, and `PrepareStreamDraw` takes a draw with other than the G-buffer's five targets when it
+draws with the main depth buffer. The player's hair and body hair have velocity draws and stay the game's. Only effect
+meshes (`S[AMSN]_di_*`) draw see-through without a prepass, and they keep no motion of their own: a test build gave them
+a resolve pass of its own (motion wherever they are in front of the scene), but no character used it, and an effect's
+motion would move the background seen through it with the character.
+
+In game (a test build, 22:15): `npc` counted 8.6 forward-pass draws streamed per frame. The ghost's class-2 pixels moved
+0.53-0.57 px per frame on average in one direction (median 0.61-0.67 px; before, 0.001-0.008 px), and with `npctest 0.3`
+95-96% of them read more than 5 px (about 15 px on average), so the motion is this path's. The user watched the ghost
+walk: "everything looks great". The final build (no see-through pass, forward draws known by the depth buffer, the
+class-2 rule below), 22:24: 16-24 forward-pass draws streamed per frame, none rejected, no skinned pipeline without
+copies; the ghost at 0.56-0.67 px, and 96% of it above 5 px with `npctest 0.3`.
+
+The rule for the game's velocity changed on the way. A mesh part is known by its index buffer, first index and count, so
+a human NPC whose armor or body mesh is the player's was left to the game with the player's parts (the gap noted above).
+The G-buffer draws write an object class into the stencil's top two bits (`tools/rdc_stencilref.py` on the goat and NPC
+captures): every skinned G-buffer pipeline replaces the stencil (write mask 0xFF) with 0x50 for the player (0x58 for
+skin), 0x90 for the other characters (0xB8 for fur) and 0x10 for skinned map objects; the TAA's stencil copy turns the
+top bits into its classes 1 and 2. The player's forward prepasses write 0x44 (hair) and 0x28 (body hair, class 0). A
+part with velocity draws of the game's is now drawn here when its draw writes the other characters' class (2), and left
+to the game otherwise. In the ghost session the player's parts all stayed the game's (`npc`: 0.0 others); once, just
+before the user quit, four materials with velocity draws came with class 2 (`C[DetailBlend]_Gbuf_Skin`,
+`C[AMSN]_Gbuf_Skin`, `C[DetailBlend]_cloth_Gbuf_Skin`, `P[ChrCustomize][Skin]_Gbuf_Skin`, named in the log): a character
+sharing the player's meshes, which now gets its motion here. With the game's motion blur on, creatures it draws velocity
+for are drawn here too.
 
 ## Object-only motion blur (2026-10-12, capture `er117_mblur_goat_f1921.rdc`)
 

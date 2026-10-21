@@ -256,13 +256,19 @@ std::atomic<int> g_npc_stage{3};  // development (ini NpcStage, remote "npcstage
 // Development counts of skinned main-camera draws: seen, left to the game (velocity), and where the others stopped.
 struct NpcCounts {
   std::atomic<uint64_t> seen{0}, velocity{0}, prepare{0}, inputs{0}, patch{0}, streamed{0}, replaced{0};
+  std::atomic<uint64_t> not_player{0};  // of `streamed`, parts the game draws velocity for that are not the player's
+  std::atomic<uint64_t> forward{0};     // of `streamed`, forward-pass draws (IsForwardSkinMaterial)
 };
 NpcCounts g_npc_counts;
 // Mesh parts (PartKey) that the game draws velocity for, with the frame it last did: the player's always; with the
-// game's motion blur on, also nearby creatures, which the game may stop drawing velocity for. Left to the game while it
-// does.
+// game's motion blur on, also nearby creatures, which the game may stop drawing velocity for. The player's are left to
+// the game while it does (StreamSkinDraw).
 std::shared_mutex g_velocity_mutex;
 std::unordered_map<uint32_t, uint64_t> g_velocity_parts;
+// Skinned pipelines that write the stencil's object class (the top two bits, replaced by the reference value), with
+// their material names; read at every skinned draw the game also draws velocity for.
+std::shared_mutex g_stencil_writers_mutex;
+std::unordered_map<uint64_t, std::string> g_stencil_writers;
 erdlss::ObjectBlur g_object_blur;
 std::atomic<bool> g_object_blur_failed{false};
 erdlss::Reflex g_reflex;
@@ -2165,10 +2171,17 @@ bool IsWindMaterial(const std::string& name) {
   return false;
 }
 
-// Skinned G-buffer shaders (characters, and skinned map objects such as banners). The game draws velocity only for the
-// player's; the others get theirs from the stream-output path with last frame's bones (skin_motion.hpp).
+// Skinned characters drawn in the forward pass, after the lighting: see-through ones such as ghosts, hair, fur fringes
+// and glowing parts. Each material comes as an alpha-tested prepass that writes depth and the stencil class, and a
+// shading pass that blends over it where the depth is equal.
+bool IsForwardSkinMaterial(const std::string& name) { return name.find("_Fwd_Skin@") != std::string::npos; }
+
+// Skinned shaders of the G-buffer (characters, and skinned map objects such as banners) and of the forward pass. The
+// game draws velocity only for the player's; the others get theirs from the stream-output path with last frame's
+// bones (skin_motion.hpp).
 bool IsSkinMaterial(const std::string& name) {
-  return name.find("_Gbuf_Skin@") != std::string::npos || name.find("_Skin_Gbuf@") != std::string::npos;
+  return name.find("_Gbuf_Skin@") != std::string::npos || name.find("_Skin_Gbuf@") != std::string::npos ||
+         IsForwardSkinMaterial(name);
 }
 
 // A mesh part across frames: its index buffer view's address, first index and index count.
@@ -2384,6 +2397,14 @@ void AddPortPipeline(uint64_t pipeline, WindSource& source) {
     SetWindError(g_wind_port.status());
 }
 
+// A pipeline of the forward pass that writes no depth: a shading pass over its prepass, or an effect mesh drawn
+// see-through without one (S[AMSN]_di_*). Neither gets stream copies: the prepass already streams the shading pass's
+// triangles, and an effect's motion would move the background seen through it with the character.
+bool ForwardWithoutDepth(const WindSource& source) {
+  return IsForwardSkinMaterial(source.name) &&
+         !(source.depth_stencil.depth_enable && source.depth_stencil.depth_write_mask);
+}
+
 // Builds the stream-output copies of a remembered pipeline. Called with g_wind_mutex held.
 void AddWindPipeline(uint64_t pipeline, WindSource& source) {
   // The vertex-only copies drop hull, domain and geometry stages and assume triangle lists, which the game's draw
@@ -2391,6 +2412,7 @@ void AddWindPipeline(uint64_t pipeline, WindSource& source) {
   if (IsSkinMaterial(source.name) &&
       (source.other_stages || source.topology != primitive_topology::triangle_list))
     return;
+  if (ForwardWithoutDepth(source)) return;
   auto* const descriptors = g_device != nullptr ? g_device->get_private_data<erdlss::Descriptors>() : nullptr;
   std::vector<erdlss::WindMotion::RootParam> layout;
   if (descriptors == nullptr || !ToRootParams(descriptors->Params(source.layout), &layout)) {
@@ -2398,7 +2420,10 @@ void AddWindPipeline(uint64_t pipeline, WindSource& source) {
     return;
   }
   std::vector<D3D12_INPUT_ELEMENT_DESC> input_layout;
-  const D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = ToPipelineDesc(source, &input_layout);
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = ToPipelineDesc(source, &input_layout);
+  // A forward prepass is the visible surface where its depth is the scene's, as in the G-buffer, and keeps the game's
+  // draw: vertex-only copies.
+  if (IsForwardSkinMaterial(source.name)) desc.PS = {};
   if (!g_wind.AddPipeline(pipeline, source.name, source.layout.handle, layout, desc, IsSkinMaterial(source.name)))
     SetWindError(g_wind.status());
 }
@@ -2462,11 +2487,13 @@ void RememberWindPipeline(device* dev, pipeline_layout layout, uint32_t count, c
     }
   }
   std::lock_guard lock(g_wind_mutex);
-  // One log line per material: how its G-buffer pass tests depth (a depth prepass shows as no depth writes).
+  // One log line per material: how its G-buffer pass tests depth (a depth prepass shows as no depth writes); for the
+  // forward pass's, one for the prepass and one for the shading pass.
   static std::vector<std::string> logged;
   const std::string material = name.substr(0, name.find('@'));
-  if (std::find(logged.begin(), logged.end(), material) == logged.end()) {
-    logged.push_back(material);
+  const std::string log_key = material + (ForwardWithoutDepth(source) ? " without depth writes" : "");
+  if (std::find(logged.begin(), logged.end(), log_key) == logged.end()) {
+    logged.push_back(log_key);
     char text[256];
     std::snprintf(text, sizeof(text),
                   "%s material %s: depth test %d, write %d, func %u, stencil %d, cull %u, PS %zu B, topology %u%s",
@@ -2475,6 +2502,12 @@ void RememberWindPipeline(device* dev, pipeline_layout layout, uint32_t count, c
                   static_cast<uint32_t>(source.rasterizer.cull_mode), source.ps.size(),
                   static_cast<uint32_t>(source.topology), source.other_stages ? ", other stages" : "");
     Log(reshade::log::level::info, text);
+  }
+  const depth_stencil_desc& ds = source.depth_stencil;
+  if (IsSkinMaterial(name) && ds.stencil_enable && (ds.front_stencil_write_mask & 0xC0) == 0xC0 &&
+      ds.front_stencil_pass_op == stencil_op::replace) {
+    std::unique_lock writers_lock(g_stencil_writers_mutex);
+    g_stencil_writers[p.handle] = material;
   }
   WindSource& stored = g_wind_sources[p.handle];
   stored = std::move(source);
@@ -2535,6 +2568,10 @@ void OnDestroyPipeline(device*, pipeline p) {
       g_wind.RemovePipeline(p.handle);
       g_wind_port.RemovePipeline(p.handle);
     }
+  }
+  {
+    std::unique_lock lock(g_stencil_writers_mutex);
+    g_stencil_writers.erase(p.handle);
   }
   std::unique_lock lock(g_pipeline_mutex);
   g_pipelines.erase(p.handle);
@@ -2782,23 +2819,34 @@ D3D12_GPU_VIRTUAL_ADDRESS FindWind(device* dev, pipeline_layout layout, const st
   return reinterpret_cast<ID3D12Resource*>(range.buffer.handle)->GetGPUVirtualAddress() + range.offset;
 }
 
-// What both stream-output paths (vegetation and characters) need at a main-camera G-buffer draw: its root layout and
-// tables, the root signature of its pipeline's copies, and its cbSceneParam and cbPerFrame with the previous frame's
-// copies (patched once per command list and pair of buffers).
+// What both stream-output paths (vegetation and characters) need at a main-camera G-buffer draw (or a characters'
+// forward prepass): its root layout and tables, the root signature of its pipeline's copies, and its cbSceneParam and
+// cbPerFrame with the previous frame's copies (patched once per command list and pair of buffers).
 struct StreamDraw {
   pipeline_layout layout = {0};
   std::vector<descriptor_table> tables;
   ID3D12RootSignature* stream_rs = nullptr;
   D3D12_GPU_VIRTUAL_ADDRESS scene = 0, frame = 0, prev_scene = 0, prev_frame = 0;
+  bool forward = false;  // a draw of the forward pass
 };
 bool PrepareStreamDraw(command_list* cmd_list, CmdData& data, const char* what, StreamDraw* out) {
   device* const dev = cmd_list->get_device();
   auto* const state = cmd_list->get_private_data<state_tracking>();
   auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
-  if (state == nullptr || descriptors == nullptr || state->render_targets.size() != 5) return false;
-  const resource rt0 = dev->get_resource_from_view(state->render_targets[0]);
-  const uint32_t width = g_render_width.load();
-  if (rt0 == 0 || (width != 0 && dev->get_resource_desc(rt0).texture.width != width)) return false;
+  if (state == nullptr || descriptors == nullptr) return false;
+  // The main camera's G-buffer pass draws into five targets of the render width. Its forward pass draws into the lit
+  // image (two targets, none for a depth-only prepass) with the main depth buffer, which other cameras do not use.
+  out->forward = state->render_targets.size() != 5;
+  if (out->forward) {
+    const uint64_t main_depth = g_depth.load();
+    if (main_depth == 0 || state->depth_stencil == 0 ||
+        dev->get_resource_from_view(state->depth_stencil).handle != main_depth)
+      return false;
+  } else {
+    const resource rt0 = dev->get_resource_from_view(state->render_targets[0]);
+    const uint32_t width = g_render_width.load();
+    if (rt0 == 0 || (width != 0 && dev->get_resource_desc(rt0).texture.width != width)) return false;
+  }
   const auto it = state->descriptor_tables.find(shader_stage::all_graphics);
   if (it == state->descriptor_tables.end() || it->second.second.size() < 7) return false;
   out->stream_rs = g_wind.root_signature(data.current.handle);
@@ -2918,8 +2966,24 @@ bool GameDrawsVelocity(uint32_t part) {
   return it != g_velocity_parts.end() && it->second + 2 >= g_frame.load();
 }
 
-// An enemy's or animal's G-buffer draw: its previous pose from last frame's bones (skin_motion.hpp) and camera.
-// Returns true when the game's draw was recorded here, so the caller skips the original.
+// The object class a skinned draw writes into the stencil's top two bits, which the TAA's stencil copy turns into its
+// classes ("Stencil classes" in docs/recon.md). G-buffer references: 0x50 for the player (0x58 for skin), 0x90 for the
+// other characters (0xB8 for fur), 0x10 for skinned map objects (tools/rdc_stencilref.py); the player's forward
+// prepasses write 0x44 (hair) and 0x28 (body hair, class 0). -1 when the pipeline writes no class (the reference value
+// is then left over from another draw).
+int StencilClass(command_list* cmd_list, pipeline pipe, std::string* material) {
+  auto* const state = cmd_list->get_private_data<state_tracking>();
+  if (state == nullptr) return -1;
+  std::shared_lock lock(g_stencil_writers_mutex);
+  const auto it = g_stencil_writers.find(pipe.handle);
+  if (it == g_stencil_writers.end()) return -1;
+  *material = it->second;
+  return static_cast<int>((state->front_stencil_reference_value >> 6) & 3);
+}
+
+// An enemy's or animal's G-buffer or forward-pass draw: its previous pose from last frame's bones (skin_motion.hpp)
+// and camera. Returns true when the game's draw was recorded here, so the caller skips the original (never for the
+// forward pass, whose draws only stream their positions).
 bool StreamSkinDraw(command_list* cmd_list, CmdData& data, uint32_t index_count, uint32_t instance_count,
                     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
   ++g_npc_counts.seen;
@@ -2928,9 +2992,27 @@ bool StreamSkinDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
     return false;
   }
   const uint32_t part = PartKey(data.index_va, first_index, index_count);
+  // Only the player's parts keep the game's velocity. A part can have the game's velocity draws without being the
+  // player's: a creature's while the game's motion blur is on, and a human NPC's mesh shared with the player's
+  // equipment or body (the same index buffer). Those drawn with the other characters' class in the stencil are drawn
+  // here.
+  bool not_player = false;
   if (GameDrawsVelocity(part)) {
-    ++g_npc_counts.velocity;
-    return false;
+    std::string material;
+    if (StencilClass(cmd_list, data.current, &material) != 2) {
+      ++g_npc_counts.velocity;
+      return false;
+    }
+    not_player = true;
+    static std::mutex logged_mutex;
+    static std::vector<std::string> logged;
+    std::lock_guard lock(logged_mutex);
+    if (logged.size() < 32 && std::find(logged.begin(), logged.end(), material) == logged.end()) {
+      logged.push_back(material);
+      Log(reshade::log::level::info, "NPC motion: " + material +
+                                         " has velocity draws of the game's but another character's stencil class: "
+                                         "drawn here");
+    }
   }
   StreamDraw draw;
   if (!PrepareStreamDraw(cmd_list, data, "character", &draw)) {
@@ -2960,6 +3042,8 @@ bool StreamSkinDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
     if (stage >= 3) prev_bones = job.prev;
   }
   ++g_npc_counts.streamed;
+  if (not_player) ++g_npc_counts.not_player;
+  if (draw.forward) ++g_npc_counts.forward;
   const bool replaced = RecordStreamDraw(cmd_list, data, draw, FindWind(dev, draw.layout, draw.tables), 0, skin.bones,
                                          prev_bones, index_count, instance_count, first_index, vertex_offset,
                                          first_instance);
@@ -2969,28 +3053,28 @@ bool StreamSkinDraw(command_list* cmd_list, CmdData& data, uint32_t index_count,
 
 // Development: the draw counts per frame since the last call, and the skinned pipelines without stream copies.
 std::string NpcDrawStats() {
-  static uint64_t last_frame = 0, last[7] = {};
+  static uint64_t last_frame = 0, last[9] = {};
   const uint64_t frame = g_frame.load();
-  const uint64_t now[7] = {g_npc_counts.seen.load(),  g_npc_counts.velocity.load(), g_npc_counts.prepare.load(),
+  const uint64_t now[9] = {g_npc_counts.seen.load(),  g_npc_counts.velocity.load(), g_npc_counts.prepare.load(),
                            g_npc_counts.inputs.load(), g_npc_counts.patch.load(),  g_npc_counts.streamed.load(),
-                           g_npc_counts.replaced.load()};
+                           g_npc_counts.replaced.load(), g_npc_counts.not_player.load(), g_npc_counts.forward.load()};
   const double frames = static_cast<double>(std::max<uint64_t>(1, frame - last_frame));
-  double d[7];
-  for (int i = 0; i < 7; ++i) d[i] = (now[i] - last[i]) / frames;
+  double d[9];
+  for (int i = 0; i < 9; ++i) d[i] = (now[i] - last[i]) / frames;
   size_t without = 0;
   {
     std::lock_guard lock(g_wind_mutex);
     for (const auto& [pipeline, source] : g_wind_sources)
-      if (IsSkinMaterial(source.name) && !g_wind.IsWindPipeline(pipeline)) ++without;
+      if (IsSkinMaterial(source.name) && !ForwardWithoutDepth(source) && !g_wind.IsWindPipeline(pipeline)) ++without;
   }
-  char text[320];
+  char text[448];
   std::snprintf(text, sizeof(text),
                 "skinned draws per frame: %.1f seen, %.1f the game's (velocity), %.1f other cameras or no copy, %.1f "
-                "without inputs, %.1f patch refused, %.1f streamed (%.1f replaced); %zu skinned pipelines without "
-                "copies",
-                d[0], d[1], d[2], d[3], d[4], d[5], d[6], without);
+                "without inputs, %.1f patch refused, %.1f streamed (%.1f replaced; %.1f with velocity draws of the "
+                "game's but not the player's; %.1f of the forward pass); %zu skinned pipelines without copies",
+                d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], without);
   last_frame = frame;
-  std::copy(now, now + 7, last);
+  std::copy(now, now + 9, last);
   return text;
 }
 

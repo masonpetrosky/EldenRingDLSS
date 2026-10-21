@@ -27,6 +27,7 @@ for picking up.
 | 0.2.0 release (fast-travel fix, preset E, RR checkbox, water reflection position) | GitHub + Nexus, everyday install (2026-10-19) |
 | Native-size water reflections (`WaterReflections=1`) | Works in game (2026-10-20, test copy `dist/test-0.3.0`); `docs/recon.md` |
 | Water flickered between the native and the engine's reflection | Fixed (hooks now run in lists decided at submission); user: "water is great now" |
+| A ghost had no motion vectors (drawn in the forward pass, which the NPC path skipped) | Fixed: characters' forward prepasses stream like G-buffer draws; user: "everything looks great" |
 | Game update 1.17.2 moved the TAA filter's vtable | Fixed (RTTI lookup); 0.2.0 needs it: release pending |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
@@ -228,9 +229,9 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
    silhouettes while strafing and on swaying grass and trees (docs/recon.md, "Object-only motion blur").
 5. RR's responsivity mask on vegetation (preset F only; negative values favor stability) for the grass at 50%.
 6. The outreach drafts above, one at a time with the user.
-7. NPC motion edge: an enemy part shared with the player's equipment gets no motion (excluded with the player's
-   parts by mesh key). Check first whether it happens: `npc` reports draws left to the game per frame, which should
-   equal the player's part count; fighting soldiers in the player's armor would show more.
+7. NPC motion edge, addressed 2026-10-20: a part with the game's velocity draws is now drawn here when its draw
+   writes the other characters' stencil class (docs/recon.md, "A ghost without motion vectors"). It happened once
+   (four materials, just before the user quit); a fight with soldiers in the player's armor would confirm it.
 8. Older items: broader robustness (the first frame of a new command-list kind; targeted live scale and resolution
    transitions passed on 2026-10-12), performance of the stretch and full-size post-processing (about 1 ms), and
    removing dead experiments (`drs_probe.*`, `engine_resolution.*`, `hw_breakpoints.*`).
