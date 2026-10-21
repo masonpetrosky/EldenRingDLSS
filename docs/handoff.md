@@ -29,7 +29,7 @@ for picking up.
 | Water flickered between the native and the engine's reflection | Fixed (hooks now run in lists decided at submission); user: "water is great now" |
 | A ghost had no motion vectors (drawn in the forward pass, which the NPC path skipped) | Fixed: characters' forward prepasses stream like G-buffer draws; user: "everything looks great" |
 | Game update 1.17.2 moved the TAA filter's vtable | Fixed (RTTI lookup) in 0.3.0: GitHub release and everyday install (2026-10-20) |
-| DLSS Frame Generation (Streamline DLSS-G, `FrameGeneration`) | Done (2026-10-21), test copy `dist/test-0.4.0-fg` only; the user played 2x-4x ("working correctly") and prefers 2x |
+| DLSS Frame Generation (Streamline DLSS-G, `FrameGeneration`) | Done (2026-10-21), test copy `dist/test-0.4.0-fg` only; the user played 2x-4x ("working correctly"); with the faster NPC path they prefer it off |
 | Castle courtyard at 52 fps: NPC patches took 5.3 ms | Fixed (2026-10-21): lookups run together, 0.2 ms, 70 fps there; verified in game; `docs/recon.md` |
 | The game's anisotropic filtering | Already 16x (2026-10-21; `docs/recon.md`) |
 | GitHub issue #1, Proton black screen | NGX and NVAPI start on a thread of their own (2026-10-21); untested under Proton |
@@ -211,15 +211,16 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 **Done 2026-10-21 (the user's requests of 2026-10-20):** the castle courtyard (52 -> 70 fps: the NPC patches' barriers,
 `docs/recon.md`, "The castle courtyard"), DLSS Frame Generation (`docs/recon.md`, "DLSS Frame Generation"; the user
-prefers 2x) and the anisotropic filtering check (the game already uses 16x).
+preferred 2x at first, and off once the courtyard ran at 70 fps) and the anisotropic filtering check (the game already
+uses 16x).
 
 **Next:**
-- **Waiting for the user's OK:** the everyday install with this build and `FrameGeneration=2` (back up first, game
-  closed; it needs the Streamline DLLs and `nvngx_dlssg.dll` beside the add-on), and a 0.4.0 release (GitHub and
-  Nexus; `CHANGELOG.md` "Unreleased" has the notes).
-- **The NPC table's atomic key** (the last race fix) has passed the GPU test but not run in game: at the courtyard,
-  `mv` dumps with the camera still should show no one-frame jumps on distant soldiers (`npc` stats: matched close to
-  patched).
+- **Waiting for the user's OK:** the everyday install with this build and `FrameGeneration=0`, their choice (back up
+  first, game closed; `deploy.ps1` also copies the Streamline DLLs and `nvngx_dlssg.dll`), and a 0.4.0 release
+  (GitHub and Nexus; `CHANGELOG.md` "Unreleased" has the notes).
+- **The NPC table's atomic key** (the last race fix) has passed the GPU test but not run in game; it is in the test
+  copy since 2026-10-21 12:24 (SHA-256 `AD747432...`). At the courtyard, `mv` dumps with the camera still should show
+  no one-frame jumps on distant soldiers (`npc` stats: matched close to patched).
 - Streamline logged "ERROR RSYNC: Flip queue is empty!!!" once at the title screen (2026-10-21); harmless so far,
   not looked into.
 - **Nexus report (answered 2026-10-20, waiting for their tests):** light particles under upscaling sometimes move

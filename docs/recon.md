@@ -1043,7 +1043,9 @@ the add-on's NGX, "the game's swap chain was created through Streamline (CreateS
 
 Every present reached the screen, evenly spaced. Generation costs about 2.6 ms per rendered frame at 2x and 1.3-1.4 ms
 for each further frame, so the rendered rate drops 12-22%. The user played at 2x, 3x and 4x: "working correctly"; they
-prefer 2x to off and to the higher multipliers. Distant enemies animate at a reduced rate, as in the base game.
+prefer 2x to off and to the higher multipliers. Distant enemies animate at a reduced rate, as in the base game. With
+the courtyard fix below (about 70 fps rendered there) they prefer it off: "frame gen is working as intended", a
+personal preference.
 
 ## The castle courtyard: 52 fps (2026-10-21)
 
