@@ -233,9 +233,10 @@ uses 16x). Then, on the user's request, the trees the same way (`docs/recon.md`,
 G-buffer"): about 1.5 ms saved in a forest. All of it went out as 0.4.0 the same day.
 
 **Next:**
-- **Nexus replies waiting for the user's OK** (drafts in `dist\nexus\replies-2026-10-21.md`, local): Ver3ion's
-  particle details, Kagerrriter's laptop RTX 5060 without a gain at 1440p, and Maooq's thanks in the thread where we
-  promised to say when frame generation works (it is in 0.4.0).
+- **Nexus replies posted 2026-10-21 14:53 with the user's OK** (texts in `dist\nexus\replies-2026-10-21.md`,
+  local): to Ver3ion's particle details (177972135), to Kagerrriter's laptop RTX 5060 without a gain at 1440p
+  (177972147: version, FPS with F9 off against the 60 cap, preset K or E; asked for F9 on/off FPS and a log), and to
+  Maooq that frame generation is in 0.4.0 (177972165, the promised follow-up). Watch for their answers.
 - Streamline logged "ERROR RSYNC: Flip queue is empty!!!" once at the title screen (2026-10-21); harmless so far,
   not looked into.
 - **Nexus report (Ver3ion, thread 177485424):** light particles under upscaling sometimes move the wrong way for a
