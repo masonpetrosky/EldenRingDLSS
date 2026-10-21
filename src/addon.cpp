@@ -102,6 +102,8 @@ struct SceneParams {
   float percentages[8] = {1, 1, 1, 1, 1, 1, 1, 1};  // SC_DynamicResolution_ScreenPercentage and the secondary
   float velocity_scale = 1, velocity_bias = 0;
   float camera[3] = {0, 0, 0};
+  // FC_MatrixProj's depth terms (reversed Z): device depth = depth_scale + depth_bias / view depth.
+  float depth_scale = 0, depth_bias = 0;
 };
 
 // A constant edit to apply when its command list is submitted after the TAA.
@@ -793,6 +795,8 @@ bool ReadSceneParams(command_list* cmd_list, SceneParams* out) {
   out->velocity_scale = f[kVelocityEncode];
   out->velocity_bias = f[kVelocityEncode + 1];
   std::memcpy(out->camera, f + kCameraPos, sizeof(out->camera));
+  out->depth_scale = proj[10];
+  out->depth_bias = proj[11];
   return true;
 }
 
@@ -3657,24 +3661,29 @@ void StartSsrChain(command_list* cmd_list, CmdData& data) {
   // share of the half-size target) agrees.
   const resource_desc ld = dev->get_resource_desc(linear);
   const auto ew = static_cast<float>(ld.texture.width), eh = static_cast<float>(ld.texture.height);
-  float px, py;
+  // The engine's depth conversion uses cbPerScene.g_vDepthComputeParam (pixel b0, byte 272), the projection's depth
+  // terms (scale, bias, 1 / bias, 0): -5.00679e-06, 0.0500673, 19.9731, 0 in er117_scale67_f2898.rdc, where
+  // FC_MatrixProj holds the same. That buffer lives in GPU-only memory (a placed resource in a default heap), so the
+  // terms come from the cbSceneParam the scene draws gave this frame (or the last).
+  float px, py, depth_scale, depth_bias;
   {
     std::lock_guard lock(g_scene_mutex);
     px = g_scene.percentages[0];
     py = g_scene.percentages[1];
+    depth_scale = g_scene.depth_scale;
+    depth_bias = g_scene.depth_bias;
   }
   const viewport vp = state->viewports[0];
   if (!(std::fabs(ew * px - vp.width) <= 1.5f && std::fabs(eh * py - vp.height) <= 1.5f)) {
     px = vp.width / ew;
     py = vp.height / eh;
   }
-  float param[4];  // cbPerScene (pixel b0) g_vDepthComputeParam
   if (linear == 0 || full == 0) {
     SsrMiss("the depth inputs were not found");
-  } else if (!ReadBoundConstants(cmd_list, shader_stage::pixel, 0, 272, param, sizeof(param))) {
-    SsrMiss("the depth parameters were not readable");
+  } else if (!(depth_bias > 0.0f) || !std::isfinite(depth_scale)) {
+    SsrMiss("the scene's projection is not known yet");
   } else {
-    const float depth_param[2] = {param[0], param[2]};
+    const float depth_param[2] = {depth_scale, 1.0f / depth_bias};
     std::lock_guard lock(g_ssr_mutex);
     if (!g_water_ssr.ready() && !g_ssr_failed &&
         !g_water_ssr.Init(reinterpret_cast<ID3D12Device*>(dev->get_native()))) {
