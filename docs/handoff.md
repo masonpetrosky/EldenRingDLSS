@@ -208,10 +208,16 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 - **DLSS Frame Generation:** look into adding it. First questions: Streamline or NGX directly, keeping the HUD out
   of the generated frames, frame pacing with UnlockTheFps, and Reflex (frame generation needs it; ours is injected
   at the present). A Nexus visitor asked for it too (2026-10-19).
-- **Nexus comments after 0.2.0, not answered yet** (each reply needs the user's OK): light particles under upscaling
-  sometimes move the wrong way for a moment and then snap back, with occasional artifacts around them (easy to see
-  after burning the Erdtree, a report from 2026-10-20); the same player sees no visible difference from the wind
-  motion vectors.
+- **Nexus report (answered 2026-10-20, waiting for their tests):** light particles under upscaling sometimes move
+  the wrong way for a moment and then snap back, with occasional artifacts around them (easy to see after burning
+  the Erdtree). Asked whether it happens at DLAA and with F9, which preset, and for a clip. The same player sees no
+  visible difference from the wind motion vectors (answered: subtle, mostly at 50-58%).
+- **GitHub issue #1, Proton black screen (answered 2026-10-20):** the reporter's 0.1.0 log stops while NGX starts
+  inside `OnInitDevice` (ReShade's init_device event): under Proton NGX finds the driver through
+  `/run/host/usr/lib/nvidia/wine`, then nvapi64.dll creates a D3D11 device and a 1x1 swap chain on another thread,
+  and nothing more is logged; likely a deadlock with the device setup. Since 0.2.0 `Reflex::Init` (NvAPI_Initialize)
+  runs there too, even with Reflex off. Idea: start NGX and NVAPI after the device setup (first present, or a
+  thread the game does not wait on). Asked for a ReShade-alone test and a 0.3.0 log.
 
 0. **Broader NPC motion checks, then test the 83545fe foliage changes** (game closed;
    targeted post-audit checks passed; original 50% DLSS/RR settings restored;
