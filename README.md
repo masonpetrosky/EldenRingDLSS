@@ -124,6 +124,13 @@ NGX and NPC window checks on an RTX GPU after building with `-Tests`:
 build/erdlss_regressions.exe --gpu third_party/dlss/bin/rel
 ```
 
+After a game update, this checks the version-specific lookups (see Limitations) against the game's executable
+without starting it:
+
+```
+build/erdlss_regressions.exe --exe "C:/Program Files (x86)/Steam/steamapps/common/ELDEN RING/Game/eldenring.exe"
+```
+
 These checks run outside the game. They cover state transitions and native feature creation; visual results and
 frame-time changes still need in-game testing.
 
@@ -214,8 +221,9 @@ hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale
 
 ## Limitations
 
-- Version specific: the TAA filter's vtable address is hard-coded; the resolution scale is found by a code pattern.
-  A game update can break either (the add-on then falls back to DLAA or the game's TAA and logs it).
+- Version specific: the resolution scale is found by a code pattern, and the TAA filter (for the jitter) by its
+  vtable, which the add-on looks up through the game's RTTI (`eldenring.exe` 2.7.2.0 moved it). A game update can
+  break either: the add-on then renders at full size (DLAA) or keeps the game's 8 jitter positions, and logs it.
 - Tested on one GPU, at 4K and in HDR. Some corrections depend on exact sizes (render sizes are rounded by the engine
   to 4 or 8 pixels).
 - Ray Reconstruction at 50-67% shows more shimmer in grass than at DLAA. It comes from the upscale (it stays with the

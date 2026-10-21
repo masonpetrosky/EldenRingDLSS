@@ -13,8 +13,9 @@ namespace erdlss {
 
 class RenderScale {
  public:
-  // Scans the game's code for the load of the state object. False if the pattern is missing.
-  bool Find();
+  // Scans the game's code for the load of the state object. False if the pattern is missing. `module` is the game's
+  // image by default (the regression checks pass a file mapped as an image, and read only found()).
+  bool Find(const uint8_t* module = nullptr);
   bool found() const { return global_ != 0; }
   // The engine's current scale, or 0 while the state object does not exist or looks wrong.
   float Get() const;

@@ -360,6 +360,23 @@ void CheckWaterSsr() {
   std::printf("water reflections checked (D3D12 debug layer %s)\n", validated ? "on" : "not installed");
   ssr.Shutdown();
 }
+
+// After a game update: the version-specific lookups (the TAA filter's vtable through the RTTI, the resolution
+// scale's code pattern) against an eldenring.exe, mapped as an image without running it.
+void CheckGameExe(const std::wstring& path) {
+  const HMODULE image = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+  if (image == nullptr) throw std::runtime_error("the executable could not be mapped as an image");
+  // An image-resource handle has its low bits set.
+  const auto* const module = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(image) & ~uintptr_t{3});
+  const uintptr_t vtable = erdlss::TaaJitter::FindVtable(module);
+  erdlss::RenderScale scale;
+  const bool pattern = scale.Find(module);
+  FreeLibrary(image);
+  Check(vtable != 0, "the TAA filter's vtable must be found through the RTTI");
+  Check(pattern, "the resolution scale's code pattern must match");
+  std::printf("game executable checked: TAA filter vtable at +0x%llX, resolution scale pattern found\n",
+              static_cast<unsigned long long>(vtable - reinterpret_cast<uintptr_t>(module)));
+}
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -370,7 +387,9 @@ int wmain(int argc, wchar_t** argv) {
     CheckLiveBlur();
     if (argc == 3 && std::wstring_view(argv[1]) == L"--gpu") CheckGpuWrappers(fs::absolute(argv[2]).wstring());
     else if (argc == 2 && std::wstring_view(argv[1]) == L"--water") CheckWaterSsr();
-    else if (argc != 1) throw std::runtime_error("usage: erdlss_regressions [--gpu <SDK DLL directory> | --water]");
+    else if (argc == 3 && std::wstring_view(argv[1]) == L"--exe") CheckGameExe(fs::absolute(argv[2]).wstring());
+    else if (argc != 1)
+      throw std::runtime_error("usage: erdlss_regressions [--gpu <SDK DLL directory> | --water | --exe <eldenring.exe>]");
     std::printf("PASS: %d regression checks\n", checks);
     return 0;
   } catch (const std::exception& error) {

@@ -35,8 +35,8 @@ bool GuardedCopy(void* dst, const void* src, size_t size) {
 
 }  // namespace
 
-bool RenderScale::Find() {
-  const auto* const base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+bool RenderScale::Find(const uint8_t* module) {
+  const auto* const base = module != nullptr ? module : reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
   const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
   const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
   const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);

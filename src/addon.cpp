@@ -1764,7 +1764,7 @@ bool ReplaceTaa(command_list* cmd_list, CmdData& data, const float screen[2]) {
                   game_exposure ? "game" : "auto", static_cast<unsigned long long>(g_failures.load()),
                   g_config.game_sharpening ? "on" : "off", g_applied_mip_bias,
                   static_cast<unsigned long long>(g_biased_samplers.load()));
-    Log(reshade::log::level::info, text);
+    Log(reshade::log::level::info, std::string(text) + "; " + g_taa_jitter.status());
   }
   return true;
 }

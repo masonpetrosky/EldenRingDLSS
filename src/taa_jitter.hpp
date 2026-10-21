@@ -1,9 +1,11 @@
 // The TAA's camera jitter cycle while upscaling (docs/recon.md, "Stage 3, round 4"). The game jitters through 8
 // Halton(2, 3) positions, enough for its TAA and for DLAA; DLSS needs about 8 x (output / render size)^2 when it
 // upscales, or static detail turns into a regular dot pattern. The cycle length is the AA filter's +0x64 (the
-// counter at +0x124 wraps there). The filter (GXBS::GXAntiAliasingFilter, vtable 0x142F242B8) copies its settings
-// from the area's graphics parameters every frame (0x141AD8F90) unless its byte +0x8 is set, so the add-on sets that
-// byte and the cycle while upscaling, and clears the byte afterwards so the game's settings apply again.
+// counter at +0x124 wraps there). The filter (GXBS::GXAntiAliasingFilter) copies its settings from the area's
+// graphics parameters every frame (0x141AD8F90) unless its byte +0x8 is set, so the add-on sets that byte and the
+// cycle while upscaling, and clears the byte afterwards so the game's settings apply again. The filters are found in
+// the heaps by their vtable, which the add-on looks up through the game's RTTI because game updates move it
+// (0x142F242B8 in 2.7.1.0, 0x142F26558 in 2.7.2.0).
 // SPDX-License-Identifier: MIT
 
 #pragma once
@@ -26,6 +28,9 @@ class TaaJitter {
   std::string status() const;
   // The first TAA filter's jitter counter (+0x124), cycle length (+0x64) and its two-frames-per-position flag (+0x10).
   bool ReadCounter(uint32_t* counter, uint32_t* phases, bool* doubled) const;
+  // The filter class's vtable in a mapped eldenring.exe image (the running game's, or a file mapped as an image by
+  // the regression checks), or 0 unless its RTTI names exactly one.
+  static uintptr_t FindVtable(const uint8_t* module);
 
  private:
   void Search();
@@ -38,6 +43,8 @@ class TaaJitter {
   bool held_ = false;  // the filters' settings are held
   uint32_t phases_ = 0;
   uint64_t searches_ = 0;
+  uintptr_t vtable_ = 0;            // written by the first search
+  bool vtable_searched_ = false;
 };
 
 }  // namespace erdlss
