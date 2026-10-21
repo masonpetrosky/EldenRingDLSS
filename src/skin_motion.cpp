@@ -9,13 +9,14 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 
 #include "d3d12_util.hpp"
 #include "dred.hpp"
 #include "kSkinMotionAdvanceCs.h"
 #include "kSkinMotionClearCs.h"
-#include "kSkinMotionCopyCs.h"
-#include "kSkinMotionPatchCs.h"
+#include "kSkinMotionLookupCs.h"
+#include "kSkinMotionResolveCs.h"
 
 namespace erdlss {
 namespace {
@@ -30,8 +31,9 @@ constexpr uint64_t kFrameBudget = kRingSize / 4;
 constexpr uint32_t kStatsSize = 16;  // frame counter, patched, matched, not inserted
 
 // Root parameters (skin_motion.hlsl).
-enum : UINT { kBones, kInstances, kIdxParam, kIndexBuffer, kTable, kStore, kPrev, kArgs, kParamCount };
-constexpr UINT kArgCount = 10;  // the Args constant buffer
+enum : UINT { kBones, kInstances, kIdxParam, kIndexBuffer, kTable, kStore, kPrev, kResults, kArgs, kParamCount };
+constexpr UINT kArgCount = 12;  // the Args constant buffer
+constexpr uint32_t kResultSize = 16;
 
 }  // namespace
 
@@ -44,7 +46,7 @@ bool SkinMotion::Init(ID3D12Device* device) {
   }
   params[kIndexBuffer].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
   params[kIndexBuffer].Descriptor = {0, 0};
-  for (UINT i = 0; i < 3; ++i) {
+  for (UINT i = 0; i < 4; ++i) {
     params[kTable + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     params[kTable + i].Descriptor = {i, 0};
   }
@@ -63,8 +65,8 @@ bool SkinMotion::Init(ID3D12Device* device) {
     size_t size;
     ID3D12PipelineState** pso;
   } shaders[] = {
-      {kSkinMotionCopyCs, sizeof(kSkinMotionCopyCs), &copy_pso_},
-      {kSkinMotionPatchCs, sizeof(kSkinMotionPatchCs), &patch_pso_},
+      {kSkinMotionLookupCs, sizeof(kSkinMotionLookupCs), &lookup_pso_},
+      {kSkinMotionResolveCs, sizeof(kSkinMotionResolveCs), &resolve_pso_},
       {kSkinMotionClearCs, sizeof(kSkinMotionClearCs), &clear_pso_},
       {kSkinMotionAdvanceCs, sizeof(kSkinMotionAdvanceCs), &advance_pso_},
   };
@@ -84,8 +86,10 @@ bool SkinMotion::Init(ID3D12Device* device) {
                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   prev_ = CreateBuffer(device, kRingSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  results_ = CreateBuffer(device, uint64_t{kLists} * kResultsPerList * kResultSize, D3D12_HEAP_TYPE_DEFAULT,
+                          D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   readback_ = CreateBuffer(device, 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-  if (table_ == nullptr || store_ == nullptr || prev_ == nullptr || readback_ == nullptr) {
+  if (table_ == nullptr || store_ == nullptr || prev_ == nullptr || results_ == nullptr || readback_ == nullptr) {
     status_ = "buffer creation failed";
     Shutdown();
     return false;
@@ -110,6 +114,7 @@ bool SkinMotion::Init(ID3D12Device* device) {
   table_->SetName(L"EldenRingDLSS NPC motion table");
   store_->SetName(L"EldenRingDLSS NPC bone store");
   prev_->SetName(L"EldenRingDLSS NPC previous bones");
+  results_->SetName(L"EldenRingDLSS NPC lookups");
   status_ = "initialized";
   return true;
 }
@@ -124,14 +129,15 @@ void SkinMotion::Shutdown() {
   fence_value_ = 0;
   if (event_ != nullptr) CloseHandle(event_);
   event_ = nullptr;
-  Release(copy_pso_);
-  Release(patch_pso_);
+  Release(lookup_pso_);
+  Release(resolve_pso_);
   Release(clear_pso_);
   Release(advance_pso_);
   Release(rs_);
   Release(table_);
   Release(store_);
   Release(prev_);
+  Release(results_);
   Release(readback_);
   std::lock_guard lock(windows_mutex_);
   windows_.clear();
@@ -140,14 +146,13 @@ void SkinMotion::Shutdown() {
 }
 
 bool SkinMotion::WindowFor(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t size, uint64_t frame, uint64_t scope,
-                           Window* out, bool* first) {
+                           Window* out) {
   std::lock_guard lock(windows_mutex_);
   // A recording can span a present, but only draws in that same recording may share its previous-pose window.
   const WindowKey key{bones, scope};
   const auto it = windows_.find(key);
   if (it != windows_.end() && it->second.frame + 1 >= frame && it->second.size >= size) {
     *out = it->second;
-    *first = false;
     return true;
   }
   if (frame != budget_frame_) {
@@ -174,7 +179,6 @@ bool SkinMotion::WindowFor(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t size, uint6
   w.prev = prev_->GetGPUVirtualAddress() + allocate(prev_next_);
   windows_[key] = w;
   *out = w;
-  *first = true;
   ++windows_made_;
   window_bytes_ += size;
   return true;
@@ -192,8 +196,7 @@ bool SkinMotion::PrepareJob(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t bones_size
   if (scope == 0 || size < 48 || instance_count == 0 || instance_count > 65535 || instance_slots == 0 || index_entries == 0)
     return false;
   Window window;
-  bool first = false;
-  if (!WindowFor(bones, size, frame, scope, &window, &first)) return false;
+  if (!WindowFor(bones, size, frame, scope, &window)) return false;
   job->bones = bones;
   job->instances = instances;
   job->idx_param = idx_param;
@@ -205,7 +208,6 @@ bool SkinMotion::PrepareJob(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t bones_size
   job->index_entries = index_entries;
   job->instance_count = instance_count;
   job->part = part;
-  job->copy = first;
   ++draws_;
   return true;
 }
@@ -213,7 +215,8 @@ bool SkinMotion::PrepareJob(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t bones_size
 bool SkinMotion::SubmitJobs(ID3D12CommandQueue* queue, const std::vector<Job>& jobs) {
   if (jobs.empty() || fence_ == nullptr || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
   std::lock_guard lock(submit_mutex_);
-  Submission& sub = lists_[next_list_];
+  const int index = next_list_;
+  Submission& sub = lists_[index];
   next_list_ = (next_list_ + 1) % kLists;
   if (fence_->GetCompletedValue() < sub.done) {  // only with 16 submissions in flight
     fence_->SetEventOnCompletion(sub.done, event_);
@@ -227,33 +230,61 @@ bool SkinMotion::SubmitJobs(ID3D12CommandQueue* queue, const std::vector<Job>& j
   cmd->SetComputeRootSignature(rs_);
   cmd->SetComputeRootUnorderedAccessView(kTable, table_->GetGPUVirtualAddress());
   cmd->SetComputeRootUnorderedAccessView(kStore, store_->GetGPUVirtualAddress());
+  cmd->SetComputeRootUnorderedAccessView(kResults,
+                                         results_->GetGPUVirtualAddress() + uint64_t{kResultsPerList} * kResultSize * index);
   const float max_distance = max_distance_.load();
   const float max_distance2 = max_distance * max_distance;
   const float test_offset = test_offset_.load();
   const uint32_t max_bones = max_bones_.load();
-  D3D12_RESOURCE_BARRIER uav = {};
-  uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;  // all unordered access
-  for (const Job& job : jobs) {
+  auto bind = [&](const Job& job, uint32_t result_base, uint32_t result_count) {
     cmd->SetComputeRootConstantBufferView(kBones, job.bones);
     cmd->SetComputeRootConstantBufferView(kInstances, job.instances);
     cmd->SetComputeRootConstantBufferView(kIdxParam, job.idx_param);
     cmd->SetComputeRootShaderResourceView(kIndexBuffer, job.index_buffer);
     cmd->SetComputeRootUnorderedAccessView(kPrev, job.prev);
     uint32_t args[kArgCount] = {job.instance_count, job.part,  kSlots - 1,         job.window_bones, job.store_offset,
-                                max_bones,          0,         job.instance_slots, job.index_entries, 0};
+                                max_bones,          0,         job.instance_slots, job.index_entries, 0,
+                                result_base,        result_count};
     std::memcpy(&args[6], &max_distance2, 4);
     std::memcpy(&args[9], &test_offset, 4);
     cmd->SetComputeRoot32BitConstants(kArgs, kArgCount, args, 0);
-    if (job.copy) {  // the window's later patches build on the copy
-      cmd->SetPipelineState(copy_pso_);
-      cmd->Dispatch((job.window_bones * 3 + 63) / 64, 1, 1);
-      cmd->ResourceBarrier(1, &uav);
+  };
+  // All lookups first, without barriers between them: a lookup reads last frame's table, which nothing writes this
+  // frame, and adds to this frame's with atomics. Then one barrier and a pass per bone window. With the patches in
+  // draw order and a barrier after each, 300 draws at a castle courtyard took 5.3 ms (2026-10-21): every lookup ran
+  // alone. A window's draws are kept together, so its results are one range; it is drawn with the largest view of
+  // its bones, the one that made it.
+  std::vector<uint32_t> order(jobs.size());
+  std::iota(order.begin(), order.end(), 0u);
+  std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return jobs[a].prev < jobs[b].prev; });
+  struct WindowRange {
+    uint32_t job, base, count;
+  };
+  std::vector<WindowRange> windows;
+  uint32_t results = 0;
+  cmd->SetPipelineState(lookup_pso_);
+  for (const uint32_t i : order) {
+    const Job& job = jobs[i];
+    if (windows.empty() || jobs[windows.back().job].prev != job.prev) windows.push_back({i, results, 0});
+    WindowRange& window = windows.back();
+    if (job.window_bones > jobs[window.job].window_bones) window.job = i;
+    if (job.instance_count > kResultsPerList - results) {  // thousands of characters in one list: their bones stay
+      ++refused_;
+      continue;
     }
-    cmd->SetPipelineState(patch_pso_);
-    cmd->Dispatch(job.instance_count, 1, 1);
-    // Later parts can revisit the same characters and bones. Their table reads and previous-pose writes must follow
-    // this patch even when no additional window copy is necessary.
-    cmd->ResourceBarrier(1, &uav);
+    bind(job, results, 0);
+    cmd->Dispatch((job.instance_count + 63) / 64, 1, 1);
+    results += job.instance_count;
+    window.count = results - window.base;
+  }
+  D3D12_RESOURCE_BARRIER uav = {};
+  uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;  // all unordered access
+  cmd->ResourceBarrier(1, &uav);
+  cmd->SetPipelineState(resolve_pso_);
+  for (const WindowRange& window : windows) {
+    const Job& job = jobs[window.job];
+    bind(job, window.base, window.count);
+    cmd->Dispatch((job.window_bones * 3 + 63) / 64, 1, 1);
   }
   Marker(cmd, L"ERDLSS <end>");  // the GPU profiler's end of this list
   if (FAILED(cmd->Close())) return false;

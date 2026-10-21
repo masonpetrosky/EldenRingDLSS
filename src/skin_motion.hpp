@@ -5,7 +5,8 @@
 // output (wind.hpp) then replays the game's vertex shader with it and with last frame's camera, and its resolve at the
 // TAA writes the difference into the motion texture. The patches run in a command list of their own just before the
 // game's list is executed: in the middle of the G-buffer pass, each patch's barriers stalled the GPU (1.8 ms for 80
-// draws).
+// draws). There, all lookups run together and one pass per bone window writes the previous poses: with a barrier after
+// each patch, 300 draws at a castle courtyard took 5.3 ms.
 // SPDX-License-Identifier: MIT
 
 #pragma once
@@ -25,7 +26,7 @@ class SkinMotion {
  public:
   bool Init(ID3D12Device* device);
   void Shutdown();  // the GPU must be idle
-  bool ready() const { return patch_pso_ != nullptr; }
+  bool ready() const { return lookup_pso_ != nullptr; }
   const std::string& status() const { return status_; }
 
   // Unique scope for one command-list recording. Lists can be recorded and submitted in different orders.
@@ -36,7 +37,6 @@ class SkinMotion {
     D3D12_GPU_VIRTUAL_ADDRESS bones = 0, instances = 0, idx_param = 0, index_buffer = 0;
     D3D12_GPU_VIRTUAL_ADDRESS prev = 0;  // the previous-pose window: bind it as cbObjMatrix for the previous pose
     uint32_t window_bones = 0, store_offset = 0, instance_slots = 0, index_entries = 0, instance_count = 0, part = 0;
-    bool copy = false;  // this list's first draw of the window: copy before any of its patches
   };
   // Plans the patch for a skinned draw: `bones` and `bones_size` are the draw's cbObjMatrix (vertex b5), `instances`
   // and `instances_size` its cbInstanceData (vertex b4), `idx_param` its cbInstanceIdxParam (b10), `index_buffer`
@@ -59,6 +59,8 @@ class SkinMotion {
   void set_max_bones(uint32_t bones) { max_bones_ = bones; }
   // Development: shifts every previous pose this far along x (m), so everything this path draws shows motion.
   void set_test_offset(float meters) { test_offset_ = meters; }
+  // Tests: the previous-pose ring that Job::prev points into.
+  ID3D12Resource* prev_buffer() const { return prev_; }
 
   // One line of statistics since the last call: draws, windows and their bytes per frame, and the GPU's counts of
   // characters patched and matched (from a recent frame; read after the GPU is idle).
@@ -81,11 +83,12 @@ class SkinMotion {
     uint32_t store_offset = 0;           // this frame's copy of the window in the store
     D3D12_GPU_VIRTUAL_ADDRESS prev = 0;  // the previous-pose window
   };
-  bool WindowFor(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t size, uint64_t frame, uint64_t scope,
-                 Window* out, bool* first);
+  bool WindowFor(D3D12_GPU_VIRTUAL_ADDRESS bones, uint32_t size, uint64_t frame, uint64_t scope, Window* out);
 
-  // The add-on's command lists for the patches, reused once the GPU is done with them (fence values).
+  // The add-on's command lists for the patches, reused once the GPU is done with them (fence values). Each has its
+  // own part of the lookup results.
   static constexpr int kLists = 16;
+  static constexpr uint32_t kResultsPerList = 4096;
   struct Submission {
     ID3D12CommandAllocator* allocator = nullptr;
     ID3D12GraphicsCommandList* list = nullptr;
@@ -101,8 +104,8 @@ class SkinMotion {
   ID3D12Device* device_ = nullptr;
   std::string status_ = "off";
   ID3D12RootSignature* rs_ = nullptr;
-  ID3D12PipelineState* copy_pso_ = nullptr;
-  ID3D12PipelineState* patch_pso_ = nullptr;
+  ID3D12PipelineState* lookup_pso_ = nullptr;
+  ID3D12PipelineState* resolve_pso_ = nullptr;
   ID3D12PipelineState* clear_pso_ = nullptr;
   ID3D12PipelineState* advance_pso_ = nullptr;
   // UAVs, promoted implicitly from the common state in every command list (buffers decay to it after each
@@ -110,6 +113,7 @@ class SkinMotion {
   ID3D12Resource* table_ = nullptr;
   ID3D12Resource* store_ = nullptr;
   ID3D12Resource* prev_ = nullptr;
+  ID3D12Resource* results_ = nullptr;   // per list and instance: the lookup's result (skin_motion.hlsl)
   ID3D12Resource* readback_ = nullptr;  // the table's header, copied every frame
 
   std::mutex windows_mutex_;

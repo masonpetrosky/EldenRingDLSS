@@ -3,10 +3,11 @@
 // characters of a model share one bone pool per frame, each from its own first bone (PerInstanceData.matricesData),
 // and the pools are rebuilt every frame in the game's constant ring, so characters are found again by mesh part and
 // position: two tables (this frame's and the previous one's) hold, for every drawn mesh part of every character, its
-// position (mWorld translation) and where its bones were copied to (the store). Patch writes a previous-pose copy of
-// the draw's bone window in which every character of the draw has the bones of last frame's nearest entry of the same
-// mesh part; the game's own vertex shader reads it as cbObjMatrix to stream out the previous pose. Characters without
-// a match keep their current bones (no motion from animation, only from the camera).
+// position (mWorld translation) and where its bones were copied to (the store). Lookup finds every character of a
+// draw in last frame's table (the nearest entry of the same mesh part) and adds it to this frame's; all lookups of a
+// command list run together. After one barrier, Resolve writes each bone window's previous-pose copy, in which every
+// drawn character has the bones of its match; the game's own vertex shader reads it as cbObjMatrix to stream out the
+// previous pose. Characters without a match keep their current bones (no motion from animation, only from the camera).
 //
 // Frames are counted on the GPU like the trees' (tree_wind.hlsl): Clear and Advance run once per frame at the TAA.
 // SPDX-License-Identifier: MIT
@@ -31,17 +32,22 @@ cbuffer Args : register(b3) {
   uint g_Instances;      // instances in the draw's cbInstanceData window
   uint g_IndexEntries;   // entries in the draw's g_InstanceIndexBuffer view
   float g_TestOffset;    // development: added to the previous pose's x translation (m), to see what gets motion
+  uint g_ResultBase;     // Lookup: the draw's first result; Resolve: the window's
+  uint g_ResultCount;    // Resolve: the window's results
 };
 ByteAddressBuffer g_IndexBuffer : register(t0);  // g_InstanceIndexBuffer
 RWByteAddressBuffer g_Table : register(u0);      // header, then the two tables
 RWByteAddressBuffer g_Store : register(u1);      // copies of the frames' bone windows (a ring)
 RWByteAddressBuffer g_Prev : register(u2);       // the draw's previous-pose window
+// Per instance of the command list's draws: its first bone in the window, the most bones to write from there, and the
+// store offset of last frame's match and its bones there (kNone and 0 without a match); kNone first when unusable.
+RWByteAddressBuffer g_Results : register(u3);
 
 // Header: frame counter, then statistics since the start (instances patched, matched to last frame, not inserted
 // because their probe sequence was full).
 static const uint kHeader = 256;
 static const uint kPatched = 4, kMatched = 8, kNotInserted = 12;
-// Slot: claim (0 = free, else the part's hash), part, position xyz, store offset of the character's first bone, bones
+// Slot: claim (0 = free, else the entry's key), part, position xyz, store offset of the character's first bone, bones
 // from there to the end of its window, pad.
 static const uint kSlot = 32;
 static const uint kProbes = 64;
@@ -51,24 +57,23 @@ static const uint kNone = 0xFFFFFFFF;
 uint Hash(uint part) {
   uint h = part * 0x9E3779B9u;
   h ^= h >> 15;
-  return h | 1;  // never 0, which marks a free slot
+  return h | 1;
+}
+
+// An entry's claim: its part and position, never 0 (a free slot). The lookups of a list run together, so one that
+// meets a slot just claimed by another may find its part and position not yet written, or half written; a duplicate
+// (the same part at the same place, drawn twice) is known by the claim alone. Comparing those fields lost entries:
+// the next frame such a character took a neighbor's pose (soldiers at a castle, 2026-10-21).
+uint Key(uint part, float3 pos) {
+  uint k = part * 0x9E3779B9u;
+  k = (k ^ (asuint(pos.x) * 0x85EBCA6Bu)) * 0x27D4EB2Fu;
+  k = (k ^ (asuint(pos.y) * 0xC2B2AE35u)) * 0x27D4EB2Fu;
+  k = (k ^ (asuint(pos.z) * 0x165667B1u)) * 0x27D4EB2Fu;
+  k ^= k >> 15;
+  return k | 1;
 }
 
 uint TableBase(uint frame) { return kHeader + (frame & 1) * (g_Mask + 1) * kSlot; }
-
-// The frame's first draw of a bone window: copy it to the store (last frame's bones for the next frame) and to the
-// previous-pose window (the bones of characters that end up without a match).
-[numthreads(64, 1, 1)]
-void Copy(uint3 id : SV_DispatchThreadID) {
-  if (id.x >= g_WindowBones * 3) return;
-  const uint4 v = asuint(g_Bones[id.x]);
-  g_Store.Store4(g_StoreOffset + id.x * 16, v);
-  g_Prev.Store4(id.x * 16, v);
-}
-
-groupshared uint gs_First;   // the character's first bone in the window
-groupshared uint gs_Count;   // bones to write
-groupshared uint gs_Source;  // store offset of last frame's bones, or kNone for the current ones
 
 // HLSL's ?: evaluates both sides, and root views have no bounds checks: every load below uses an address that is
 // valid whatever the branch, and the results are selected afterwards.
@@ -81,80 +86,90 @@ uint InstanceIndex(uint k) {
   return valid && idx < g_Instances ? idx : kNone;
 }
 
-// One group per instance of the draw.
+// One thread per instance of the draw. The lookups of a command list run together: last frame's table is not written
+// this frame, and two draws adding the same part at the same place at once leave a duplicate entry at worst.
 [numthreads(64, 1, 1)]
-void Patch(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
-  if (thread.x == 0) {
-    gs_First = 0;
-    gs_Count = 0;
-    gs_Source = kNone;
-    const uint idx = InstanceIndex(group.x);
-    const uint safe = idx != kNone ? idx : 0;
-    const float3 pos = float3(g_Instance[safe * 13].w, g_Instance[safe * 13 + 1].w, g_Instance[safe * 13 + 2].w);
-    const uint first = idx != kNone ? asuint(g_Instance[safe * 13 + 4].x) : kNone;
-    if (first < g_WindowBones) {
-      gs_First = first;
-      uint count = min(g_WindowBones - first, g_MaxBones);
-      // Instances of one draw must not write over each other's bones.
-      for (uint k = 0; k < g_Count; ++k) {
-        const uint other_idx = InstanceIndex(k);
-        if (other_idx == kNone) continue;
-        const uint other = asuint(g_Instance[min(other_idx, g_Instances - 1) * 13 + 4].x);
-        if (other > first) count = min(count, other - first);
-      }
-      const uint h = Hash(g_Part);
-      const uint frame = g_Table.Load(0);
+void Lookup(uint3 id : SV_DispatchThreadID) {
+  if (id.x >= g_Count) return;
+  uint4 result = uint4(kNone, 0, kNone, 0);
+  const uint idx = InstanceIndex(id.x);
+  const uint safe = idx != kNone ? idx : 0;
+  const float3 pos = float3(g_Instance[safe * 13].w, g_Instance[safe * 13 + 1].w, g_Instance[safe * 13 + 2].w);
+  const uint first = idx != kNone ? asuint(g_Instance[safe * 13 + 4].x) : kNone;
+  if (first < g_WindowBones) {
+    const uint h = Hash(g_Part);
+    const uint key = Key(g_Part, pos);
+    const uint frame = g_Table.Load(0);
 
-      // This frame's entry, unless an earlier draw of this frame added the same part at the same place.
-      const uint base = TableBase(frame);
-      bool inserted = false;
-      for (uint i = 0; i < kProbes && !inserted; ++i) {
-        const uint slot = base + ((h + i) & g_Mask) * kSlot;
-        uint claim;
-        g_Table.InterlockedCompareExchange(slot, 0, h, claim);
-        if (claim == 0) {
-          g_Table.Store(slot + 4, g_Part);
-          g_Table.Store3(slot + 8, asuint(pos));
-          g_Table.Store2(slot + 20, uint2(g_StoreOffset + first * 48, g_WindowBones - first));
-          inserted = true;
-        } else if (claim == h && g_Table.Load(slot + 4) == g_Part && all(g_Table.Load3(slot + 8) == asuint(pos))) {
-          inserted = true;
-        }
+    // This frame's entry, unless an earlier draw of this frame added the same part at the same place.
+    const uint base = TableBase(frame);
+    bool inserted = false;
+    for (uint i = 0; i < kProbes && !inserted; ++i) {
+      const uint slot = base + ((h + i) & g_Mask) * kSlot;
+      uint claim;
+      g_Table.InterlockedCompareExchange(slot, 0, key, claim);
+      if (claim == 0) {
+        g_Table.Store(slot + 4, g_Part);
+        g_Table.Store3(slot + 8, asuint(pos));
+        g_Table.Store2(slot + 20, uint2(g_StoreOffset + first * 48, g_WindowBones - first));
       }
-      if (!inserted) g_Table.InterlockedAdd(kNotInserted, 1);
-
-      // Last frame's nearest entry of the same part.
-      const uint prev_base = TableBase(frame + 1);
-      float best = g_MaxDistance2;
-      uint2 source = uint2(kNone, 0);  // store offset, bones there
-      for (uint j = 0; j < kProbes; ++j) {
-        const uint slot = prev_base + ((h + j) & g_Mask) * kSlot;
-        const uint claim = g_Table.Load(slot);
-        if (claim == 0) break;
-        if (claim != h || g_Table.Load(slot + 4) != g_Part) continue;
-        const float3 d = asfloat(g_Table.Load3(slot + 8)) - pos;
-        const float d2 = dot(d, d);
-        if (d2 < best) {
-          best = d2;
-          source = g_Table.Load2(slot + 20);
-        }
-      }
-      gs_Source = source.x;
-      gs_Count = source.x != kNone ? min(count, source.y) : count;
-      g_Table.InterlockedAdd(kPatched, 1);
-      if (gs_Source != kNone) g_Table.InterlockedAdd(kMatched, 1);
+      inserted = claim == 0 || claim == key;
     }
+    if (!inserted) g_Table.InterlockedAdd(kNotInserted, 1);
+
+    // Last frame's nearest entry of the same part.
+    const uint prev_base = TableBase(frame + 1);
+    float best = g_MaxDistance2;
+    uint2 source = uint2(kNone, 0);  // store offset, bones there
+    for (uint j = 0; j < kProbes; ++j) {
+      const uint slot = prev_base + ((h + j) & g_Mask) * kSlot;
+      const uint claim = g_Table.Load(slot);
+      if (claim == 0) break;
+      if (g_Table.Load(slot + 4) != g_Part) continue;
+      const float3 d = asfloat(g_Table.Load3(slot + 8)) - pos;
+      const float d2 = dot(d, d);
+      if (d2 < best) {
+        best = d2;
+        source = g_Table.Load2(slot + 20);
+      }
+    }
+    result = uint4(first, min(g_WindowBones - first, g_MaxBones), source);
+    g_Table.InterlockedAdd(kPatched, 1);
+    if (source.x != kNone) g_Table.InterlockedAdd(kMatched, 1);
   }
-  GroupMemoryBarrierWithGroupSync();
-  const uint values = gs_Count * 3;
-  const uint dest = gs_First * 3 * 16;
-  for (uint i = thread.x; i < values; i += 64) {
-    const uint4 stored = g_Store.Load4((gs_Source != kNone ? gs_Source : 0u) + i * 16);
-    const uint4 current = asuint(g_Bones[gs_First * 3 + i]);
-    uint4 v = gs_Source != kNone ? stored : current;
-    if (i % 3 == 0) v.w = asuint(asfloat(v.w) + g_TestOffset);  // the first row's translation
-    g_Prev.Store4(dest + i * 16, v);
+  g_Results.Store4((g_ResultBase + id.x) * 16, result);
+}
+
+// One thread per float4 of a bone window, after its lookups: copies the window to the store (last frame's bones for
+// the next frame) and writes its previous-pose copy. The game lays a model's characters out one after another, so a
+// bone belongs to the drawn character with the greatest first bone at or below it, whatever the order of the draws;
+// it gets that character's bone from last frame's match, and keeps the current one without a match, past the end of
+// last frame's window, or when no drawn character holds it.
+[numthreads(64, 1, 1)]
+void Resolve(uint3 id : SV_DispatchThreadID) {
+  if (id.x >= g_WindowBones * 3) return;
+  const uint4 current = asuint(g_Bones[id.x]);
+  g_Store.Store4(g_StoreOffset + id.x * 16, current);
+  const uint bone = id.x / 3;
+  uint4 owner = uint4(kNone, 0, kNone, 0);
+  for (uint r = 0; r < g_ResultCount; ++r) {
+    const uint4 entry = g_Results.Load4((g_ResultBase + r) * 16);
+    // Of two parts of one character, the one with a match.
+    const bool better = owner.x == kNone || entry.x > owner.x || (entry.x == owner.x && owner.z == kNone);
+    if (entry.x <= bone && better) owner = entry;
   }
+  const bool owned = owner.x != kNone;
+  const bool matched = owned && owner.z != kNone;
+  const uint offset = owned ? bone - owner.x : 0u;
+  const uint limit = matched ? min(owner.y, owner.w) : owner.y;
+  const uint row = matched ? min(offset, owner.w - 1) : 0u;
+  const uint4 stored = g_Store.Load4((matched ? owner.z : 0u) + row * 48 + (id.x % 3) * 16);
+  uint4 v = current;
+  if (offset < limit) {
+    if (matched) v = stored;
+    if (id.x % 3 == 0) v.w = asuint(asfloat(v.w) + g_TestOffset);  // the first row's translation
+  }
+  g_Prev.Store4(id.x * 16, v);
 }
 
 // Once per frame after its last NPC draw: empties the next frame's table (one thread per slot) ...
