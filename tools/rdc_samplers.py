@@ -24,8 +24,10 @@ try:
             for used in samplers:
                 s = used.sampler
                 a = attrs(s)
-                keep = {k: str(v) for k, v in a.items() if k in ("filter", "maxAnisotropy", "mipBias", "minLOD", "maxLOD",
+                keep = {k: str(v) for k, v in a.items() if k in ("maxAnisotropy", "mipBias", "minLOD", "maxLOD",
                                                                  "addressU", "compareFunction")}
+                f = s.filter
+                keep["filter"] = "min %s mag %s mip %s (%s)" % (f.minify, f.magnify, f.mip, f.filter)
                 lines.append("  %s s%d %s" % (stage, used.access.index, keep))
     with open(os.environ["ER_OUT"], "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")

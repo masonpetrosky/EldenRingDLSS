@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+New:
+- DLSS Frame Generation (`FrameGeneration`, experimental, off; also in the overlay): DLSS-G through NVIDIA Streamline
+  shows generated frames between the game's own, made from the game's depth and camera, the add-on's motion vectors
+  and the frame without its HUD, so the HUD stays sharp. 2x on RTX 40 and 50 cards, 3x to 6x or dynamic on RTX 50;
+  Reflex runs with it. Needs hardware-accelerated GPU scheduling, and a restart to switch on from off. At a castle
+  courtyard in 4K at 50% with Ray Reconstruction on an RTX 5070 Ti: 70 fps off, 120 at 2x, 168 at 3x, 208 at 4x,
+  evenly paced. Not available under Wine or Proton.
+
+Fixes:
+- Places with many enemies or NPCs in view ran slowly with `NpcMotion=1`: each character's previous pose waited for
+  the one before, so 300 of them at a castle courtyard took 5.3 ms per frame. They now run together in 0.2 ms; that
+  courtyard went from 52 to 70 fps (4K at 50%, Ray Reconstruction, RTX 5070 Ti).
+- Under Proton the game could stay on a black screen at start-up (GitHub issue #1): the add-on started DLSS inside
+  the game's device creation, and under Proton that start never returned. DLSS and Reflex now start on a thread of
+  their own once the device exists, and the game keeps its TAA until DLSS is ready. Not yet confirmed on Linux.
+
 ## 0.3.0 (2026-10-20)
 
 Fixes:

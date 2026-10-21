@@ -71,6 +71,11 @@ bushes and 0.3-0.4 ms for characters at 4K and 50%; tree motion vectors (off by 
 - **Object-only motion blur** (optional): with the game's Motion Blur on, enemies, animals and swings blur, camera
   turns do not.
 - **NVIDIA Reflex** (experimental): the driver's low-latency mode, with the sleep injected at the present.
+- **DLSS Frame Generation** (experimental, `FrameGeneration`, also in the overlay): DLSS-G through NVIDIA Streamline
+  shows generated frames between the game's own, made from the game's depth and camera, the add-on's motion vectors
+  and the frame without its HUD (taken at the game's final UI composite), so the HUD stays sharp. 2x on RTX 40 cards,
+  up to 6x or dynamic on RTX 50 cards; Streamline's Reflex runs with it. At a castle courtyard in 4K at 50% with Ray
+  Reconstruction on an RTX 5070 Ti: 70 fps off, 120 at 2x, 168 at 3x, 208 at 4x, evenly paced.
 - **Cheaper ray tracing**: the game re-animates and refits ~200 bottom-level acceleration structures every frame;
   the add-on refits vegetation by distance (near every frame, far every 2nd/4th frame) and characters every frame,
   which halved the ray tracing cost on Maximum in testing.
@@ -107,7 +112,8 @@ on an RTX 5070 Ti, partly paid back by the denoisers and rays it replaces, so pa
 
 ## Requirements
 
-- Windows 10/11, an NVIDIA RTX GPU and a current driver.
+- Windows 10/11, an NVIDIA RTX GPU and a current driver. Frame generation needs an RTX 40 or 50 series GPU and
+  hardware-accelerated GPU scheduling (Windows graphics settings).
 - ELDEN RING (Steam), App Ver. 1.17.2 or 1.17.1 (shown on the title screen). Code patterns and offsets are version
   specific (see Limitations).
 - ReShade 6.8 **with full add-on support**.
@@ -119,6 +125,7 @@ on an RTX 5070 Ti, partly paid back by the denoisers and rays it replaces, so pa
 
 ```
 pwsh tools/fetch_dlss_sdk.ps1     # DLSS SDK headers, static library and DLLs into third_party/dlss (NVIDIA license)
+pwsh tools/fetch_streamline.ps1   # Streamline headers and signed DLLs into third_party/streamline (frame generation)
 pwsh build.ps1                    # configures and builds build/EldenRingDLSS.addon64
 pwsh build.ps1 -Tests             # also builds and runs standalone state/transition regression checks
 ```
@@ -128,6 +135,7 @@ NGX and NPC window checks on an RTX GPU after building with `-Tests`:
 
 ```
 build/erdlss_regressions.exe --gpu third_party/dlss/bin/rel
+build/erdlss_regressions.exe --npc     # NPC previous poses on the GPU: 16 characters, shuffled draws and bone pool
 ```
 
 After a game update, this checks the version-specific lookups (see Limitations) against the game's executable
@@ -181,6 +189,7 @@ documents each key.
 | `NpcMotion` | 0 | Motion vectors for enemies, NPCs and animals. |
 | `ObjectBlur` | 0 | With the game's Motion Blur on, blur only moving objects, not camera turns. |
 | `Reflex` | 0 | NVIDIA Reflex low-latency mode (experimental). |
+| `FrameGeneration` | 0 | DLSS Frame Generation (experimental): 0 off, 2 to 6 frames shown per rendered frame (3 and up on RTX 50), -1 dynamic. Switching it on from 0 takes a restart. |
 | `RayReconstruction` | 0 | DLSS Ray Reconstruction while the game's ray tracing is on (overlay checkbox). |
 | `RtShadowRayGen` | 4 | Under Ray Reconstruction: 4 = the add-on's own AO and sun shadow rays (temporal blue noise), 3 = the same with blue noise that does not spread over frames, 0 = the game's rays (1 and 2 are development options). |
 | `ToggleKey` | 120 | Virtual key code for the DLSS toggle (120 = F9; ignored while Alt, Ctrl or Shift is held). |
@@ -207,7 +216,8 @@ records extra passes with native D3D12, and watches ray tracing calls (`dispatch
 Source layout: `src/addon.cpp` (events, pass recognition, DLSS at the TAA, post-processing corrections, ray tracing
 hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale.*` (the engine's resolution scale),
 `src/taa_jitter.*` (jitter cycle and counter), `src/stretch.*`, `src/rr_guides.*`, `src/ao_upscale.*` (native passes),
-`src/wind*.*`, `src/tree_*` (vegetation motion vectors), `src/descriptors.*` (descriptor tracking).
+`src/wind*.*`, `src/tree_*` (vegetation motion vectors), `src/skin_motion.*` (enemy and NPC motion vectors),
+`src/frame_generation.*` (Streamline and DLSS Frame Generation), `src/descriptors.*` (descriptor tracking).
 
 ## Development tools
 
@@ -224,6 +234,8 @@ hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale
   ray tracing calls and readers of a resource in a capture.
 - `tools/ghidra/`: headless Ghidra queries (decompile, cross references) against an analyzed `eldenring.exe`.
 - `tools/dlss_bench/`: times DLSS SR and RR outside the game.
+- `tools/fg_smoke/`: frame generation outside the game: a window with a turning camera and a HUD box, with Streamline
+  set up exactly like the add-on's and DLSS beside it.
 
 ## Limitations
 
@@ -235,6 +247,7 @@ hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale
 - Ray Reconstruction at 50-67% shows more shimmer in grass than at DLAA. It comes from the upscale (it stays with the
   game's own rays and with RR off); the add-on's own rays (`RtShadowRayGen`, on by default) remove the wave pattern
   the game's noise made in distant grass under RR.
+- Frame generation is not available under Wine or Proton, and DLSS-G pauses while the game's window is not focused.
 - Every normal exit of the game ends in a harmless WER crash report (an allocator check at shutdown); it predates
   this add-on.
 
@@ -247,6 +260,8 @@ The add-on's own code is MIT licensed (`LICENSE`). It uses:
 - Dear ImGui headers (`third_party/imgui`, MIT, see `third_party/imgui/LICENSE.txt`).
 - The NVIDIA DLSS SDK, under NVIDIA's license, fetched by `tools/fetch_dlss_sdk.ps1` and not included here.
 - NVIDIA NVAPI (MIT), fetched by `tools/fetch_nvapi.ps1` and linked statically for Reflex.
+- NVIDIA Streamline (MIT), fetched by `tools/fetch_streamline.ps1`; its signed DLLs ship next to the add-on for frame
+  generation (`nvngx_dlssg.dll` under NVIDIA's RTX SDKs license, Reflex under its own).
 
 Not affiliated with or endorsed by FromSoftware, Bandai Namco or NVIDIA. ELDEN RING is a trademark of its owners;
 DLSS is a trademark of NVIDIA.

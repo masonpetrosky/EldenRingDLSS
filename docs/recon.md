@@ -978,3 +978,133 @@ The add-on now finds the vtable through the RTTI (type descriptor `.?AVGXAntiAli
 object locator that points to it, the vtable whose slot -1 points to the locator); in game: "1 TAA filter(s) found
 in 1 search(es) (vtable +0x2F26558), 32 jitter phases". `erdlss_regressions --exe <eldenring.exe>` checks both
 lookups on a file (2.7.1.0: +0x2F242B8, 2.7.2.0: +0x2F26558).
+
+## Anisotropic filtering (2026-10-21)
+
+Checked at the user's request: `tools/rdc_samplers.py` on `er117_trees_f2056.rdc` (the material draws, events
+56780-64878) shows the materials' samplers s0-s2 as anisotropic with `maxAnisotropy` 16; the others are point samplers
+(lookups) and trilinear ones. The game already filters at 16x with the user's settings, so there is nothing to add.
+Below a render scale of 1 the add-on only moves the material samplers' mip bias (`mip bias -2.00 on 19 samplers`).
+
+## DLSS Frame Generation (2026-10-21)
+
+`FrameGeneration=0|2-6|-1` (overlay "Frame generation", dev remote `fg [0|2-6|dynamic]`, `frame_generation.*`): DLSS-G
+through NVIDIA Streamline 2.14.16 (`tools/fetch_streamline.ps1`; the signed `sl.interposer.dll`, `sl.common.dll`,
+`sl.dlss_g.dll`, `sl.reflex.dll`, `sl.pcl.dll` and `nvngx_dlssg.dll` ship next to the add-on). DLSS-G is only offered
+through Streamline, and Streamline has to own the swap chain: its DXGI proxy creates the real one, and its Present runs
+the generation and shows the generated frames before the game's own.
+
+How it fits under ReShade:
+- At `init_device` (inside the game's `D3D12CreateDevice`, before any queue or swap chain exists) the add-on loads
+  Streamline in manual-hooking mode and patches three slots of the native vtables beneath ReShade's proxies:
+  `ID3D12Device::CreateCommandQueue` and `IDXGIFactory::CreateSwapChain` / `CreateSwapChainForHwnd`. Only calls from
+  ReShade's module (by return address) are routed, so ReShade's proxies stay on top of Streamline's: the queue is
+  created through Streamline's device proxy and ReShade keeps the native one (the add-on maps it back), and the swap
+  chain is created through Streamline's factory proxy, which ReShade then wraps.
+- Streamline's Reflex replaces the add-on's NVAPI Reflex while Streamline runs (DLSS-G requires it; `Reflex` maps to its
+  low-latency mode, which is on whatever the setting while frames are generated).
+- Inputs per frame, tagged on the game's command lists. At the TAA: the depth and the add-on's motion texture (with the
+  NPC, wind and object-blur motion), the scene's share of them as the extent, `mvecScale` (-in_height / in_width, -1),
+  the jitter, and the camera from `cbSceneParam` (`VC_MatrixViewProj` @384, `SC_PrevCameraPos` @448,
+  `VC_PrevMatrixViewProj` @464, which carries this frame's jitter; column-major for row vectors, relative to the
+  camera's position). At the game's UI composite: the frame without its UI and the UI's alpha.
+- The UI composite (`GXSimple_BlendUI_SDR2SDR_F`, one draw into the swap chain's image) computes
+  `UIScene.a * HDRScene + UIScene.rgb`, with `UIScene` an R8G8B8A8_UNORM layer at the output size whose alpha is how
+  much of the scene shows through. At that draw the add-on stores the UI layer, makes DLSS-G's UI alpha (1 -
+  `UIScene.a`, `ui_alpha.hlsl`), clears the layer to "no UI" (0, 0, 0, 1), draws the composite into its own target (the
+  HUD-less image, in the composite's format), puts the layer back and lets the game's draw run. With
+  `enableUserInterfaceRecomposition` DLSS-G generates from the HUD-less image and lays the UI over the generated frames.
+  One capture per frame (the first composite).
+
+Learned on the way with `tools/fg_smoke` (a window with a turning camera and a UI box, Streamline set up exactly like
+the add-on's, DLSS super resolution beside it):
+- DLSS-G generates only for the focused window (`sl.log`: "DLSS-G disabled: window not focused").
+- `numFramesActuallyPresented` in DLSS-G's state is the number of frames shown for the last present (the rendered one
+  plus the generated ones), not a count since the last query.
+- Two NGX starts in one process (Streamline's for DLSS-G, the add-on's own for DLSS) share the feature DLL folder of the
+  first. With separate folders the second's feature was "not available", in either order; with `nvngx_dlssg.dll` next
+  to `nvngx_dlss.dll` in the add-on's folder both work.
+- On the RTX 5070 Ti (driver 617.42) DLSS-G goes up to 6x (`numFramesToGenerateMax` 5) and supports dynamic
+  multi-frame generation. It needs hardware-accelerated GPU scheduling.
+- One-time Streamline warnings at the first frames, harmless: "Invalid backbuffer resource extent", "unsupported
+  alignment ... overridden to 0", "slDLSSGGetState must be synchronized with the present thread".
+
+In game (the castle courtyard below; 4K, 50%, RR, ray tracing Maximum, UnlockTheFps at 237): Streamline started before
+the add-on's NGX, "the game's swap chain was created through Streamline (CreateSwapChain)", "capturing the UI at
+3840x2160", and DLSS-G generated with every frame's inputs (`inputs in the last 30 frames: scene 30, UI 30`, status
+0x0). PresentMon, 5 s per mode at one spot (`ab_capture.ps1 -Round fg`):
+
+| | presents per second | rendered per second | GPU per rendered frame | display interval (sd) | present to display |
+| --- | --- | --- | --- | --- | --- |
+| off | 51.9 | 52.1 | 19.2 ms | 19.26 ms (0.39) | 16.8 ms |
+| 2x | 91.3 | 45.7 | 21.8 ms | 10.94 ms (0.32) | 24.8 ms |
+| 3x | 129.4 | 43.1 | 23.2 ms | 7.73 ms (0.42) | 26.2 ms |
+| 4x | 163.4 | 40.8 | 24.5 ms | 6.12 ms (0.39) | 28.2 ms |
+
+Every present reached the screen, evenly spaced. Generation costs about 2.6 ms per rendered frame at 2x and 1.3-1.4 ms
+for each further frame, so the rendered rate drops 12-22%. The user played at 2x, 3x and 4x: "working correctly"; they
+prefer 2x to off and to the higher multipliers. Distant enemies animate at a reduced rate, as in the base game.
+
+## The castle courtyard: 52 fps (2026-10-21)
+
+The user's slow spot: a castle courtyard with many soldiers in view (4K, 50%, RR, ray tracing Maximum). `ab_capture.ps1
+-Round perf` (5 s each, frame generation off, one thing off at a time):
+
+| | fps | GPU busy |
+| --- | --- | --- |
+| everyday settings | 51.8 | 19.2 ms |
+| the game's shadow ray generation (`rtgen 0`) | 50.8 | 19.6 ms |
+| super resolution instead of RR | 56.1 | 17.8 ms |
+| water reflections off | 51.9 | 19.2 ms |
+| tree wind off | 52.6 | 18.9 ms |
+| wind motion off | 53.7 | 18.5 ms |
+| NPC motion off | 72.9 | 13.7 ms |
+| object blur off | 51.6 | 19.3 ms |
+| Reflex off | 51.6 | 19.3 ms |
+| render scale 0.33 | 59.0 | 16.8 ms |
+| the game's TAA at full size | 46.7 | 21.4 ms |
+
+The GPU profile (60 frames, `tools/gpu_profile.py`): the NPC patches took 5.32 ms of the frame's 18.85 ms, more than
+Ray Reconstruction (3.93 ms), the full-screen passes (2.23), the G-buffer (2.17) and the ray-tracing scene build
+(1.57). `npc`: 300 draws per frame in 6 patch submissions, 17 bone windows, 344 instances patched, 342 of them matched
+to last frame.
+
+`SkinMotion::SubmitJobs` recorded each draw's patch as its own dispatch (a 64-thread group per instance, the table
+lookup in one thread) followed by a UAV barrier, so the GPU ran 300 lookups one after another, each a chain of
+dependent memory reads and atomics: about 18 us each. Now all lookups of a submission run together and write their
+results to a list (the instance's first bone in the window, the most bones to write, last frame's match), and after one
+barrier a pass per bone window (`Resolve`) copies the window to the store and writes its previous-pose copy. A bone
+belongs to the drawn character with the greatest first bone at or below it, since the game lays a model's characters
+out one after another. That no longer depends on the order of the draws: before, each patch wrote from its character's
+first bone to the end of the window, and the last patch in draw order won.
+
+After the change, at the same spot (`-Round perf` and `-Round fg` again, one after the other):
+
+| | before | after |
+| --- | --- | --- |
+| everyday settings | 51.8 fps | 69.9-71.2 fps (GPU 14.0-14.2 ms) |
+| NPC motion off | 72.9 | 74.3 |
+| super resolution instead of RR | 56.1 | 80.4 |
+| render scale 0.33 | 59.0 | 86.5 |
+| the game's TAA at full size | 46.7 | 64.5 |
+| NPC patches (GPU profile) | 5.32 ms | 0.14 ms, 0.20 ms with the race fixes below (8 submissions) |
+
+With frame generation, presents per second (rendered): off 71.2 (present to display 11.9 ms), 2x 120.0 (60.0; display
+interval sd 0.40 ms, present to display 18.0 ms), 3x 167.7 (55.8), 4x 208.4 (51.9). The 2x rate is not a cap: 14.0 ms
+plus the 2.6 ms of generation make 60 fps, and 3x and 4x fit the same cost per generated frame.
+
+With `npctest 0.3` (every previous pose shifted 0.3 m) and the camera still, 75-80% of the other characters' pixels
+(stencil class 2) read more than 5 px of motion, as before the change; the rest are one-pixel silhouette edges.
+
+Running the lookups together opened two races in the table:
+- A slot just claimed by one lookup still held the part and position of its entry from two frames ago until the
+  claimer wrote its own. Another lookup of the same part that met the slot in between could take it for a duplicate of
+  itself and insert nothing, so the next frame that character matched a neighbor within `npcdist` (2 m). In game,
+  distant soldiers about 1.5 m apart jumped by about 60 px for one frame in the motion texture now and then (`mv` dumps
+  with the camera still), and the jumps went away at `npcdist 0.3`. Clearing whole slots in `Clear` ended them in game
+  (none in 32 frames; 393.2 of 393.5 characters matched per frame).
+- A GPU test made for this (`erdlss_regressions --npc`: 16 characters of two mesh parts on a grid 1.5 m apart, 12
+  frames, the draws and the bone pool shuffled every frame, each character's previous pose checked bone by bone) still
+  failed 14 of 25 runs: a lookup could also read a position that was half written. Now the claim word is the entry's
+  key, a hash of its part and position written in the one atomic operation, and a duplicate is recognized by the claim
+  alone; `Clear` empties only the claims again. 40 of 40 runs pass. This last build has not run in game yet.

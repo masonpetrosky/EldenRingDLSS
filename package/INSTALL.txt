@@ -7,7 +7,8 @@ also keeps it off the matchmaking servers. Do not take it online.
 
 Requirements
 ------------
-- An NVIDIA RTX graphics card and a current driver.
+- An NVIDIA RTX graphics card and a current driver. Frame generation needs an RTX 40 or 50 series card and
+  hardware-accelerated GPU scheduling (Windows Settings > System > Display > Graphics).
 - ELDEN RING on Steam, App Ver. 1.17.2 or 1.17.1 (shown on the title screen; eldenring.exe file version 2.7.2.0 or
   2.7.1.0). On other versions the add-on may fall back to DLAA or to the game's TAA (see ReShade.log).
 - me3 (ModEngine3): https://github.com/garyttierney/me3
@@ -21,14 +22,15 @@ Installing
    (right-click > 7-Zip > Open archive) and extract ReShade64.dll. If you already installed the add-on version of
    ReShade into another 64-bit DirectX game, the dxgi.dll it put there is the same file.
 3. Put that file into the EldenRingDLSS folder and rename it to ReShade64.asi. The folder then holds
-   ReShade64.asi, EldenRingDLSS.addon64, nvngx_dlss.dll, nvngx_dlssd.dll, EldenRingDLSS.ini and ReShade.ini.
+   ReShade64.asi, EldenRingDLSS.addon64, NVIDIA's DLLs (nvngx_dlss.dll, nvngx_dlssd.dll, nvngx_dlssg.dll and five
+   sl.*.dll), EldenRingDLSS.ini and ReShade.ini.
 4. Start the game by double-clicking EldenRingDLSS.me3 (or: me3 launch --auto-detect -p <path to EldenRingDLSS.me3>).
 
 Already using an me3 profile with other mods? Copy the [[natives]] entry from EldenRingDLSS.me3 into your profile
 and adjust its path (relative to your profile file), or move the EldenRingDLSS folder next to your profile.
 
 Without me3: the add-on also works in a regular ReShade install (6.8 or newer with full add-on support) while the
-game runs without Easy Anti-Cheat. Put EldenRingDLSS.addon64, nvngx_dlss.dll, nvngx_dlssd.dll and
+game runs without Easy Anti-Cheat. Put EldenRingDLSS.addon64, the nvngx_*.dll and sl.*.dll files and
 EldenRingDLSS.ini next to ReShade's DLL.
 
 Using it
@@ -43,6 +45,10 @@ Using it
   DLSS Ray Reconstruction then replaces the game's ray tracing denoisers (sharper shadows of grass and leaves, less
   ghosting under trees), and the add-on traces the sun shadows and ambient occlusion itself. Best with upscaling: at
   4K on an RTX 5070 Ti it takes about 4 ms at RenderScale 0.50 and 12 ms at 1.00.
+- Frame generation (experimental): set FrameGeneration=2 in EldenRingDLSS.ini (or "Frame generation" in the overlay)
+  and restart the game. DLSS Frame Generation then shows a generated frame between every two of the game's, with
+  the HUD kept sharp, and turns Reflex on. RTX 50 cards can also show 3 to 6 frames per rendered frame, or a dynamic
+  number (-1). It pauses while the game's window is not focused.
 - The ReShade log (EldenRingDLSS\ReShade.log) has the add-on's messages, prefixed [ERDLSS].
 
 Not getting more frames?
@@ -72,13 +78,16 @@ Known limitations
 - Tested on one machine: RTX 5070 Ti, 4K, HDR. Game updates can break it (it then falls back and logs it).
 - With Ray Reconstruction, fine grass shimmers more at low render scales (from the upscale, not the ray tracing);
   0.67 is calmer than 0.50.
+- Frame generation is not available under Wine or Proton.
 - Every normal exit of the game ends in a crash report (a check at shutdown); it predates the add-on and is
   harmless.
 
 Licenses
 --------
 The add-on's own code is MIT licensed (licenses\LICENSE.txt). EldenRingDLSS.addon64 contains NVIDIA's DLSS SDK
-library, and nvngx_dlss.dll and nvngx_dlssd.dll are NVIDIA's DLSS runtime; both are under NVIDIA's RTX SDKs license
-(licenses\NVIDIA-RTX-SDKs-LICENSE.txt). The add-on also contains code from ReShade (licenses\ReShade-LICENSE.md) and
-NVIDIA's NVAPI (licenses\NVAPI-LICENSE.txt), and uses Dear ImGui's headers (licenses\ImGui-LICENSE.txt). Not affiliated with or endorsed by FromSoftware, Bandai Namco
-or NVIDIA. ELDEN RING is a trademark of its owners; NVIDIA and DLSS are trademarks of NVIDIA Corporation.
+library, and nvngx_dlss.dll, nvngx_dlssd.dll and nvngx_dlssg.dll are NVIDIA's DLSS runtime; both are under NVIDIA's
+RTX SDKs license (licenses\NVIDIA-RTX-SDKs-LICENSE.txt). The sl.*.dll files are NVIDIA Streamline
+(licenses\Streamline-LICENSE.txt), with its Reflex parts under licenses\Reflex-LICENSE.txt. The add-on also contains
+code from ReShade (licenses\ReShade-LICENSE.md) and NVIDIA's NVAPI (licenses\NVAPI-LICENSE.txt), and uses Dear
+ImGui's headers (licenses\ImGui-LICENSE.txt). Not affiliated with or endorsed by FromSoftware, Bandai Namco or
+NVIDIA. ELDEN RING is a trademark of its owners; NVIDIA and DLSS are trademarks of NVIDIA Corporation.

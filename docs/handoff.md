@@ -1,4 +1,4 @@
-# Handoff: Elden Ring DLSS, state on 2026-10-12
+# Handoff: Elden Ring DLSS, state on 2026-10-21
 
 A ReShade 6.8 add-on (`src/`, built as `EldenRingDLSS.addon64`) loaded through me3 that replaces Elden Ring's TAA
 with DLSS. Full history and measurements are in `docs/recon.md` (rendering, upscaling, motion vectors) and
@@ -29,6 +29,10 @@ for picking up.
 | Water flickered between the native and the engine's reflection | Fixed (hooks now run in lists decided at submission); user: "water is great now" |
 | A ghost had no motion vectors (drawn in the forward pass, which the NPC path skipped) | Fixed: characters' forward prepasses stream like G-buffer draws; user: "everything looks great" |
 | Game update 1.17.2 moved the TAA filter's vtable | Fixed (RTTI lookup) in 0.3.0: GitHub release and everyday install (2026-10-20) |
+| DLSS Frame Generation (Streamline DLSS-G, `FrameGeneration`) | Done (2026-10-21), test copy `dist/test-0.4.0-fg` only; the user played 2x-4x ("working correctly") and prefers 2x |
+| Castle courtyard at 52 fps: NPC patches took 5.3 ms | Fixed (2026-10-21): lookups run together, 0.2 ms, 70 fps there; verified in game; `docs/recon.md` |
+| The game's anisotropic filtering | Already 16x (2026-10-21; `docs/recon.md`) |
+| GitHub issue #1, Proton black screen | NGX and NVAPI start on a thread of their own (2026-10-21); untested under Proton |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -97,6 +101,10 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
   line) before measuring.
 - A test copy of the release zip lives in `dist/test` (profile `dist/test/EldenRingDLSS.me3`, and
   `EldenRingDLSS-fps.me3` with UnlockTheFps for frame-rate measurements); not an install the user plays with.
+- `dist/test-0.4.0-fg` (2026-10-21): the 0.3.0 zip's layout with the frame generation build, the Streamline DLLs and
+  `nvngx_dlssg.dll`, started with `launch.bat` (`EldenRingDLSS-fps.me3`, UnlockTheFps). Ini: the everyday settings plus
+  `FrameGeneration=2`. The frame generation and courtyard tests ran here; `ab_capture.ps1 -Folder` points at its
+  `EldenRingDLSS` folder.
 
 The user's game settings: Custom, almost everything Maximum (water, shader and GI quality High), ray tracing
 Maximum, motion blur off, 4K, HDR on. Game version: App Ver. 1.17.2 = `eldenring.exe` 2.7.2.0 since 2026-10-20 (1.17.1
@@ -120,7 +128,8 @@ Maximum, motion blur off, 4K, HDR on. Game version: App Ver. 1.17.2 = `eldenring
 - If a launch hangs before the game creates its device (no "Redirecting D3D12CreateDevice" in ReShade.log, process
   not responding) and a relaunch fails with "Steam is required", Steam still lists the game as running: the user
   restarts Steam (Steam > Exit), then launch again (happened once on 2026-10-10).
-- Every normal exit ends in a WER crash report (int3 at `eldenring.exe+0xC58DB6`, a shutdown allocator check). It
+- Every normal exit ends in a WER crash report (int3 at `eldenring.exe+0xC58DB6` on 2.7.1.0, `+0xC59276` on 2.7.2.0,
+  a shutdown allocator check). It
   predates this work and is harmless. Windows sometimes skips repeated identical reports, so a missing report is not
   proof of a crash: ask the user how the game closed (2026-10-11: a normal quit without a report).
 - Remote command pitfalls: `dlss` without an argument switches DLSS **off** (it compares the argument with "on");
@@ -200,20 +209,19 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
-**Next, at the user's request (2026-10-20, for a later session):**
-- **Frame rate in a castle courtyard:** with the everyday settings (4K, 50%, preset M, Ray Reconstruction, ray
-  tracing Maximum, frame cap removed) the user got only 52 FPS there. Find the spot with the user, profile it
-  (`gpuprofile 60 courtyard`, `gpu_profile.py --compare`, PresentMon) and look for savings; item 2 below lists known
-  candidates.
-- **DLSS Frame Generation:** look into adding it. First questions: Streamline or NGX directly, keeping the HUD out
-  of the generated frames, frame pacing with UnlockTheFps, and Reflex (frame generation needs it; ours is injected
-  at the present). A Nexus visitor asked for it too (2026-10-19).
-- **Anisotropic filtering:** find out which level the game uses. `OnCreateSampler` (`src/addon.cpp`) already sees
-  every sampler the game creates (for the mip bias); log `filter`, `max_anisotropy` and the address modes once.
-  Static samplers in root signatures would not pass through `create_sampler`. FF7 Rebirth asked for 4x, and our
-  FF7RebirthAnisotropic add-on raises that to 16x: it leaves 1x samplers alone, and the level changes only on a
-  restart because the samplers are made at start-up. If Elden Ring is below 16x, add an ini option here or a
-  standalone add-on like that one.
+**Done 2026-10-21 (the user's requests of 2026-10-20):** the castle courtyard (52 -> 70 fps: the NPC patches' barriers,
+`docs/recon.md`, "The castle courtyard"), DLSS Frame Generation (`docs/recon.md`, "DLSS Frame Generation"; the user
+prefers 2x) and the anisotropic filtering check (the game already uses 16x).
+
+**Next:**
+- **Waiting for the user's OK:** the everyday install with this build and `FrameGeneration=2` (back up first, game
+  closed; it needs the Streamline DLLs and `nvngx_dlssg.dll` beside the add-on), and a 0.4.0 release (GitHub and
+  Nexus; `CHANGELOG.md` "Unreleased" has the notes).
+- **The NPC table's atomic key** (the last race fix) has passed the GPU test but not run in game: at the courtyard,
+  `mv` dumps with the camera still should show no one-frame jumps on distant soldiers (`npc` stats: matched close to
+  patched).
+- Streamline logged "ERROR RSYNC: Flip queue is empty!!!" once at the title screen (2026-10-21); harmless so far,
+  not looked into.
 - **Nexus report (answered 2026-10-20, waiting for their tests):** light particles under upscaling sometimes move
   the wrong way for a moment and then snap back, with occasional artifacts around them (easy to see after burning
   the Erdtree). Asked whether it happens at DLAA and with F9, which preset, and for a clip. The same player sees no
@@ -222,8 +230,9 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
   inside `OnInitDevice` (ReShade's init_device event): under Proton NGX finds the driver through
   `/run/host/usr/lib/nvidia/wine`, then nvapi64.dll creates a D3D11 device and a 1x1 swap chain on another thread,
   and nothing more is logged; likely a deadlock with the device setup. Since 0.2.0 `Reflex::Init` (NvAPI_Initialize)
-  runs there too, even with Reflex off. Idea: start NGX and NVAPI after the device setup (first present, or a
-  thread the game does not wait on). Asked for a ReShade-alone test and a 0.3.0 log.
+  runs there too, even with Reflex off. Asked for a ReShade-alone test and a 0.3.0 log. Since 2026-10-21 NGX and
+  NVAPI start on a thread the game does not wait on (`StartNvidia` in `src/addon.cpp`), and Streamline is skipped
+  under Wine; a comment on the issue once it is released needs the user's OK.
 
 0. **Broader NPC motion checks, then test the 83545fe foliage changes** (game closed;
    targeted post-audit checks passed; original 50% DLSS/RR settings restored;
