@@ -8,8 +8,8 @@ also keeps it off the matchmaking servers. Do not take it online.
 Requirements
 ------------
 - An NVIDIA RTX graphics card and a current driver.
-- ELDEN RING on Steam, App Ver. 1.17.1 (shown on the title screen; eldenring.exe file version 2.7.1.0). On other
-  versions the add-on may fall back to DLAA or to the game's TAA (see ReShade.log).
+- ELDEN RING on Steam, App Ver. 1.17.2 or 1.17.1 (shown on the title screen; eldenring.exe file version 2.7.2.0 or
+  2.7.1.0). On other versions the add-on may fall back to DLAA or to the game's TAA (see ReShade.log).
 - me3 (ModEngine3): https://github.com/garyttierney/me3
 - ReShade 6.8 or newer *with full add-on support*: https://reshade.me (the "with full add-on support" download).
 
@@ -72,8 +72,6 @@ Known limitations
 - Tested on one machine: RTX 5070 Ti, 4K, HDR. Game updates can break it (it then falls back and logs it).
 - With Ray Reconstruction, fine grass shimmers more at low render scales (from the upscale, not the ray tracing);
   0.67 is calmer than 0.50.
-- Water reflections are coarse at render scales below 1.00: the game computes them at half the render size, so at
-  0.50 they are much rougher than at native resolution. A fix is planned.
 - Every normal exit of the game ends in a crash report (a check at shutdown); it predates the add-on and is
   harmless.
 

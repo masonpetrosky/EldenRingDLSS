@@ -66,7 +66,8 @@ bushes and 0.3-0.4 ms for characters at 4K and 50%; tree motion vectors (off by 
   DLSS therefore smears: a port of the game's grass wind shader and a stream-output replay of the tree shaders. The
   trees are off by default (`WindTrees=1` or the overlay turns them on, about 2 ms at 4K with trees in view).
 - **Motion vectors for enemies, NPCs and animals**: the game only draws velocity for the player's character. The
-  add-on replays the other skinned characters' G-buffer draws with last frame's bones, matched per mesh part.
+  add-on replays the other skinned characters' draws (in the G-buffer, and after the lighting for ghosts and other
+  see-through characters) with last frame's bones, matched per mesh part.
 - **Object-only motion blur** (optional): with the game's Motion Blur on, enemies, animals and swings blur, camera
   turns do not.
 - **NVIDIA Reflex** (experimental): the driver's low-latency mode, with the sleep injected at the present.

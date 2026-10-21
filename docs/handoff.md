@@ -28,7 +28,7 @@ for picking up.
 | Native-size water reflections (`WaterReflections=1`) | Works in game (2026-10-20, test copy `dist/test-0.3.0`); `docs/recon.md` |
 | Water flickered between the native and the engine's reflection | Fixed (hooks now run in lists decided at submission); user: "water is great now" |
 | A ghost had no motion vectors (drawn in the forward pass, which the NPC path skipped) | Fixed: characters' forward prepasses stream like G-buffer draws; user: "everything looks great" |
-| Game update 1.17.2 moved the TAA filter's vtable | Fixed (RTTI lookup); 0.2.0 needs it: release pending |
+| Game update 1.17.2 moved the TAA filter's vtable | Fixed (RTTI lookup); 0.3.0 has it (prepared, release pending) |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -164,19 +164,18 @@ pwsh -NoProfile -File tools/package.ps1               # release zip in dist\ (ve
   (Modifications entry and upscaling row), the ReShade forum.
 - For the next release: the comparison slider pairs the game's TAA (sharpened) with unsharpened DLSS, captured 36 s
   apart while the light changed; a fairer pair would be back-to-back, possibly with `GameSharpening=1`.
-- **0.2.0, prepared 2026-10-19, not released.** The Nexus page had 323 unique downloads and six unanswered comments,
-  two of them about no frame-rate gain: 0.1.0 stops upscaling after the first loading screen (fixed in 6c124ae).
-  Zip in `dist\` (`CHANGELOG.md`) with NpcMotion=1 in its ini, regression and GPU checks passed. Rebuilt the same day
-  after the user asked for Ray Reconstruction to be featured: an overlay checkbox with a state line, `RtShadowRayGen`
-  3 by default (modes 2-4 now replace the game's rays only while RR runs; otherwise the game's shaders run, not our
-  port), and `ab_capture.ps1 -Round rrshow` for the page's RR images (SR, RR with our rays, RR with the game's rays,
-  TAA; each with frame times and the DLSS ones with a GPU profile).
-  The remote control works in release builds too, so `dist\test-0.2.0` (the zip plus ReShade64.asi, RenderScale=0.50,
-  `EldenRingDLSS-fps.me3` with UnlockTheFps) can run `ab_capture.ps1 -Folder <its EldenRingDLSS folder>` rounds.
-  Waiting for one in-game pass by the user (log, showcase screenshots and frame rates, fast travel, NPCs, leaf
-  shadows under trees for 83545fe, presets K/M/L/E, Ray Reconstruction from the new checkbox), then the release, the
-  Nexus file, page and replies (drafts in
-  `dist\nexus\page-0.2.0.bbcode` and `replies-2026-10-19.json`, local only).
+- **0.2.0, released 2026-10-19**: GitHub release and Nexus file, page and replies (drafts in
+  `dist\nexus\page-0.2.0.bbcode` and `replies-2026-10-19.json`, local only). Before it the Nexus page had 323 unique
+  downloads and six unanswered comments, two of them about no frame-rate gain: 0.1.0 stops upscaling after the first
+  loading screen (fixed in 6c124ae). `ab_capture.ps1 -Round rrshow` made the page's RR images (SR, RR with our rays,
+  RR with the game's rays, TAA; each with frame times and the DLSS ones with a GPU profile). The remote control works
+  in release builds too, so `dist\test-0.2.0` (the zip plus ReShade64.asi, RenderScale=0.50, `EldenRingDLSS-fps.me3`
+  with UnlockTheFps) can run `ab_capture.ps1 -Folder <its EldenRingDLSS folder>` rounds.
+- **0.3.0, prepared 2026-10-20, not released**: the 1.17.2 fix, native-size water reflections, characters of the
+  forward pass (the ghost) and the stencil class rule (`CHANGELOG.md`). `dist\EldenRingDLSS-0.3.0.zip`, regression
+  checks and the 2.7.2.0 executable check passed; its add-on is the build the user tested in game
+  (`dist\test-0.3.0`) but for the version resource. Drafts, local only: `dist\release-notes-0.3.0.md` and
+  `dist\nexus\page-0.3.0.bbcode`. Each public step waits for the user's OK: GitHub release, Nexus file and page.
 
 ## Ray tracing with our own ray generation shaders (dev)
 

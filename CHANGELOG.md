@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0 (2026-10-20)
+
+Fixes:
+- ELDEN RING App Ver. 1.17.2 (`eldenring.exe` 2.7.2.0): the update moved game code the add-on looks for, so 0.2.0 no
+  longer found the TAA filter while upscaling. It upscaled with the game's 8 jitter positions (static detail turns
+  into a fine dot pattern) and with the scene's jitter, which is now and then a frame stale (presets M and L make the
+  world jump). The add-on now finds the filter by its class name in the game's type information instead of a fixed
+  address.
+- Ghosts and other characters drawn after the lighting (see-through and glowing ones) had no motion vectors, so DLSS
+  smeared them as they moved.
+- NPCs wearing the same armor or body mesh as your character had no motion vectors on those parts.
+
+New:
+- Water reflections at the native size while upscaling (`WaterReflections=1`, on by default, also in the overlay):
+  the game traces the water's screen-space reflections at half the render size, so at 50% they had a quarter of the
+  native detail and sparkled. The add-on now traces them at the size the game uses at 100%: about 0.2 ms and 170 MB
+  of video memory at 4K and 50%.
+
 ## 0.2.0 (2026-10-19)
 
 Fixes:
