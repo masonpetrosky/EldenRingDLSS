@@ -219,10 +219,9 @@ uses 16x). Then, on the user's request, the trees the same way (`docs/recon.md`,
 G-buffer"): about 1.5 ms saved in a forest.
 
 **Next:**
-- **Waiting for the user's OK:** the everyday install with this build and `FrameGeneration=0`, their choice (back up
-  first, game closed; `deploy.ps1` also copies the Streamline DLLs and `nvngx_dlssg.dll`), and a 0.4.0 release
-  (GitHub and Nexus; `CHANGELOG.md` "Unreleased" has the notes). With trees at about 0.5 ms, whether `WindTrees`
-  should be on by default is theirs to decide too.
+- **0.4.0, OK'd by the user 2026-10-21** ("Yes to all 3"): the release on GitHub and Nexus with tree motion vectors
+  on by default (`WindTrees=1`), the everyday install from its zip with `FrameGeneration=0` (their choice; back up
+  first, game closed), and a comment on GitHub issue #1. Notes in `dist\release-notes-0.4.0.md` (local).
 - Streamline logged "ERROR RSYNC: Flip queue is empty!!!" once at the title screen (2026-10-21); harmless so far,
   not looked into.
 - **Nexus report (answered 2026-10-20, waiting for their tests):** light particles under upscaling sometimes move

@@ -689,7 +689,7 @@ void LoadConfig() {
   g_config.wind_capacity = std::max(1, std::min(ReadInt(L"WindCapacity", 8), 24));
   g_config.wind_mode = ReadInt(L"WindMode", 1) == 0 ? 0 : 1;
   g_config.wind_prepass = ReadInt(L"WindPrepass", 0) != 0;
-  g_config.wind_trees = ReadInt(L"WindTrees", 0) != 0;
+  g_config.wind_trees = ReadInt(L"WindTrees", 1) != 0;
   g_config.npc_motion = ReadInt(L"NpcMotion", 0) != 0;
   g_config.object_blur = ReadInt(L"ObjectBlur", 0) != 0;
   g_config.reflex = ReadInt(L"Reflex", 0) != 0;
@@ -6173,8 +6173,8 @@ void OnOverlay(effect_runtime*) {
   if (g_config.wind_motion && g_config.wind_mode == 1) {
     ImGui::Indent();
     if (ImGui::Checkbox("Tree motion vectors", &g_config.wind_trees)) SaveConfig();
-    ImGui::SetItemTooltip("Also gives SpeedTree trees and shrubs motion vectors. Costs about 2 ms more at 4K with "
-                          "trees in view, and about %d MB of video memory.",
+    ImGui::SetItemTooltip("Also gives SpeedTree trees and shrubs motion vectors. Costs about 0.5 ms more in a forest "
+                          "at 4K with render scale 0.50, and about %d MB of video memory.",
                           g_config.wind_tree_capacity * 32 + 13);
     ImGui::Unindent();
   }

@@ -20,8 +20,9 @@ between shots). The game's TAA sharpens its output, which reads as crisper in a 
 in motion; DLSS drops that noise, and detail of 4 px and coarser is the same. `GameSharpening=1` puts the game's
 sharpening back on top of DLSS if you prefer that look.
 
-Frame rates with the release settings (RTX 5070 Ti, 3840x2160, HDR, Maximum settings, frame cap removed; 5 s each
-with PresentMon; the add-on's default motion vectors: grass, bushes and characters, trees off):
+Frame rates with 0.2.0's release settings (RTX 5070 Ti, 3840x2160, HDR, Maximum settings, frame cap removed; 5 s
+each with PresentMon; motion vectors for grass, bushes and characters, trees off; the trees, on by default since
+0.4.0, add about 0.5 ms in a forest):
 
 | Ray tracing Maximum, one spot at sunset | Render size | Average fps | 1% low | GPU time per frame |
 | --- | --- | --- | --- | --- |
@@ -44,8 +45,8 @@ with PresentMon; the add-on's default motion vectors: grass, bushes and characte
 motion vectors; `tools/ab_capture.ps1 -Round vanilla`); the other rows are `-Round showcase` (`tools/frames.py`
 summarizes the logs). With ray tracing off a 4K frame is already cheap on this card, and the DLSS model plus the
 motion vectors cost about what the lower render size saves. The motion vectors cost about 0.5-0.7 ms for grass and
-bushes and 0.3-0.4 ms for characters at 4K and 50%; tree motion vectors (off by default) about 2 ms
-(`-Round mvcost`). Presets at 50% with ray tracing on (another spot): E 78.1 fps, K 73.3, M 70.5, L 67.6.
+bushes and 0.3-0.4 ms for characters at 4K and 50% (`-Round mvcost`), and about 0.5 ms for trees in a forest
+(`-Round treebatch`). Presets at 50% with ray tracing on (another spot): E 78.1 fps, K 73.3, M 70.5, L 67.6.
 
 ## Features
 
@@ -64,7 +65,7 @@ bushes and 0.3-0.4 ms for characters at 4K and 50%; tree motion vectors (off by 
   the size the game uses at 100%: about 0.2 ms and 170 MB of video memory at 4K and 50%.
 - **Motion vectors for wind-animated vegetation** (grass, bushes, SpeedTree trees), which the game does not write and
   DLSS therefore smears: a port of the game's grass wind shader and a stream-output replay of the tree shaders. The
-  trees are off by default (`WindTrees=1` or the overlay turns them on, about 0.5 ms in a forest at 4K and 50%).
+  trees cost about 0.5 ms more in a forest at 4K and 50% (`WindTrees=0` or the overlay leaves them out).
 - **Motion vectors for enemies, NPCs and animals**: the game only draws velocity for the player's character. The
   add-on replays the other skinned characters' draws (in the G-buffer, and after the lighting for ghosts and other
   see-through characters) with last frame's bones, matched per mesh part.
@@ -186,7 +187,7 @@ documents each key.
 | `ChromaticAberration` | 1 | Keep the game's chromatic aberration (0 removes it). |
 | `WindMotion` | 0 | Motion vectors for wind-animated vegetation. |
 | `WindMode` | 1 | 1 = ported grass shader plus tree replay; 0 = stream output for everything. |
-| `WindTrees` | 0 | Include SpeedTree trees and shrubs, about 0.5 ms in a forest at 4K and 50% (`WindTreeCapacity`: millions of vertices per frame). |
+| `WindTrees` | 1 | Include SpeedTree trees and shrubs, about 0.5 ms in a forest at 4K and 50% (`WindTreeCapacity`: millions of vertices per frame). |
 | `NpcMotion` | 0 | Motion vectors for enemies, NPCs and animals. |
 | `ObjectBlur` | 0 | With the game's Motion Blur on, blur only moving objects, not camera turns. |
 | `Reflex` | 0 | NVIDIA Reflex low-latency mode (experimental). |

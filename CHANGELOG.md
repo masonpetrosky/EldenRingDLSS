@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-10-21)
 
 New:
 - DLSS Frame Generation (`FrameGeneration`, experimental, off; also in the overlay): DLSS-G through NVIDIA Streamline
@@ -21,6 +21,10 @@ Fixes:
 - Under Proton the game could stay on a black screen at start-up (GitHub issue #1): the add-on started DLSS inside
   the game's device creation, and under Proton that start never returned. DLSS and Reflex now start on a thread of
   their own once the device exists, and the game keeps its TAA until DLSS is ready. Not yet confirmed on Linux.
+
+Changed:
+- Tree motion vectors are on by default again (`WindTrees=1`, a checkbox in the overlay), now that they cost about
+  0.5 ms in a forest at 4K and 50%. An `EldenRingDLSS.ini` kept from 0.2.0 or 0.3.0 still has `WindTrees=0`.
 
 ## 0.3.0 (2026-10-20)
 

@@ -388,7 +388,7 @@ if ($Round -eq 'sharpen') {
   # shots\tb_*.csv and tools\gpu_profile.py shots\gpuprofile_tb_on.csv --compare shots\gpuprofile_tb_off.csv.
   # Restores the ini's settings.
   $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
-  $trees = if ($ini -match '^WindTrees=1') { 'on' } else { 'off' }
+  $trees = if ($ini -match '^WindTrees=0') { 'off' } else { 'on' }
   $fg = ($ini | Where-Object { $_ -match '^FrameGeneration=' }) -replace '^FrameGeneration=', ''
   if ($fg -and $fg -ne '0') { Send 'fg 0' 2.0 }
   Send 'dlss on'; Send 'windtrees on' 3.0
@@ -407,7 +407,7 @@ if ($Round -eq 'sharpen') {
   # even ones for two 16-frame motion dumps (tools\tree_alternate.py shots tc_alt1 tc_alt2: the canopy motion of both
   # placements in neighboring frames). Frame generation off meanwhile. Restores the ini's settings.
   $ini = Get-Content (Join-Path $Folder 'EldenRingDLSS.ini') -ErrorAction SilentlyContinue
-  $trees = if ($ini -match '^WindTrees=1') { 'on' } else { 'off' }
+  $trees = if ($ini -match '^WindTrees=0') { 'off' } else { 'on' }
   $fg = ($ini | Where-Object { $_ -match '^FrameGeneration=' }) -replace '^FrameGeneration=', ''
   if ($fg -and $fg -ne '0') { Send 'fg 0' 2.0 }
   Send 'dlss on'; Send 'windtrees on' 3.0
