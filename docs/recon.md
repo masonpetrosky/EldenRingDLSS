@@ -875,3 +875,47 @@ The chain (`tools/rdc_flow.py` on `er117_trees_f2056.rdc`; the scale from `er117
 
 Fix: `SampleColor1` keeps the engine's viewport (the share) and only gets the percentages set to 1, so it reads the
 whole full-size frame into the share, the layout the water expects.
+
+## Water reflections at the native size (2026-10-19, in game 2026-10-20)
+
+With the reflection in the right place, the water at 50% was still much rougher than at native resolution with the
+game's TAA: the engine traces the reflection in its half-size targets, and with dynamic resolution only in the
+scene's share of them (at 4K and 50% 960x540 texels instead of 1920x1080). The add-on (`src/water_ssr.*`,
+`WaterReflections=1`) keeps its own copies of the chain's textures, sized so the scene's share of them is the native
+half size: T = min(2E, align32(ceil(E / p))) for an engine size E at percentage p.
+
+- At `GXSsrConvertDepth` it runs its own depth pass from the full-size depth copy: the linear depth the rays march
+  through and the depth buffer the water draws test against (the nearest of the covered texels, as the engine's 2x2
+  downscale).
+- The water's `*_FwdSsr` draws are drawn again into those textures (the game's own still run, because their depth
+  writes feed later passes), the `GXSsrTexDownScale` / `GXSsrTexBlur2` draws are drawn there instead (blur offsets
+  scaled to the larger mips, `mipLvF` - 1 on the blur texture, which has no top mip), and the water's lit forward
+  draw (`FwdSdw`, t44) reads the add-on's reflection. `SampleColor1` fills its whole target and the water draws get
+  `SC_DynamicResolution_SecondaryScreenPercentage.zw` = 1. Slots are overwritten in place in the game's per-draw
+  descriptor ring (`tools/rdc_descslots.py`).
+
+The first in-game run did nothing: the chain never started ("the depth parameters were not readable" every frame).
+The depth pass needs `cbPerScene.g_vDepthComputeParam` (pixel b0, byte 272), and that buffer is a placed resource
+in a default heap (GPU-only memory), so the add-on cannot map it. Every other constant buffer the chain reads or
+edits (`cbMipGenerate`, the water draws' `cbSceneParam`, and the TAA's `CB_AA` and `cbPostProcessCommon` for
+comparison) is in the upload heap (structured data of `er117_scale67_f2898.rdc`). `g_vDepthComputeParam` is the
+projection's depth terms (scale, bias, 1 / bias, 0): -5.00679e-06, 0.0500673, 19.9731, 0 in that capture, where
+`FC_MatrixProj` [10] and [11] hold the same, so the add-on now takes them from the `cbSceneParam` it reads at the
+main camera's scene draws.
+
+In game (4K, 50%, RR, the night river): the chain runs in 3840x2160 textures with a 1920x1080 share, 167 MB. The
+user: "Reflection looks great now", "it's night and day" (no A/B needed). Cost at that spot: the add-on's passes
+0.05 ms, the water's lit draw +0.14 ms (it reads the larger reflection); PresentMon GPU busy 13.2 -> 13.5 ms, 75.6 ->
+74.0 fps. Whole-frame temporal noise (8-shot bursts, `tools/flicker.py`): 6.9 with and without, 9.7 with the game's
+TAA at 100%.
+
+## The game update to App Ver. 1.17.2 (`eldenring.exe` 2.7.2.0, 2026-10-20)
+
+Steam replaced `eldenring.exe`, `regulation.bin` and parts of `Data0`/`Data3`. The shaders the add-on logs at
+startup have the same sizes (245 material pixel shaders), and the resolution scale's code pattern still matches once,
+but `GXBS::GXAntiAliasingFilter`'s vtable moved from 0x142F242B8 to 0x142F26558, and 0.2.0 had it hard-coded: while
+upscaling, the jitter stayed at the game's 8 positions and DLSS fell back to the scene constants' jitter, silently.
+The add-on now finds the vtable through the RTTI (type descriptor `.?AVGXAntiAliasingFilter@GXBS@@`, the complete
+object locator that points to it, the vtable whose slot -1 points to the locator); in game: "1 TAA filter(s) found
+in 1 search(es) (vtable +0x2F26558), 32 jitter phases". `erdlss_regressions --exe <eldenring.exe>` checks both
+lookups on a file (2.7.1.0: +0x2F242B8, 2.7.2.0: +0x2F26558).

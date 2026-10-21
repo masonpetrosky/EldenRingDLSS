@@ -7,7 +7,7 @@ ray tracing cheaper, and replaces its ray tracing denoisers with DLSS Ray Recons
 rays.
 
 This is a personal research project, developed and tested on one machine (RTX 5070 Ti, 4K HDR, ELDEN RING App Ver.
-1.17.1 (`eldenring.exe` file version 2.7.1.0), ReShade 6.8, [me3](https://github.com/garyttierney/me3) 0.13). It is
+1.17.2 (`eldenring.exe` file version 2.7.2.0; developed on 1.17.1), ReShade 6.8, [me3](https://github.com/garyttierney/me3) 0.13). It is
 published so that the reverse engineering and the lessons in `docs/` do not have to be repeated, and so that others
 can play with it: a ready-to-use zip is on the [Releases](https://github.com/masonpetrosky/EldenRingDLSS/releases)
 page. Use it at your own risk and offline only (me3 runs the game without Easy Anti-Cheat and keeps it off the
@@ -58,6 +58,10 @@ bushes and 0.3-0.4 ms for characters at 4K and 50%; tree motion vectors (off by 
   read, and decides at submission time (with GPU predicates) for command lists that land on either side of the TAA.
 - **Correct jitter**: a longer jitter cycle while upscaling (the game cycles 8 positions), taken from the TAA
   filter's own counter (the scene constants are sometimes a frame stale, which presets M and L show as judder).
+- **Water reflections at the native size while upscaling** (`WaterReflections=1`, also in the overlay): the game
+  traces the water's screen-space reflections at half the render size, so at 50% they had a quarter of the native
+  detail and sparkled. The add-on runs the reflection chain in larger textures of its own, so the water reflects at
+  the size the game uses at 100%: about 0.2 ms and 170 MB of video memory at 4K and 50%.
 - **Motion vectors for wind-animated vegetation** (grass, bushes, SpeedTree trees), which the game does not write and
   DLSS therefore smears: a port of the game's grass wind shader and a stream-output replay of the tree shaders. The
   trees are off by default (`WindTrees=1` or the overlay turns them on, about 2 ms at 4K with trees in view).
@@ -103,7 +107,8 @@ on an RTX 5070 Ti, partly paid back by the denoisers and rays it replaces, so pa
 ## Requirements
 
 - Windows 10/11, an NVIDIA RTX GPU and a current driver.
-- ELDEN RING (Steam), App Ver. 1.17.1 (shown on the title screen). Code patterns and offsets are version specific (see Limitations).
+- ELDEN RING (Steam), App Ver. 1.17.2 or 1.17.1 (shown on the title screen). Code patterns and offsets are version
+  specific (see Limitations).
 - ReShade 6.8 **with full add-on support**.
 - A way to load ReShade into the game without Easy Anti-Cheat. The scripts here use me3 profiles.
 - To build: Visual Studio 2022 or later (MSVC, C++20), CMake, Ninja, the Windows SDK (`fxc`, `dxc`), PowerShell 7,
@@ -229,8 +234,6 @@ hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale
 - Ray Reconstruction at 50-67% shows more shimmer in grass than at DLAA. It comes from the upscale (it stays with the
   game's own rays and with RR off); the add-on's own rays (`RtShadowRayGen`, on by default) remove the wave pattern
   the game's noise made in distant grass under RR.
-- Water reflections are coarse at render scales below 1: the game computes its screen-space reflections at half
-  the render size, so at 50% they are much rougher than at native resolution with the game's TAA. A fix is planned.
 - Every normal exit of the game ends in a harmless WER crash report (an allocator check at shutdown); it predates
   this add-on.
 

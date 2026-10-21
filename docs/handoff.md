@@ -24,6 +24,9 @@ for picking up.
 | Fast travel left the game at full size (grain under RR) | Fixed (6c124ae), everyday and dev installs (2026-10-12) |
 | GPU profile (5 places) | Done (2026-10-12): `docs/raytracing.md`, "GPU profile: where the frame goes" |
 | Foliage cost in our rays; leaf-shadow popping; a flicker | **Open**, dev install only (83545fe, visual validation pending): see Next steps 0 |
+| 0.2.0 release (fast-travel fix, preset E, RR checkbox, water reflection position) | GitHub + Nexus, everyday install (2026-10-19) |
+| Native-size water reflections (`WaterReflections=1`) | Works in game (2026-10-20, test copy `dist/test-0.3.0`); `docs/recon.md` |
+| Game update 1.17.2 moved the TAA filter's vtable | Fixed (RTTI lookup); 0.2.0 needs it: release pending |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -91,7 +94,9 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
   `EldenRingDLSS-fps.me3` with UnlockTheFps for frame-rate measurements); not an install the user plays with.
 
 The user's game settings: Custom, almost everything Maximum (water, shader and GI quality High), ray tracing
-Maximum, motion blur off, 4K, HDR on. Game version: App Ver. 1.17.1 = `eldenring.exe` 2.7.1.0.
+Maximum, motion blur off, 4K, HDR on. Game version: App Ver. 1.17.2 = `eldenring.exe` 2.7.2.0 since 2026-10-20 (1.17.1
+= 2.7.1.0 before; a copy of that exe is in `Documents\Tools\Ghidra\input`). After a game update, run
+`build/erdlss_regressions.exe --exe <eldenring.exe>` before testing in game.
 
 ## Working rules (from the user)
 

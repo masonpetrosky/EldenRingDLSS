@@ -5748,7 +5748,7 @@ void OnOverlay(effect_runtime*) {
   ImGui::SetItemTooltip("Below a 100%% render scale the game traces the water's reflections at the render scale too: "
                         "on a 4K screen at 50%% in 960x540 pixels instead of 1920x1080, which makes them coarse and "
                         "noisy. This traces them at the size the game uses at 100%%, in buffers of the add-on's own "
-                        "(about 190 MB of video memory on a 4K screen at 50%%, less at higher render scales).");
+                        "(about 170 MB of video memory on a 4K screen at 50%%, less at higher render scales).");
   if (g_config.water_reflections && SsrWanted()) {
     std::unique_lock lock(g_ssr_mutex, std::try_to_lock);
     if (lock.owns_lock()) {
