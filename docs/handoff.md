@@ -25,10 +25,10 @@ for picking up.
 | GPU profile (5 places) | Done (2026-10-12): `docs/raytracing.md`, "GPU profile: where the frame goes" |
 | Foliage cost in our rays; leaf-shadow popping; a flicker | **Open**, dev install only (83545fe, visual validation pending): see Next steps 0 |
 | 0.2.0 release (fast-travel fix, preset E, RR checkbox, water reflection position) | GitHub + Nexus, everyday install (2026-10-19) |
-| Native-size water reflections (`WaterReflections=1`) | Works in game (2026-10-20, test copy `dist/test-0.3.0`); `docs/recon.md` |
+| Native-size water reflections (`WaterReflections=1`) | Done: in 0.3.0 and the everyday install (2026-10-20); `docs/recon.md` |
 | Water flickered between the native and the engine's reflection | Fixed (hooks now run in lists decided at submission); user: "water is great now" |
 | A ghost had no motion vectors (drawn in the forward pass, which the NPC path skipped) | Fixed: characters' forward prepasses stream like G-buffer draws; user: "everything looks great" |
-| Game update 1.17.2 moved the TAA filter's vtable | Fixed (RTTI lookup); 0.3.0 has it (prepared, release pending) |
+| Game update 1.17.2 moved the TAA filter's vtable | Fixed (RTTI lookup) in 0.3.0: GitHub release and everyday install (2026-10-20) |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -69,7 +69,10 @@ frame whose lighting was already recorded; later frames restore the game's denoi
 Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
-  `natives\EldenRingDLSS` (release DLSS DLL). Build of commit 6c124ae, installed 2026-10-12 morning with the user's
+  `natives\EldenRingDLSS` (release DLSS DLL). **Since 2026-10-20 the 0.3.0 release build** (0.2.0's from 2026-10-19
+  before it; undo copies in `Documents\Backups\EldenRing\2026-10-19-before-dlss-0.2.0` and
+  `2026-10-20-before-dlss-0.3.0`); its ini is the one below with `RtShadowRayGen=4`, water reflections on by default.
+  Earlier: the build of commit 6c124ae, installed 2026-10-12 morning with the user's
   OK: d0f03f5 (installed after midnight) plus the fast-travel fix and the dev-only GPU profiler. 50% with preset M, enemy and animal motion vectors (`NpcMotion=1`) and the trees' motion at 50% fixed,
   object-only motion blur (`ObjectBlur=1`) with the game's Motion Blur on: the user tried it in this install and
   keeps it ("It seems great"), NVIDIA Reflex injected at the present (`Reflex=1`; the user noticed an improvement),
@@ -171,11 +174,12 @@ pwsh -NoProfile -File tools/package.ps1               # release zip in dist\ (ve
   RR with the game's rays, TAA; each with frame times and the DLSS ones with a GPU profile). The remote control works
   in release builds too, so `dist\test-0.2.0` (the zip plus ReShade64.asi, RenderScale=0.50, `EldenRingDLSS-fps.me3`
   with UnlockTheFps) can run `ab_capture.ps1 -Folder <its EldenRingDLSS folder>` rounds.
-- **0.3.0, prepared 2026-10-20, not released**: the 1.17.2 fix, native-size water reflections, characters of the
-  forward pass (the ghost) and the stencil class rule (`CHANGELOG.md`). `dist\EldenRingDLSS-0.3.0.zip`, regression
-  checks and the 2.7.2.0 executable check passed; its add-on is the build the user tested in game
-  (`dist\test-0.3.0`) but for the version resource. Drafts, local only: `dist\release-notes-0.3.0.md` and
-  `dist\nexus\page-0.3.0.bbcode`. Each public step waits for the user's OK: GitHub release, Nexus file and page.
+- **0.3.0, released 2026-10-20** (the user OK'd the GitHub release, the Nexus update and the everyday install): the
+  1.17.2 fix, native-size water reflections, characters of the forward pass (the ghost) and the stencil class rule
+  (`CHANGELOG.md`). Tag v0.3.0 at 142a1d0, GitHub release with `EldenRingDLSS-0.3.0.zip` (SHA-256 `581AC40C...789F`;
+  notes in `dist\release-notes-0.3.0.md`, local); regression checks and the 2.7.2.0 executable check passed; its
+  add-on is the build the user tested in game (`dist\test-0.3.0`) but for the version resource. Nexus: the file as
+  the update of 0.2.0 and the page from `dist\nexus\page-0.3.0.bbcode` (local).
 
 ## Ray tracing with our own ray generation shaders (dev)
 
@@ -196,7 +200,20 @@ Details: `docs/raytracing.md`, "Our own shadow ray generation shader in the game
 
 ## Next steps
 
-0. **Resume here: broader NPC motion checks, then test the 83545fe foliage changes** (game closed;
+**Next, at the user's request (2026-10-20, for a later session):**
+- **Frame rate in a castle courtyard:** with the everyday settings (4K, 50%, preset M, Ray Reconstruction, ray
+  tracing Maximum, frame cap removed) the user got only 52 FPS there. Find the spot with the user, profile it
+  (`gpuprofile 60 courtyard`, `gpu_profile.py --compare`, PresentMon) and look for savings; item 2 below lists known
+  candidates.
+- **DLSS Frame Generation:** look into adding it. First questions: Streamline or NGX directly, keeping the HUD out
+  of the generated frames, frame pacing with UnlockTheFps, and Reflex (frame generation needs it; ours is injected
+  at the present). A Nexus visitor asked for it too (2026-10-19).
+- **Nexus comments after 0.2.0, not answered yet** (each reply needs the user's OK): light particles under upscaling
+  sometimes move the wrong way for a moment and then snap back, with occasional artifacts around them (easy to see
+  after burning the Erdtree, a report from 2026-10-20); the same player sees no visible difference from the wind
+  motion vectors.
+
+0. **Broader NPC motion checks, then test the 83545fe foliage changes** (game closed;
    targeted post-audit checks passed; original 50% DLSS/RR settings restored;
    `docs/raytracing.md`, "Foliage in our
    rays, and a flicker"). At the second forest spot (the user's character beside leaves that popped):
