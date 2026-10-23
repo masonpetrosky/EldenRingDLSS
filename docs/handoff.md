@@ -180,6 +180,9 @@ pwsh -NoProfile -File tools/package.ps1               # release zip in dist\ (ve
   manager download off (Vortex cannot set up me3), requirements me3 and ReShade (off-site), permissions: no
   re-upload, modification/conversion/asset use with credit, tags Performance Optimization, ReShade, AI-Generated
   Content; GitHub as a download mirror; no donation points (NVIDIA asks to be notified before commercial use).
+  Since 2026-10-23 the permissions follow the MIT license: other mods that use our files may also earn donation
+  points or be sold. Re-upload stays off because the zip and the add-on contain NVIDIA's code, and the author notes
+  say forks take those parts from NVIDIA's SDKs under NVIDIA's terms.
 - Not posted yet (drafts in `dist/outreach.md`, local): Reddit (r/EldenRingMods, r/nvidia), PCGamingWiki
   (Modifications entry and upscaling row), the ReShade forum.
 - For the next release: the comparison slider pairs the game's TAA (sharpened) with unsharpened DLSS, captured 36 s
