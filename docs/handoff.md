@@ -29,7 +29,7 @@ for picking up.
 | Water flickered between the native and the engine's reflection | Fixed (hooks now run in lists decided at submission); user: "water is great now" |
 | A ghost had no motion vectors (drawn in the forward pass, which the NPC path skipped) | Fixed: characters' forward prepasses stream like G-buffer draws; user: "everything looks great" |
 | Game update 1.17.2 moved the TAA filter's vtable | Fixed (RTTI lookup) in 0.3.0: GitHub release and everyday install (2026-10-20) |
-| DLSS Frame Generation (Streamline DLSS-G, `FrameGeneration`) | Done (2026-10-21), in 0.4.0 (off by default) and the everyday install (2x since 2026-10-23, the user's choice: a forest still drops to about 50 fps without it; off from 2026-10-21 after the faster NPC path) |
+| DLSS Frame Generation (Streamline DLSS-G, `FrameGeneration`) | Done (2026-10-21), in 0.4.0 (off by default) and the everyday install (off, the user's choice: they played 2x-4x on 2026-10-21 and tried 2x again on 2026-10-23 for a forest at about 50 fps, and don't like it) |
 | Castle courtyard at 52 fps: NPC patches took 5.3 ms | Fixed (2026-10-21): lookups run together, 0.2 ms, 70 fps there; verified in game; in 0.4.0; `docs/recon.md` |
 | Tree wind patches stalled the G-buffer (trees about 2 ms) | Fixed (2026-10-21): patches run before their lists, trees about 0.5 ms, forest 45.6 -> 48.8 fps; checked in game (`treebatch verify`, alternating A/B); in 0.4.0, which turns the trees on by default |
 | The game's anisotropic filtering | Already 16x (2026-10-21; `docs/recon.md`) |
@@ -76,15 +76,16 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
   `natives\EldenRingDLSS` (release DLSS DLL). **Since 2026-10-21 the 0.4.0 release build** with the Streamline DLLs
-  and `nvngx_dlssg.dll`, frame generation 2x since 2026-10-23 (`FrameGeneration=2`, set in the overlay; off from
-  2026-10-21 to 2026-10-23); 0.3.0 from 2026-10-20 and
+  and `nvngx_dlssg.dll`, frame generation off (`FrameGeneration=0`; tried at 2x on 2026-10-23 and switched off
+  again, the user doesn't like it); 0.3.0 from 2026-10-20 and
   0.2.0 from 2026-10-19 before it; undo copies in `Documents\Backups\EldenRing\2026-10-19-before-dlss-0.2.0`,
   `2026-10-20-before-dlss-0.3.0` and `2026-10-21-before-dlss-0.4.0`. Its ini is the one below with
   `RtShadowRayGen=4`, water reflections on by default. 0.4.0 first ran from this profile on 2026-10-23, and its log is
   clean: Ray Reconstruction at 50%, the TAA filter found with 32 jitter phases, native-size water reflections. With
-  frame generation, Streamline 2.14.16 and DLSS-G 310.9.16 load, the swap chain is created through Streamline, and
-  in the world it logs "generating, 2 frames shown per rendered frame ... scene 30, UI 30". Before that the profile
-  had not started since 2026-10-12; the in-game tests ran from the test copies.
+  frame generation on, Streamline 2.14.16 and DLSS-G 310.9.16 load, the swap chain is created through Streamline,
+  and in the world it logs "generating, 2 frames shown per rendered frame ... scene 30, UI 30". Before that the
+  profile had not started since 2026-10-12; the in-game tests ran from the test copies. Open: a Limgrave forest
+  runs at about 50 fps (48.8 measured on 2026-10-21); profile it like the courtyard (`-Round perf`, `gpu_profile.py`).
   Earlier: the build of commit 6c124ae, installed 2026-10-12 morning with the user's
   OK: d0f03f5 (installed after midnight) plus the fast-travel fix and the dev-only GPU profiler. 50% with preset M, enemy and animal motion vectors (`NpcMotion=1`) and the trees' motion at 50% fixed,
   object-only motion blur (`ObjectBlur=1`) with the game's Motion Blur on: the user tried it in this install and
