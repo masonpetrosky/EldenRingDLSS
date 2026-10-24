@@ -225,7 +225,11 @@ pwsh -NoProfile -File tools/package.ps1               # release zip in dist\ (ve
   497, trees 159, executable 29). Only the add-on (and INSTALL.txt's version) differs from 0.4.0's zip. Nexus: the file
   "Elden Ring DLSS 0.4.1" as the update of 0.4.0 (archived), version 0.4.1, the page from
   `dist\nexus\page-0.4.1.bbcode` (local: the 0.4.1 changelog and "from 0.4.0, replacing EldenRingDLSS.addon64 is
-  enough"). The replies to Ver3ion and YuiAragaki1121 and the sticky wait for the user's OK of the texts.
+  enough"); virus scan "Safe to use". Posted 2026-10-23 ~20:45 after the user's "Yes, post all three": reply
+  178135107 in Ver3ion's thread 177485424 (the particle fix, and on their frame generation slowdowns, RTX 4090 at 4K
+  with an RTSS cap of 156 in Reflex mode: try without the RTSS cap or with the NVIDIA Control Panel's Max Frame Rate,
+  since both set Reflex's options), reply 178135122 in YuiAragaki1121's thread 177992826, and the sticky 177857019
+  now announces 0.4.1. Checked after a reload: nested in the right threads, the sticky is our only top-level post.
 
 ## Ray tracing with our own ray generation shaders (dev)
 
