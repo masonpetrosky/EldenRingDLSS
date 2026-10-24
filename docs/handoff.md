@@ -1,4 +1,4 @@
-# Handoff: Elden Ring DLSS, state on 2026-10-21
+# Handoff: Elden Ring DLSS, state on 2026-10-23
 
 A ReShade 6.8 add-on (`src/`, built as `EldenRingDLSS.addon64`) loaded through me3 that replaces Elden Ring's TAA
 with DLSS. Full history and measurements are in `docs/recon.md` (rendering, upscaling, motion vectors) and
@@ -35,6 +35,7 @@ for picking up.
 | The game's anisotropic filtering | Already 16x (2026-10-21; `docs/recon.md`) |
 | GitHub issue #1, Proton black screen | NGX and NVAPI start on a thread of their own in 0.4.0; untested under Proton, the reporter was asked to try it (2026-10-21) |
 | 0.4.0 release (frame generation, the courtyard and forest speed-ups, trees on by default) | GitHub + Nexus, everyday install (2026-10-21) |
+| Particle glitches under upscaling (Nexus report; a Living Jar's break shows it) | Fixed (2026-10-23): lists decided at submission, every particle effect's screen-copy rectangle and screen sizes; user-tested in `dist/test-particles` ("pot break looks good"); not yet in the everyday install or a release |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -115,6 +116,10 @@ Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
   `nvngx_dlssg.dll`, started with `launch.bat` (`EldenRingDLSS-fps.me3`, UnlockTheFps). Ini: the everyday settings plus
   `FrameGeneration=2`. The frame generation and courtyard tests ran here; `ab_capture.ps1 -Folder` points at its
   `EldenRingDLSS` folder.
+- `dist/test-particles` (2026-10-23): the same layout with the particle fix build, the user's everyday settings
+  (frame generation off), `launch.bat`. Burst captures of a Living Jar's break are in its `shots` folder
+  (`sparks`, `break_night`, `break_day` before the fix, `break_fixed` with the radial blur fixed by name; the
+  general fix's burst is in `shots` itself).
 
 The user's game settings: Custom, almost everything Maximum (water, shader and GI quality High), ray tracing
 Maximum, motion blur off, 4K, HDR on. Game version: App Ver. 1.17.2 = `eldenring.exe` 2.7.2.0 since 2026-10-20 (1.17.1
@@ -250,7 +255,10 @@ G-buffer"): about 1.5 ms saved in a forest. All of it went out as 0.4.0 the same
   moment and then snap back, with occasional artifacts around them (easy to see after burning the Erdtree). Their
   answer of 2026-10-21 01:06: only while upscaling, too hard to film; easiest to see with an endgame save where fire
   particles are dense, moving the camera. To reproduce, the user needs such a save. The same player sees no visible
-  difference from the wind motion vectors (answered: subtle, mostly at 50-58%).
+  difference from the wind motion vectors (answered: subtle, mostly at 50-58%). **Likely fixed 2026-10-23** (not in
+  a release yet): a Living Jar's break reproduced the class of bug, and the fix covers both causes found (lists on a
+  new side of the TAA, the screen copy's rectangle); `docs/recon.md`, "Particles under upscaling". The embers
+  themselves are untested (no save after the Erdtree burns).
 - **GitHub issue #1, Proton black screen (answered 2026-10-20):** the reporter's 0.1.0 log stops while NGX starts
   inside `OnInitDevice` (ReShade's init_device event): under Proton NGX finds the driver through
   `/run/host/usr/lib/nvidia/wine`, then nvapi64.dll creates a D3D11 device and a 1x1 swap chain on another thread,

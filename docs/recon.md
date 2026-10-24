@@ -1149,3 +1149,37 @@ Whether the patches are still right when they run before the list:
 - `treebatch alternate` places the patches before their lists in odd frames and inline in even ones, and the dump's
   `.txt` files name each frame's placement. Two 16-frame dumps (`ab_capture.ps1 -Round treecheck`,
   `tools/tree_alternate.py`): canopy motion inline / before their lists 1.001, from neighboring frames (0.989-1.007).
+
+## Particles under upscaling (2026-10-23)
+
+The Nexus report (light particles under upscaling briefly move the wrong way and snap back; dense embers after the
+Erdtree burns) got a repro without an endgame save: breaking a Living Jar looked wrong at 50% and fine with F9 (the
+game's TAA) and at 100% (DLAA). Two causes, both after the TAA:
+
+- **List kinds on a new side.** The engine records its post-processing and particle lists in parallel, and the add-on
+  learns per list kind (first pipeline and target) whether it comes before or after the TAA. A kind's first frames on
+  a side it had not been seen on were drawn with the wrong correction: uncorrected after the TAA (the effect at its
+  render-size place, toward the top-left) or corrected before it. The release build's counters (`dualinfo`; the
+  everyday install answers the remote too) showed 202 lists uncorrected after the TAA and 420 corrected before it in
+  the first 11 minutes of a session (lists counted while DLSS was off inflated the first number until now). At the
+  jar, a burst of new particle kinds (`GXFfxtessellate*`) drew uncorrected for a frame each. Now every list that may
+  be corrected is decided at submission (recorded twice under a GPU predicate, as the kinds seen on both sides already
+  were): kinds not seen yet, kinds seen only after the TAA, and particle lists seen only before it (`g_dual_rule` 3;
+  remote `dualrule 0-3`, `surprises`). Lists on the unexpected side since: one, at the first upscaled frame of a
+  session. About 8 lists and 90 draws per frame are recorded twice.
+- **The screen copy's rectangle.** That alone did not fix the jar. A burst capture at the break (remote `burst 16
+  radialBlur`: the TAA's inputs and the final image of 16 frames from the first draw of a pipeline whose name contains
+  the pattern) showed a box of a brighter, blurred copy of another part of the screen with hard edges (horizontal
+  streaks at night). The jar's `GXFfxradialBlur` reads the screen copy inside `g_resolveRectUV` (PSCommonBuffer byte
+  16), given in the scene's share, like the heat distortion fixed on 2026-10-10, but only names containing
+  "distortion" were corrected. Values at the break: rectangle (0.112, 0.0002)-(0.381, 0.472), UV scale (0.5, 0.5, 1,
+  1). Now every particle pipeline gets the correction while its UV scale shows the share, if the rectangle lies
+  inside the share (`prect on|off`). In game it applied to `GXFfxdistortionSoftBump`, `GXFfxdistortionBump`,
+  `GXFfxradialBlur` and `GXFfxbumpDistorsionTexture`, a full-screen distortion the name check had missed (the game
+  spells it "Distorsion"). User: "pot break looks good, looked around at other effects too and it seems good".
+
+A scan of the particle pipelines' constant buffers (b0-b3, vertex and pixel, at each pipeline's first draws) for the
+render size and its reciprocal found 128 places in 47 pipelines. Most are the tile lighting's `screenSize` (VS b0 608)
+of every tessellated effect (only the point sprites' and the distortion's were corrected); some also have PS b0
+864/1008, PS b1 16/608, VS b2 96/496/608 or VS b3 544. They are set to the output size now (`psizes on|off`). The
+jar looked the same with or without them.

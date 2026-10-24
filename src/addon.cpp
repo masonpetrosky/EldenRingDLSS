@@ -142,6 +142,7 @@ struct __declspec(uuid("2b0f6a0e-6a47-4c2b-9d2a-5b3c6a1f9e11")) CmdData {
   bool signed_ = false;
   bool has_taa = false;  // the TAA was recorded here
   uint64_t first_target = 0;  // the texture the first draw drew into (part of the signature)
+  int kind_state = -1;        // the kind's state (KindState) when the list was signed, for the logs
   bool has_ui = false;        // the final UI composite was recorded here: the frame's last list
   // A list whose kind comes both before and after the TAA (the fire's distortion and sparks, the grace flame):
   // decided when it is submitted. Its corrected draws are recorded twice under a GPU predicate (slot `pred_slot`,
@@ -384,7 +385,8 @@ std::atomic<uint64_t> g_post_fixes{0};        // corrected passes, for the overl
 // The engine records its jobs' command lists in parallel, so the passes after the TAA are mostly in other lists,
 // recorded at the same time. Their order shows when they are submitted: every list submitted after the TAA's in a
 // frame is post-processing. Lists are recognized by their first pipeline; kinds seen only after the TAA are corrected
-// when they are recorded in later frames (the first frame a new kind appears is not).
+// when they are recorded in later frames. Kinds not seen yet, and those that may change sides (g_dual_rule), are
+// decided at submission.
 std::mutex g_kinds_mutex;
 // Signature -> where it was submitted in its last 64 frames with a TAA (bit set = after the TAA). The game does not
 // keep every list on one side: the list with the fire's heat distortion and sparks comes after the TAA almost always
@@ -1067,6 +1069,53 @@ std::string WriteDumps(command_queue* queue) {
          g_dump_name + "_mv_NN.bin";
 }
 
+// A burst saved from the first draw of a pipeline whose name contains a pattern (remote "burst <frames> <pattern>"),
+// e.g. a pot's shards the moment it breaks: the TAA's inputs as in "mv" and the final image of each frame
+// (burst_final_NN, the back buffer before present).
+std::mutex g_burst_mutex;
+std::string g_burst_pattern;  // under g_burst_mutex
+std::atomic<bool> g_burst_armed{false}, g_burst_fired{false};
+std::atomic<int> g_burst_frames{0}, g_burst_finals{0};  // frames asked for, final images still to copy
+
+void CheckBurst(const std::string& name) {
+  {
+    std::lock_guard lock(g_burst_mutex);
+    if (g_burst_pattern.empty() || name.find(g_burst_pattern) == std::string::npos) return;
+  }
+  if (!g_burst_armed.exchange(false)) return;
+  {
+    std::lock_guard lock(g_dump_mutex);
+    g_dump_name = "burst";
+    g_dump_start = g_frame.load();
+    g_dump_last = 0;
+    g_dump_remaining = g_burst_frames.load();
+  }
+  g_burst_finals = g_burst_frames.load();
+  g_burst_fired = true;
+  g_passlog_frame = g_frame.load() + 1;  // and every named draw of the next frame (shots/passlog.txt)
+  Log(reshade::log::level::info, "Burst: " + name + " drew in frame " + std::to_string(g_frame.load()) + "; saving " +
+                                     std::to_string(g_burst_frames.load()) + " frames");
+}
+
+// At present, while a burst runs: copies the final image through ReShade's immediate command list.
+void CopyFinalImage(effect_runtime* runtime) {
+  command_queue* const queue = runtime->get_command_queue();
+  const resource back_buffer = runtime->get_current_back_buffer();
+  {
+    std::lock_guard lock(g_dump_mutex);
+    char suffix[16];
+    std::snprintf(suffix, sizeof(suffix), "_%02d", g_burst_frames.load() - g_burst_finals.load());
+    if (!CopyToReadback(queue->get_immediate_command_list(), back_buffer, g_frame.load(),
+                        g_dump_name + "_final" + suffix, resource_usage::present)) {
+      Log(reshade::log::level::error, "Could not create a readback buffer for the burst's final image.");
+      g_burst_finals = 0;
+      return;
+    }
+  }
+  queue->flush_immediate_command_list();
+  --g_burst_finals;
+}
+
 void DestroyMask(device* dev) {
   for (const auto& [res, view] : g_stencil_views) dev->destroy_resource_view(view);
   g_stencil_views.clear();
@@ -1323,21 +1372,14 @@ std::string PipelineName(uint64_t pipeline) {
 // instead of writing them.
 thread_local std::vector<PendingEdit>* t_defer = nullptr;
 
-// Edits `count` floats at byte `offset` of the constant buffer bound to `reg` of `stage`, in the upload heap before
-// the GPU reads them (every pass after the TAA has its own allocations: tools/rdc_cbbinds.py). `edit` gets the
-// values and returns whether it changed them. `step` (optional) tells where it stopped: 1 no tracking, 2 no bound
-// tables, 3 register not found in the bound tables, 4 no buffer behind the descriptor, 5 mapping failed, 6 the edit
-// kept the values.
-template <typename Edit>
-bool EditBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg, uint32_t offset, uint32_t count,
-                        Edit edit, int* step = nullptr) {
-  int unused = 0;
-  int& at = step != nullptr ? *step : unused;
+// The buffer range behind the constant buffer bound to `reg` of `stage`. `at` tells where it stopped: 1 no tracking,
+// 2 no bound tables, 3 register not found in the bound tables, 4 no buffer behind the descriptor.
+bool BoundConstantRange(command_list* cmd_list, shader_stage stage, uint32_t reg, buffer_range* range, int& at) {
   device* const dev = cmd_list->get_device();
   auto* const state = cmd_list->get_private_data<state_tracking>();
   auto* const descriptors = dev->get_private_data<erdlss::Descriptors>();
   at = 1;
-  if (state == nullptr || descriptors == nullptr || count > 16) return false;
+  if (state == nullptr || descriptors == nullptr) return false;
   auto it = state->descriptor_tables.find(stage == shader_stage::compute ? shader_stage::all_compute
                                                                           : shader_stage::all_graphics);
   // Compute tables are not always tracked under all_compute (the ray tracing denoiser's were not): take any key with
@@ -1353,9 +1395,25 @@ bool EditBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg
   if (!descriptors->Find(dev, it->second.first, it->second.second, stage, RegisterKind::kConstantBuffer, reg, 0, &heap,
                          &slot))
     return false;
-  const buffer_range range = descriptors->Buffer(heap, slot);
+  *range = descriptors->Buffer(heap, slot);
   at = 4;
-  if (range.buffer == 0 || range.size < offset + count * 4) return false;
+  return range->buffer != 0;
+}
+
+// Edits `count` floats at byte `offset` of the constant buffer bound to `reg` of `stage`, in the upload heap before
+// the GPU reads them (every pass after the TAA has its own allocations: tools/rdc_cbbinds.py). `edit` gets the
+// values and returns whether it changed them. `step` (optional) tells where it stopped: 1-4 as in BoundConstantRange
+// (4 also when the buffer is too small), 5 mapping failed, 6 the edit kept the values.
+template <typename Edit>
+bool EditBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg, uint32_t offset, uint32_t count,
+                        Edit edit, int* step = nullptr) {
+  int unused = 0;
+  int& at = step != nullptr ? *step : unused;
+  device* const dev = cmd_list->get_device();
+  at = 1;
+  if (count > 16) return false;
+  buffer_range range = {};
+  if (!BoundConstantRange(cmd_list, stage, reg, &range, at) || range.size < offset + count * 4) return false;
   void* mapped = nullptr;
   at = 5;
   if (!dev->map_buffer_region(range.buffer, range.offset + offset, count * 4, map_access::read_write, &mapped))
@@ -1379,6 +1437,128 @@ bool EditBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg
 }
 
 bool IsShare(float v) { return v > 0.2f && v < 0.999f; }
+
+// Reads the constant buffer bound to `reg` of `stage` (its first 4 KB at most).
+bool ReadBoundConstants(command_list* cmd_list, shader_stage stage, uint32_t reg, std::vector<float>* values) {
+  buffer_range range = {};
+  int at = 0;
+  if (!BoundConstantRange(cmd_list, stage, reg, &range, at)) return false;
+  const uint64_t size = (std::min<uint64_t>)(range.size, 4096) & ~uint64_t{3};
+  if (size < 8) return false;
+  device* const dev = cmd_list->get_device();
+  void* mapped = nullptr;
+  if (!dev->map_buffer_region(range.buffer, range.offset, size, map_access::read_only, &mapped)) return false;
+  values->resize(static_cast<size_t>(size / 4));
+  std::memcpy(values->data(), mapped, static_cast<size_t>(size));
+  dev->unmap_buffer_region(range.buffer);
+  return true;
+}
+
+// Particle pipelines after the TAA hold the render size in constants the named corrections don't know: on 2026-10-23
+// a scan found 128 places in 47 pipelines, among them the tile lighting's screenSize (VS b0 608) of every tessellated
+// effect, not only the point sprites'. The first draws of each particle pipeline scan its constant buffers b0-b3 for
+// the render size (width, height) or its reciprocal; the places found are set to the output size at that pipeline's
+// later draws, after the values are checked again (the first 40 are logged; half the render size is only logged).
+// Development switch: remote "psizes on|off".
+struct SizeSlot {
+  shader_stage stage = shader_stage::vertex;
+  uint32_t reg = 0, offset = 0;
+  bool reciprocal = false;
+};
+struct ParticleSlots {
+  int scans = 0;
+  std::vector<SizeSlot> slots;
+};
+std::mutex g_particle_slots_mutex;
+std::unordered_map<uint64_t, ParticleSlots> g_particle_slots;  // by pipeline
+std::atomic<bool> g_particle_sizes{true};
+std::atomic<uint64_t> g_particle_size_fixes{0};
+std::atomic<uint32_t> g_particle_size_lines{0};
+
+// The screen copy's rectangle of particle effects after the TAA (development switch: remote "prect on|off").
+std::atomic<bool> g_screen_rect_fix{true};
+
+// Logs each particle pipeline name the first time its screen-copy rectangle is scaled (40 names at most).
+void NoteScreenRect(const std::string& name, const float* before, float sx, float sy) {
+  static std::mutex mutex;
+  static std::unordered_set<std::string> seen;
+  {
+    std::lock_guard lock(mutex);
+    if (seen.size() >= 40 || !seen.insert(name).second) return;
+  }
+  char text[256];
+  std::snprintf(text, sizeof(text), "Screen copy rectangle: %s (%g, %g)-(%g, %g) -> (%g, %g)-(%g, %g)", name.c_str(),
+                before[0], before[1], before[2], before[3], before[0] / sx, before[1] / sy, before[2] / sx,
+                before[3] / sy);
+  Log(reshade::log::level::info, text);
+}
+
+bool FixParticleSizes(command_list* cmd_list, uint64_t pipeline, const std::string& name, bool compute, float rw,
+                      float rh, float ow, float oh) {
+  if (!g_particle_sizes.load()) return false;
+  const auto near_pair = [](const float* v, float w, float h) {
+    return std::fabs(v[0] - w) <= 1.0f && std::fabs(v[1] - h) <= 1.0f;
+  };
+  const auto reciprocal_pair = [](const float* v, float w, float h) {
+    return v[0] > 0.0f && v[1] > 0.0f && std::fabs(v[0] * w - 1.0f) < 2e-3f && std::fabs(v[1] * h - 1.0f) < 2e-3f;
+  };
+  std::vector<SizeSlot> slots;
+  bool scan = false;
+  {
+    std::lock_guard lock(g_particle_slots_mutex);
+    ParticleSlots& p = g_particle_slots[pipeline];
+    scan = p.scans < 4;
+    if (scan) ++p.scans;
+    slots = p.slots;
+  }
+  if (scan) {
+    const std::vector<shader_stage> stages =
+        compute ? std::vector<shader_stage>{shader_stage::compute}
+                : std::vector<shader_stage>{shader_stage::vertex, shader_stage::pixel};
+    std::vector<float> v;
+    for (const shader_stage stage : stages)
+      for (uint32_t reg = 0; reg < 4; ++reg) {
+        if (!ReadBoundConstants(cmd_list, stage, reg, &v)) continue;
+        for (size_t i = 0; i + 1 < v.size(); ++i) {
+          if (i % 4 == 3) continue;  // a pair within one float4
+          const bool size = near_pair(&v[i], rw, rh), reciprocal = !size && reciprocal_pair(&v[i], rw, rh);
+          const bool half = !size && !reciprocal && near_pair(&v[i], rw * 0.5f, rh * 0.5f);
+          if (!size && !reciprocal && !half) continue;
+          const SizeSlot s = {stage, reg, static_cast<uint32_t>(i * 4), reciprocal};
+          const auto same = [&s](const SizeSlot& o) {
+            return o.stage == s.stage && o.reg == s.reg && o.offset == s.offset;
+          };
+          bool known = std::any_of(slots.begin(), slots.end(), same);
+          if (!known && !half) {
+            slots.push_back(s);
+            std::lock_guard lock(g_particle_slots_mutex);
+            std::vector<SizeSlot>& kept = g_particle_slots[pipeline].slots;
+            if (std::none_of(kept.begin(), kept.end(), same)) kept.push_back(s);
+          }
+          if (!known && g_particle_size_lines.fetch_add(1) < 40) {
+            char text[256];
+            std::snprintf(text, sizeof(text), "Particle constants: %s %s b%u +%u holds %s (%g, %g)%s", name.c_str(),
+                          stage == shader_stage::vertex ? "VS" : stage == shader_stage::pixel ? "PS" : "CS", reg,
+                          static_cast<unsigned>(i * 4),
+                          size ? "the render size" : reciprocal ? "the render size's reciprocal" : "half the render size",
+                          v[i], v[i + 1], half ? "; left as it is" : "; set to the output size");
+            Log(reshade::log::level::info, text);
+          }
+          ++i;  // the pair's second float
+        }
+      }
+  }
+  bool fixed = false;
+  for (const SizeSlot& s : slots)
+    fixed |= EditBoundConstants(cmd_list, s.stage, s.reg, s.offset, 2, [&](float* v) {
+      if (s.reciprocal ? !reciprocal_pair(v, rw, rh) : !near_pair(v, rw, rh)) return false;
+      v[0] = s.reciprocal ? 1.0f / ow : ow;
+      v[1] = s.reciprocal ? 1.0f / oh : oh;
+      return true;
+    });
+  if (fixed) ++g_particle_size_fixes;
+  return fixed;
+}
 
 // GPU predicates for the lists decided at submission: one 64-bit slot per list, 1 = after the TAA. An upload buffer
 // (GENERIC_READ includes the PREDICATION state), mapped for good.
@@ -1423,6 +1603,20 @@ std::atomic<uint64_t> g_dual_lists{0}, g_dual_after{0}, g_dual_draws{0};
 // before it. The first time a kind changes sides it is one of these; after that it is decided at submission.
 std::atomic<uint64_t> g_unhandled_after{0}, g_unhandled_before{0};
 std::atomic<bool> g_dual_enabled{true};  // development (remote "dual on|off"): off = the majority rule alone
+// Which lists are decided at submission besides the kinds seen on both sides (remote "dualrule 0-3"): 1 adds the
+// kinds not seen yet, 2 also the kinds seen only after the TAA, 3 also the particle lists seen only before it. Before,
+// a kind's first frames on a side it had not been seen on drew uncorrected after the TAA or corrected before it: its
+// particle effect at the wrong size and place for a frame or two (the Nexus report of particles that move the wrong
+// way and snap back; 622 such lists in the first 11 minutes of a session on 2026-10-23).
+std::atomic<int> g_dual_rule{3};
+// Lists drawn on the unexpected side, per kind, for the log and the remote "surprises" (under g_kinds_mutex).
+struct Surprise {
+  uint64_t after = 0, before = 0;  // drawn uncorrected after the TAA, corrected before it
+  int state = -1;                  // the kind's state when the last one was signed
+  uint64_t last_log = 0;
+};
+std::unordered_map<uint64_t, Surprise> g_surprises;
+uint32_t g_surprise_lines = 0;  // log lines written so far (capped)
 
 // The viewport and scissor a corrected draw needs, when it is recorded twice instead of corrected in place.
 struct DrawFix {
@@ -1453,6 +1647,8 @@ void CorrectPostPassImpl(command_list* cmd_list, CmdData& data, bool compute, Dr
   if (state == nullptr) return;
   const std::string name = PipelineName(data.current.handle);
   bool fixed = false;
+  const float sx = data.post_scale[0], sy = data.post_scale[1];
+  const float out_w = static_cast<float>(data.out_width), out_h = static_cast<float>(data.out_height);
   if (compute) {
     if (name == "CS_VFX_StandardParticleForce")  // ccbSceneParam (b0): dynamicResolutionX/Y at byte 568
       fixed = EditBoundConstants(cmd_list, shader_stage::compute, 0, 568, 2, [](float* v) {
@@ -1460,12 +1656,13 @@ void CorrectPostPassImpl(command_list* cmd_list, CmdData& data, bool compute, Dr
         v[0] = v[1] = 1.0f;
         return true;
       });
+    if (name.find("_VFX_") != std::string::npos)
+      fixed |= FixParticleSizes(cmd_list, data.current.handle, name, true, std::round(out_w * sx),
+                                std::round(out_h * sy), out_w, out_h);
     if (fixed) ++g_post_fixes;
     return;
   }
   device* const dev = cmd_list->get_device();
-  const float sx = data.post_scale[0], sy = data.post_scale[1];
-  const float out_w = static_cast<float>(data.out_width), out_h = static_cast<float>(data.out_height);
 
   // The viewport: the scene's share of the target becomes the whole target. Except for the water's screen-space
   // reflection source (SampleColor1 after the depth of field: a half-size copy of the frame that the next frame's
@@ -1518,20 +1715,29 @@ void CorrectPostPassImpl(command_list* cmd_list, CmdData& data, bool compute, Dr
         return true;
       });
   if (particles) {
-    // The heat distortion (GXFfxdistortion*) samples a copy of the screen inside g_resolveRectUV (PSCommonBuffer byte
-    // 16: min u, v, max u, v), which the engine gives in the scene's share; the copy is full size after DLSS. Scaled
-    // while g_dynamicResolution_UVScale still shows the share (it is set to 1 just below).
-    if (name.find("distortion") != std::string::npos) {
-      bool share = false;
-      EditBoundConstants(cmd_list, shader_stage::pixel, 0, 816, 2, [&share](float* v) {
-        share = IsShare(v[0]) && IsShare(v[1]);
-        return false;
+    // Effects that read a copy of the screen (the heat distortion GXFfxdistortion*, the radial blur of a breaking jar
+    // GXFfxradialBlur) sample it inside g_resolveRectUV (PSCommonBuffer byte 16: min u, v, max u, v), which the engine
+    // gives in the scene's share; the copy is full size after DLSS. Scaled for every particle pipeline while
+    // g_dynamicResolution_UVScale still shows the share (it is set to 1 just below), if the rectangle lies inside the
+    // share (unused, it holds 1s or zeros). Only the distortion was corrected until 2026-10-23, when the jar's radial
+    // blur smeared a box of the wrong part of the screen at 50%.
+    bool share = false;
+    EditBoundConstants(cmd_list, shader_stage::pixel, 0, 816, 2, [&share](float* v) {
+      share = IsShare(v[0]) && IsShare(v[1]);
+      return false;
+    });
+    if (share && g_screen_rect_fix.load()) {
+      float before[4] = {};
+      const bool scaled = EditBoundConstants(cmd_list, shader_stage::pixel, 0, 16, 4, [&](float* v) {
+        if (v[0] < 0.0f || v[1] < 0.0f || v[0] > v[2] || v[1] > v[3] || v[2] > sx + 1e-3f || v[3] > sy + 1e-3f ||
+            (v[2] == 0.0f && v[3] == 0.0f))
+          return false;
+        std::memcpy(before, v, sizeof(before));
+        v[0] /= sx, v[1] /= sy, v[2] /= sx, v[3] /= sy;
+        return true;
       });
-      if (share)
-        fixed |= EditBoundConstants(cmd_list, shader_stage::pixel, 0, 16, 4, [sx, sy](float* v) {
-          v[0] /= sx, v[1] /= sy, v[2] /= sx, v[3] /= sy;
-          return true;
-        });
+      fixed |= scaled;
+      if (scaled) NoteScreenRect(name, before, sx, sy);
     }
     // PSCommonBuffer (pixel b0): g_dynamicResolution_UVScale (byte 816) = (share x, share y, 1, 1).
     fixed |= EditBoundConstants(cmd_list, shader_stage::pixel, 0, 816, 4, [](float* v) {
@@ -1553,6 +1759,9 @@ void CorrectPostPassImpl(command_list* cmd_list, CmdData& data, bool compute, Dr
           v[0] = out_w, v[1] = out_h, v[2] = 1.0f / out_w, v[3] = 1.0f / out_h;
           return true;
         });
+    // The render size anywhere else in their constants.
+    fixed |= FixParticleSizes(cmd_list, data.current.handle, name, false, std::round(out_w * sx),
+                              std::round(out_h * sy), out_w, out_h);
   }
   // The heat distortion's screen copy (PointSampleColor1 before each GXFfxdistortion* draw) copies one particle's
   // rectangle: a full-size viewport with a scissor in the scene's share. Scaled with g_resolveRectUV.
@@ -3660,23 +3869,28 @@ void SignList(command_list* cmd_list, CmdData& data, bool draw) {
   }
   data.signature = data.current.handle ^ (target * 0x9E3779B97F4A7C15ull);
   data.first_target = target;
+  const std::string first = PipelineName(data.current.handle);
   {
     std::lock_guard names_lock(g_kind_names_mutex);
-    if (g_kind_names.size() < 4096) g_kind_names.try_emplace(data.signature, PipelineName(data.current.handle));
+    if (g_kind_names.size() < 4096) g_kind_names.try_emplace(data.signature, first);
   }
   if (!g_post_fix || !g_config.enabled || g_config.render_scale >= 1.0f || g_last_out_width.load() == 0) return;
+  // Particle lists start with an effect's pipeline (GXFfx*, *_VFX_*), before the TAA as well as after it.
+  const bool particles = first.rfind("GXFfx", 0) == 0 || first.find("_VFX_") != std::string::npos;
   {
     std::lock_guard lock(g_kinds_mutex);
     const int state = KindState(data.signature);
-    if (state != 2 && state != 3 && state != 4) return;
-    if (state != 2) {
-      if (!g_dual_enabled.load() || !g_predicates.Ready(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()))) {
-        if (state == 3) return;  // without predicates: the old majority rule
-      } else {
-        data.dual = true;
-        data.pred_slot = g_predicates.next++ % Predicates::kSlots;
-        ++g_dual_lists;
-      }
+    data.kind_state = state;
+    const int rule = g_dual_rule.load();
+    const bool decide = state == 3 || state == 4 || (rule >= 1 && state == 0) || (rule >= 2 && state == 2) ||
+                        (rule >= 3 && state == 1 && particles);
+    if (decide && g_dual_enabled.load() &&
+        g_predicates.Ready(reinterpret_cast<ID3D12Device*>(cmd_list->get_device()->get_native()))) {
+      data.dual = true;
+      data.pred_slot = g_predicates.next++ % Predicates::kSlots;
+      ++g_dual_lists;
+    } else if (state != 2 && state != 4) {
+      return;  // before the TAA, or without predicates the old majority rule: corrected only if mostly after
     }
   }
   data.post_fix = true;
@@ -3687,6 +3901,7 @@ void SignList(command_list* cmd_list, CmdData& data, bool draw) {
 }
 
 void LearnListKindsLocked();
+void NoteSurpriseLocked(const CmdData& data, bool after);
 
 // Command lists in GPU order: every list submitted after the one holding the TAA, until the UI composite, is
 // post-processing.
@@ -3716,8 +3931,12 @@ void OnExecuteCommandList(command_queue* queue, command_list* cmd_list) {
   if (g_config.render_scale >= 1.0f) return;
   if (data == nullptr || !data->signed_) return;
   std::lock_guard lock(g_kinds_mutex);
-  if (!data->dual && data->post_fix != g_frame_taa_submitted && !data->has_taa && !data->has_ui)
+  // Counted only while the passes after the TAA are corrected: with DLSS off (F9) none are, on purpose.
+  if (!data->dual && data->post_fix != g_frame_taa_submitted && !data->has_taa && !data->has_ui && g_post_fix &&
+      g_config.enabled && g_last_out_width.load() != 0) {
     ++(g_frame_taa_submitted ? g_unhandled_after : g_unhandled_before);
+    NoteSurpriseLocked(*data, g_frame_taa_submitted);
+  }
   if (data->dual && g_predicates.mapped != nullptr) {
     const bool after = g_frame_taa_submitted;
     g_predicates.mapped[data->pred_slot] = after ? 1 : 0;
@@ -3759,6 +3978,23 @@ std::string KindName(uint64_t signature) {
   char id[24];
   std::snprintf(id, sizeof(id), " %04llx", static_cast<unsigned long long>(signature & 0xFFFF));
   return (it == g_kind_names.end() ? std::string("?") : it->second) + id;
+}
+
+// A list drawn on the unexpected side of the TAA (not decided at submission): logged per kind the first time and
+// then at most every 600 frames, 400 lines in all.
+void NoteSurpriseLocked(const CmdData& data, bool after) {
+  Surprise& s = g_surprises[data.signature];
+  ++(after ? s.after : s.before);
+  s.state = data.kind_state;
+  const uint64_t frame = g_frame.load();
+  if (g_surprise_lines >= 400 || (s.last_log != 0 && frame - s.last_log < 600)) return;
+  s.last_log = frame;
+  ++g_surprise_lines;
+  Log(reshade::log::level::info, "Unexpected side: " + KindName(data.signature) + " (state " +
+                                     std::to_string(data.kind_state) + " when recorded) drawn " +
+                                     (after ? "uncorrected after the TAA" : "corrected before the TAA") + ", frame " +
+                                     std::to_string(frame) + " (" + std::to_string(s.after) + " after, " +
+                                     std::to_string(s.before) + " before so far)");
 }
 
 // Learns the list kinds collected since the last frame end if they had a TAA; the caller holds g_kinds_mutex.
@@ -4168,6 +4404,7 @@ bool OnDrawIndexed(command_list* cmd_list, uint32_t index_count, uint32_t instan
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
   ProfileWork(cmd_list, *data, 1);
+  if (g_burst_armed.load()) CheckBurst(PipelineName(data->current.handle));
   if (data->pass == Pass::kSsrWater && BeforeTaaList(*data))
     SsrWaterDraw(cmd_list, [&](ID3D12GraphicsCommandList* native) {
       native->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
@@ -4502,6 +4739,7 @@ bool OnDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_cou
   if (data == nullptr) return false;
   SignList(cmd_list, *data, true);
   ProfileWork(cmd_list, *data, 1);
+  if (g_burst_armed.load()) CheckBurst(PipelineName(data->current.handle));
   // Object-only motion blur only while the game's motion blur runs (its passes are skipped when it is off).
   if (data->pass == Pass::kMotionBlur) g_blur_frame = g_frame.load();
   if (data->pass == Pass::kCameraMotion && g_config.object_blur && BlurRunning() &&
@@ -5496,6 +5734,12 @@ void OnReshadePresent(effect_runtime* runtime) {
     StartTrees(runtime);
   if (g_config.npc_motion && g_wind_ready.load() && !g_skin.ready() && !g_skin_failed.load()) StartSkin();
   static std::string dump_request;  // the pending "mv" command, answered once its frames are saved
+  static std::string burst_request;  // the armed "burst" command, pending as a dump once it fires
+  if (g_burst_finals.load() > 0) CopyFinalImage(runtime);
+  if (g_burst_fired.exchange(false)) {
+    dump_request = burst_request;
+    burst_request.clear();
+  }
   static std::string stats_request;  // the pending "vegstats" command
   static int stats_frames = 0;
   static std::string wind_debug_request;  // the pending "winddebug" command
@@ -5562,7 +5806,7 @@ void OnReshadePresent(effect_runtime* runtime) {
     {
       std::lock_guard lock(g_dump_mutex);
       if (g_dump_remaining.load() > 0 && frame > g_dump_start + 600) g_dump_remaining = 0;  // no TAA (menu?)
-      done = g_dump_remaining.load() == 0 && frame > g_dump_last + 3;
+      done = g_dump_remaining.load() == 0 && g_burst_finals.load() == 0 && frame > g_dump_last + 3;
     }
     if (done) {
       FinishRemote(dump_request, WriteDumps(runtime->get_command_queue()));
@@ -5592,6 +5836,21 @@ void OnReshadePresent(effect_runtime* runtime) {
     }
     g_stats_remaining = stats_frames;
     stats_request = command + " " + arg;
+    return;
+  }
+  if (command == "burst") {  // "burst <frames> <part of a pipeline name>": armed until such a pipeline draws
+    if (arg2.empty()) {
+      FinishRemote(command, "usage: burst <frames> <part of a pipeline name>");
+      return;
+    }
+    {
+      std::lock_guard lock(g_burst_mutex);
+      g_burst_pattern = arg2;
+    }
+    g_burst_frames = std::clamp(std::atoi(arg.c_str()), 1, 16);
+    g_burst_armed = true;
+    burst_request = command + " " + arg + " " + arg2;
+    FinishRemote(burst_request, "armed: waiting for a draw of a pipeline named *" + arg2 + "*");
     return;
   }
   if (command == "mv") {
@@ -5991,9 +6250,47 @@ void OnReshadePresent(effect_runtime* runtime) {
     result = text;
   } else if (command == "sceneinfo") {
     result = "scene constants from other cameras rejected: " + std::to_string(g_scene_rejected.load());
+  } else if (command == "prect") {
+    // prect on|off: the screen copy's rectangle of particle effects after the TAA
+    if (!arg.empty()) g_screen_rect_fix = arg != "off";
+    result = std::string("screen copy rectangles ") + (g_screen_rect_fix.load() ? "on" : "off");
+  } else if (command == "psizes") {
+    // psizes on|off: the scanned render-size constants of particles after the TAA (FixParticleSizes)
+    if (!arg.empty()) g_particle_sizes = arg != "off";
+    size_t pipelines = 0, places = 0;
+    {
+      std::lock_guard lock(g_particle_slots_mutex);
+      pipelines = g_particle_slots.size();
+      for (const auto& [pipeline, p] : g_particle_slots) places += p.slots.size();
+    }
+    result = std::string("particle sizes ") + (g_particle_sizes.load() ? "on" : "off") + ": " +
+             std::to_string(pipelines) + " pipelines scanned, " + std::to_string(places) + " places, " +
+             std::to_string(g_particle_size_fixes.load()) + " draws corrected";
+  } else if (command == "dualrule") {
+    if (!arg.empty()) g_dual_rule = std::clamp(std::atoi(arg.c_str()), 0, 3);
+    result = "dual rule " + std::to_string(g_dual_rule.load());
+  } else if (command == "surprises") {
+    // surprises [reset]: the kinds drawn on the unexpected side of the TAA, most often first
+    std::lock_guard lock(g_kinds_mutex);
+    if (arg == "reset") {
+      g_surprises.clear();
+      g_surprise_lines = 0;
+      result = "reset";
+    } else {
+      std::vector<std::pair<uint64_t, Surprise>> top(g_surprises.begin(), g_surprises.end());
+      std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+        return a.second.after + a.second.before > b.second.after + b.second.before;
+      });
+      result = std::to_string(top.size()) + " kinds";
+      for (size_t i = 0; i < top.size() && i < 12; ++i)
+        result += "; " + KindName(top[i].first) + ": " + std::to_string(top[i].second.after) + " after, " +
+                  std::to_string(top[i].second.before) + " before (state " + std::to_string(top[i].second.state) +
+                  ")";
+    }
   } else if (command == "dualinfo" || command == "dual") {
     if (command == "dual" && !arg.empty()) g_dual_enabled = arg != "off";
-    result = std::string(g_dual_enabled.load() ? "on" : "off") + "; lists decided at submission: " +
+    result = std::string(g_dual_enabled.load() ? "on" : "off") + ", rule " + std::to_string(g_dual_rule.load()) +
+             "; lists decided at submission: " +
              std::to_string(g_dual_lists.load()) + " (" +
              std::to_string(g_dual_after.load()) + " landed after the TAA), draws recorded twice: " +
              std::to_string(g_dual_draws.load()) + "; lists on the unexpected side: " +

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+Fixes:
+- Particle effects under upscaling (render scales below 100%): a new effect's first frames, and an effect drawn on
+  the other side of the game's TAA than before, were drawn at the wrong size and place for a frame or two, so
+  particles seemed to move the wrong way and snap back (reported on Nexus with the embers after the Erdtree burns).
+  The add-on now decides when the effect is sent to the GPU instead of guessing from earlier frames.
+- The radial blur when a Living Jar breaks showed a box of a blurred, wrong part of the screen below 100%. Every
+  particle effect that reads a copy of the screen now gets its rectangle corrected, not only the heat distortion
+  (which also fixes a full-screen distortion the old name check missed), and every particle effect's screen-size
+  constants are corrected (lit particles used the render size for their light tiles).
+
 ## 0.4.0 (2026-10-21)
 
 New:

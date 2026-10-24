@@ -225,7 +225,8 @@ hooks, remote control), `src/dlss.*` (NGX wrapper, SR and RR), `src/render_scale
 
 - **Remote control** (dev builds): write a command into `remote.txt` next to the add-on, the answer appears in
   `remote.done` (`tools/remote.ps1 "<command>"`). Commands for screenshots (`capture`), motion-vector dumps (`mv`),
-  pass logs (`passlog`), the render scale (`scale`), presets, jitter, ray tracing switches (`rtskip`, `rtrefit`,
+  bursts of both from the first draw of an effect (`burst <frames> <pipeline name part>`, e.g. the moment a jar
+  breaks), pass logs (`passlog`), the render scale (`scale`), presets, jitter, ray tracing switches (`rtskip`, `rtrefit`,
   `rtdist`, `rtsamples`, `rtinfo`) and Ray Reconstruction (`rr`, `rrraw`, `rrpreset`, `rrdump`); see
   `OnReshadePresent` in `src/addon.cpp`.
 - `tools/ab_capture.ps1`: scripted comparison rounds with PresentMon frame-time logs; `tools/frames.py` turns the
