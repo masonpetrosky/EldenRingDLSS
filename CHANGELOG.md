@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 (2026-10-23)
 
 Fixes:
 - Particle effects under upscaling (render scales below 100%): a new effect's first frames, and an effect drawn on
