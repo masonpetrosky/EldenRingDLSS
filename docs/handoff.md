@@ -35,7 +35,7 @@ for picking up.
 | The game's anisotropic filtering | Already 16x (2026-10-21; `docs/recon.md`) |
 | GitHub issue #1, Proton black screen | NGX and NVAPI start on a thread of their own in 0.4.0; untested under Proton, the reporter was asked to try it (2026-10-21) |
 | 0.4.0 release (frame generation, the courtyard and forest speed-ups, trees on by default) | GitHub + Nexus, everyday install (2026-10-21) |
-| Particle glitches under upscaling (Nexus report; a Living Jar's break shows it) | Fixed (2026-10-23): lists decided at submission, every particle effect's screen-copy rectangle and screen sizes; user-tested in `dist/test-particles` ("pot break looks good"); not yet in the everyday install or a release |
+| Particle glitches under upscaling (Nexus report; a Living Jar's break shows it) | Fixed (2026-10-23): lists decided at submission, every particle effect's screen-copy rectangle and screen sizes; user-tested in `dist/test-particles` ("pot break looks good"); 0.4.1 on GitHub + Nexus and in the everyday install (2026-10-23) |
 
 The user chose NVIDIA's placement for the upscale (DLSS at the TAA, before tonemapping; "option 1") over upscaling
 the tonemapped image at the final composite.
@@ -76,9 +76,10 @@ frame whose lighting was already recorded; later frames restore the game's denoi
 Two me3 profiles under `%LOCALAPPDATA%\garyttierney\me3\config\profiles`:
 
 - **Everyday** (`eldenring-default`, Start menu "ELDEN RING (me3)"): UnlockTheFps plus
-  `natives\EldenRingDLSS` (release DLSS DLL). **Since 2026-10-21 the 0.4.0 release build** with the Streamline DLLs
+  `natives\EldenRingDLSS` (release DLSS DLL). **Since 2026-10-23 the 0.4.1 release build** (add-on A2E785A2; undo
+  copy of 0.4.0 in `Documents\Backups\EldenRing\2026-10-23-before-dlss-0.4.1`), with the Streamline DLLs
   and `nvngx_dlssg.dll`, frame generation off (`FrameGeneration=0`; tried at 2x on 2026-10-23 and switched off
-  again, the user doesn't like it); 0.3.0 from 2026-10-20 and
+  again, the user doesn't like it); 0.4.0 from 2026-10-21, 0.3.0 from 2026-10-20 and
   0.2.0 from 2026-10-19 before it; undo copies in `Documents\Backups\EldenRing\2026-10-19-before-dlss-0.2.0`,
   `2026-10-20-before-dlss-0.3.0` and `2026-10-21-before-dlss-0.4.0`. Its ini is the one below with
   `RtShadowRayGen=4`, water reflections on by default. 0.4.0 first ran from this profile on 2026-10-23, and its log is
@@ -218,6 +219,13 @@ pwsh -NoProfile -File tools/package.ps1               # release zip in dist\ (ve
   default, a tooltip and the version resource. Nexus: the file as the update of 0.3.0 (0.3.0 archived, virus scan
   "Safe to use"), version 0.4.0, the summary (350 characters, now naming frame generation), the page from
   `dist\nexus\page-0.4.0.bbcode` (local), and the sticky 177857019 announces 0.4.0.
+- **0.4.1, released 2026-10-23** (the user: "Do both, show me the Nexus replies first"): the particle fixes of
+  3b865fd. Tag v0.4.1 at 5f37127, GitHub release "Elden Ring DLSS 0.4.1" with `EldenRingDLSS-0.4.1.zip` (SHA-256
+  `A3504B24...55EC`; notes in `dist\release-notes-0.4.1.md`, local); regression checks passed (NGX 57, water 75, NPC
+  497, trees 159, executable 29). Only the add-on (and INSTALL.txt's version) differs from 0.4.0's zip. Nexus: the file
+  "Elden Ring DLSS 0.4.1" as the update of 0.4.0 (archived), version 0.4.1, the page from
+  `dist\nexus\page-0.4.1.bbcode` (local: the 0.4.1 changelog and "from 0.4.0, replacing EldenRingDLSS.addon64 is
+  enough"). The replies to Ver3ion and YuiAragaki1121 and the sticky wait for the user's OK of the texts.
 
 ## Ray tracing with our own ray generation shaders (dev)
 
